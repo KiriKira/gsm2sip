@@ -109,12 +109,12 @@ build_apk() {
 
     if [ "$BUILD_TYPE" = "release" ]; then
         ./gradlew assembleRelease --no-daemon
-        # Signed via the "shared" signingConfig, so the output is app-release.apk
-        # rather than app-release-unsigned.apk.  An unsigned APK is rejected by
-        # PackageManager with INSTALL_PARSE_FAILED_NO_CERTIFICATES and is
-        # useless in the priv-app module, which is what the old path produced.
         APK_PATH="app/build/outputs/apk/release/app-release.apk"
-        [ -f "$APK_PATH" ] || APK_PATH="app/build/outputs/apk/release/app-release-unsigned.apk"
+        if [ ! -f "$APK_PATH" ]; then
+            echo "ERROR: Release packaging requires GSM_RELEASE_STORE_FILE, GSM_RELEASE_STORE_PASSWORD, GSM_RELEASE_KEY_ALIAS and GSM_RELEASE_KEY_PASSWORD."
+            echo "Unsigned release APKs are for inspection only and cannot be packaged as a Magisk module."
+            exit 1
+        fi
     else
         ./gradlew assembleDebug --no-daemon
         APK_PATH="app/build/outputs/apk/debug/app-debug.apk"

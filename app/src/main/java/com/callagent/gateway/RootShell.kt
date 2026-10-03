@@ -14,7 +14,6 @@ import java.util.concurrent.LinkedBlockingQueue
  * Eliminates repeated Magisk superuser popups.
  *
  * Usage:
- *   RootShell.exec("appops set --uid com.callagent.gateway RECORD_AUDIO allow")
  *   val output = RootShell.execForOutput("tinymix 2>&1 | grep -i Incall")
  */
 object RootShell {

@@ -1,6 +1,8 @@
 # PLAN — gsm2sip 双 SIM 网关 v1
 
-更新：2026-10-03。基于 [main 提交 477b7e3](https://github.com/KiriKira/gsm2sip/tree/477b7e349891928dda7b87a9b55b72c52e7eab87) 审查；以下功能均为待实现。此计划取代旧版，旧版保留在 Git 历史。\n\n协议以 [三端协议 v1](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/protocol-v1.md) 为唯一权威，联合次序见 [roadmap](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/roadmap.md)，源码差距见 [审查报告](docs/REVIEW-2026-10-03.md)。实现开始时在依赖记录锁定server协议提交；此仓库不复制wire protocol。
+更新：2026-10-03。基于 [main 提交 477b7e3](https://github.com/KiriKira/gsm2sip/tree/477b7e349891928dda7b87a9b55b72c52e7eab87) 审查；以下功能均为待实现。此计划取代旧版，旧版保留在 Git 历史。
+
+协议以 [三端协议 v1](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/protocol-v1.md) 为唯一权威，联合次序见 [roadmap](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/roadmap.md)，源码差距见 [审查报告](docs/REVIEW-2026-10-03.md)。实现开始时在依赖记录锁定server协议提交；此仓库不复制wire protocol。
 
 ## 目标边界
 

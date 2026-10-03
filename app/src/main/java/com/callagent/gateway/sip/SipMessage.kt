@@ -9,7 +9,8 @@ import com.callagent.gateway.rtp.SrtpKeys
 class SipMessage private constructor(
     val startLine: String,
     val headers: Map<String, String>,
-    val body: String
+    val body: String,
+    private val allHeaders: Map<String, List<String>>
 ) {
 
     val isRequest: Boolean get() = !startLine.startsWith("SIP/")
@@ -26,6 +27,10 @@ class SipMessage private constructor(
 
     fun header(name: String): String? =
         headers[name.lowercase()]
+
+    /** Preserve duplicate headers for fields whose ambiguity must fail closed. */
+    fun headerValues(name: String): List<String> =
+        allHeaders[name.lowercase()] ?: listOfNotNull(header(name))
 
     val callId: String? get() = header("call-id")
     val cseq: String? get() = header("cseq")
@@ -153,8 +158,9 @@ class SipMessage private constructor(
      */
     val sdpIsSavp: Boolean
         get() = body.lineSequence()
-            .firstOrNull { it.startsWith("m=audio") }
-            ?.contains("RTP/SAVP") == true
+            .firstOrNull { it.startsWith("m=audio ") }
+            ?.trim()?.split(Regex("\\s+"))?.getOrNull(2)
+            ?.equals("RTP/SAVP", ignoreCase = true) == true
 
     /**
      * The peer's `a=crypto` lines (RFC 4568), in offer order, as
@@ -168,14 +174,31 @@ class SipMessage private constructor(
             .mapNotNull { line ->
                 // a=crypto:<tag> <suite> inline:<key>[|lifetime][|MKI] [params]
                 val parts = line.removePrefix("a=crypto:").trim().split(Regex("\\s+"), limit = 3)
-                if (parts.size < 3) return@mapNotNull null
+                if (parts.size != 3) return@mapNotNull null
                 val tag = parts[0].toIntOrNull() ?: return@mapNotNull null
-                val keyParam = parts[2].split(Regex("\\s+"))
-                    .firstOrNull { it.startsWith("inline:") }
-                    ?.removePrefix("inline:") ?: return@mapNotNull null
+                val keyParam = parts[2].takeIf { it.startsWith("inline:", ignoreCase = true) }
+                    ?.substringAfter(':') ?: return@mapNotNull null
                 Triple(tag, parts[1], keyParam)
             }
             .toList()
+
+    /** Count raw crypto attributes too, so malformed lines cannot be skipped silently. */
+    val sdpCryptoLineCount: Int
+        get() = body.lineSequence().count { it.startsWith("a=crypto:") }
+
+    /** Negotiated dynamic RTP payload carrying RFC 4733 telephone events, if offered. */
+    val sdpTelephoneEventPayloadType: Int?
+        get() {
+            val media = body.lineSequence().firstOrNull { it.startsWith("m=audio ") }
+                ?.trim()?.split(Regex("\\s+")) ?: return null
+            val offered = media.drop(3).mapNotNull { it.toIntOrNull() }.toSet()
+            return body.lineSequence().mapNotNull { line ->
+                val match = TELEPHONE_EVENT_RTPMAP.matchEntire(line.trim()) ?: return@mapNotNull null
+                val payload = match.groupValues[1].toIntOrNull() ?: return@mapNotNull null
+                val clockRate = match.groupValues[2].toIntOrNull() ?: return@mapNotNull null
+                payload.takeIf { it in offered && it in 0..127 && clockRate == 8000 }
+            }.firstOrNull()
+        }
 
     /** Check for custom gateway header: X-GSM-Forward */
     val gsmForwardNumber: String?
@@ -224,7 +247,18 @@ class SipMessage private constructor(
                 }
             }
 
-            return SipMessage(startLine, headers, body).also { it.raw = data }
+            val allHeaders = LinkedHashMap<String, MutableList<String>>()
+            for (i in 1 until lines.size) {
+                val line = lines[i]
+                val colonIdx = line.indexOf(':')
+                if (colonIdx > 0) {
+                    val key = line.substring(0, colonIdx).trim().lowercase()
+                    val value = line.substring(colonIdx + 1).trim()
+                    allHeaders.getOrPut(key) { mutableListOf() }.add(value)
+                }
+            }
+
+            return SipMessage(startLine, headers, body, allHeaders).also { it.raw = data }
         }
 
         private fun extractTag(header: String): String? {
@@ -232,6 +266,53 @@ class SipMessage private constructor(
             if (idx < 0) return null
             return header.substring(idx + 5).split(";")[0].trim()
         }
+
+        private val TELEPHONE_EVENT_RTPMAP = Regex(
+            "(?i)a=rtpmap:(\\d+)\\s+telephone-event/(\\d+)"
+        )
+    }
+}
+
+/** Parse a server-authored v1 SIP metadata set. Trust is granted by SipClient's TLS peer check. */
+fun SipMessage.gsmCallMetadata(): GsmCallMetadata? {
+    fun exactlyOne(name: String): String? = headerValues(name).singleOrNull()?.trim()
+
+    val versionText = exactlyOne("X-GSM-Protocol-Version") ?: return null
+    if (versionText != GsmCallMetadata.SUPPORTED_PROTOCOL_VERSION.toString()) return null
+    val version = GsmCallMetadata.SUPPORTED_PROTOCOL_VERSION
+    val callId = exactlyOne("X-GSM-Call-Id")
+        ?.takeIf { GsmCallMetadata.UUID_PATTERN.matches(it) } ?: return null
+    val simId = exactlyOne("X-GSM-Sim-Id")
+        ?.takeIf { GsmCallMetadata.UUID_PATTERN.matches(it) } ?: return null
+    val revisionText = exactlyOne("X-GSM-Mapping-Revision") ?: return null
+    if (revisionText.isEmpty() || revisionText.any { it !in '0'..'9' }) return null
+    val revision = revisionText.toLongOrNull()?.takeIf { it >= 0 } ?: return null
+    return GsmCallMetadata(version, callId.lowercase(), simId.lowercase(), revision)
+}
+
+data class GsmCallMetadata(
+    val protocolVersion: Int,
+    val callId: String,
+    val simId: String,
+    val mappingRevision: Long
+) {
+    fun sipHeaders(): List<String> {
+        require(protocolVersion == SUPPORTED_PROTOCOL_VERSION)
+        require(UUID_PATTERN.matches(callId) && UUID_PATTERN.matches(simId))
+        require(mappingRevision >= 0)
+        return listOf(
+            "X-GSM-Protocol-Version: $protocolVersion",
+            "X-GSM-Call-Id: ${callId.lowercase()}",
+            "X-GSM-Sim-Id: ${simId.lowercase()}",
+            "X-GSM-Mapping-Revision: $mappingRevision"
+        )
+    }
+
+    companion object {
+        const val SUPPORTED_PROTOCOL_VERSION = 1
+        internal val UUID_PATTERN = Regex(
+            "(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+        )
     }
 }
 
@@ -276,7 +357,8 @@ object SipBuilder {
         username: String, domain: String, serverPort: Int,
         localIp: String, localPort: Int,
         callId: String, cseq: Int,
-        auth: String? = null
+        auth: String? = null,
+        expiresSeconds: Long = 3600
     ): String {
         val uri = "sip:$domain:$serverPort"
         return buildString {
@@ -288,7 +370,7 @@ object SipBuilder {
             append("From: <sip:$username@$localIp>;tag=${tag()}\r\n")
             append("Call-ID: $callId\r\n")
             append("CSeq: $cseq REGISTER\r\n")
-            append("Contact: <sip:$username@$localIp:$localPort$contactParam>;expires=3600\r\n")
+            append("Contact: <sip:$username@$localIp:$localPort$contactParam>;expires=$expiresSeconds\r\n")
             if (auth != null) append(auth)
             append("Content-Length: 0\r\n\r\n")
         }
@@ -304,6 +386,7 @@ object SipBuilder {
         callerIdNumber: String? = null,
         callerIdName: String? = null,
         auth: String? = null,
+        extraHeaders: List<String> = emptyList(),
         srtp: SrtpKeys? = null
     ): String {
         val fromDisplay = if (callerIdName != null) "\"$callerIdName\" " else ""
@@ -320,8 +403,12 @@ object SipBuilder {
             append("CSeq: $cseq INVITE\r\n")
             append("Contact: <sip:$username@$localIp:$localPort$contactParam>\r\n")
             if (auth != null) append(auth)
+            for (header in extraHeaders) {
+                require(!header.contains('\r') && !header.contains('\n')) { "Invalid SIP extra header" }
+                append(header).append("\r\n")
+            }
             append("Content-Type: application/sdp\r\n")
-            append("Content-Length: ${sdp.length}\r\n\r\n")
+            append("Content-Length: ${sdp.toByteArray(Charsets.UTF_8).size}\r\n\r\n")
             append(sdp)
         }
     }
@@ -394,11 +481,18 @@ object SipBuilder {
         localRtpPort: Int? = null,
         toTag: String = tag(),
         srtp: SrtpKeys? = null,
-        srtpTag: Int = 1
+        srtpTag: Int = 1,
+        codecPayloadType: Int? = null,
+        telephoneEventPayloadType: Int? = null
     ): String {
         val to = msg.to ?: ""
         val toWithTag = if (to.contains(";tag=")) to else "$to;tag=$toTag"
-        val sdp = if (localRtpPort != null) buildSdp(localIp, localRtpPort, srtp, srtpTag) else null
+        val acceptedPayloads = codecPayloadType?.let { codec ->
+            listOfNotNull(codec.takeIf { it in listOf(0, 8, 9) }, telephoneEventPayloadType)
+        }
+        val sdp = if (localRtpPort != null) {
+            buildSdp(localIp, localRtpPort, srtp, srtpTag, acceptedPayloads)
+        } else null
         return buildString {
             append("SIP/2.0 200 OK\r\n")
             append("Via: ${msg.via}\r\n")
@@ -409,7 +503,7 @@ object SipBuilder {
             append("Contact: <sip:$username@$localIp:$localPort$contactParam>\r\n")
             if (sdp != null) {
                 append("Content-Type: application/sdp\r\n")
-                append("Content-Length: ${sdp.length}\r\n\r\n")
+                append("Content-Length: ${sdp.toByteArray(Charsets.UTF_8).size}\r\n\r\n")
                 append(sdp)
             } else {
                 append("Content-Length: 0\r\n\r\n")
@@ -592,16 +686,18 @@ object SipBuilder {
         localIp: String,
         rtpPort: Int,
         srtp: SrtpKeys? = null,
-        srtpTag: Int = 1
+        srtpTag: Int = 1,
+        payloadTypes: List<Int>? = null
     ): String = buildString {
         // G.722 is wideband (16 kHz sampling) but its SDP clock rate is
         // written as 8000 per RFC 3551 — a historical quirk, not a typo.
         // telephone-event is always offered: it carries DTMF, not voice.
-        val payloads = when (codecMode) {
-            "g711" -> "8 0 101"
-            "both" -> "9 8 0 101"
-            else -> "9 101"
-        }
+        val payloads = payloadTypes?.distinct()?.joinToString(" ")
+            ?: when (codecMode) {
+                "g711" -> "8 0 101"
+                "both" -> "9 8 0 101"
+                else -> "9 101"
+            }
         append("v=0\r\n")
         append("o=gateway 0 0 IN IP4 $localIp\r\n")
         append("s=SIP Call\r\n")
@@ -614,13 +710,18 @@ object SipBuilder {
         if (srtp != null) {
             append("a=crypto:$srtpTag ${srtp.suite.sdpName} inline:${srtp.toInline()}\r\n")
         }
-        if (codecMode != "g711") append("a=rtpmap:9 G722/8000\r\n")
-        if (codecMode != "g722") {
-            append("a=rtpmap:8 PCMA/8000\r\n")
-            append("a=rtpmap:0 PCMU/8000\r\n")
+        val selected = payloadTypes?.toSet()
+        if (selected == null || 9 in selected) append("a=rtpmap:9 G722/8000\r\n")
+        if (selected == null || 8 in selected || 0 in selected) {
+            if (selected == null || 8 in selected) append("a=rtpmap:8 PCMA/8000\r\n")
+            if (selected == null || 0 in selected) append("a=rtpmap:0 PCMU/8000\r\n")
         }
-        append("a=rtpmap:101 telephone-event/8000\r\n")
-        append("a=fmtp:101 0-16\r\n")
+        val telephoneEventPt = selected?.firstOrNull { it !in listOf(0, 8, 9) } ?:
+            if (selected == null) 101 else null
+        if (telephoneEventPt != null) {
+            append("a=rtpmap:$telephoneEventPt telephone-event/8000\r\n")
+            append("a=fmtp:$telephoneEventPt 0-16\r\n")
+        }
         append("a=ptime:20\r\n")
         append("a=sendrecv\r\n")
     }

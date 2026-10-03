@@ -3,7 +3,6 @@ package com.callagent.gateway.rtp
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
-import android.os.Build
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -46,7 +45,9 @@ class RtpSession(
     private val localPort: Int,
     private val remoteAddr: String,
     private val remotePort: Int,
-    private val payloadType: Int = RtpPacket.PT_PCMA
+    private val payloadType: Int = RtpPacket.PT_PCMA,
+    private val telephoneEventPayloadType: Int? = null,
+    private val requireSrtp: Boolean = false
 ) {
     private val running = AtomicBoolean(false)
     /** The four loop threads, so [stop] can wait for them to leave the
@@ -98,6 +99,12 @@ class RtpSession(
     @Volatile var srtpAuthFailures = 0L
         private set
 
+    private val telephoneEvents = telephoneEventPayloadType?.let { eventPayload ->
+        TelephoneEventReceiver(eventPayload, onToneEdge = { edge ->
+            listener?.onDtmfTone(edge.digit, edge.active)
+        })
+    }
+
     /**
      * Encrypt if this call is protected, then send.
      *
@@ -107,6 +114,7 @@ class RtpSession(
      */
     private fun sendRtp(data: ByteArray, addr: InetAddress, port: Int) {
         val ctx = srtpSend
+        if (requireSrtp && ctx == null) return
         val out = if (ctx == null) data else (ctx.protect(data) ?: return)
         socket?.send(DatagramPacket(out, out.size, addr, port))
     }
@@ -195,11 +203,23 @@ class RtpSession(
         fun onRtpStarted()
         fun onRtpStopped()
         fun onRtpError(error: String)
+        /** Telecom bridge callback for remote RFC 4733 digits. */
+        fun onDtmfTone(digit: Char, active: Boolean) {}
         fun onRtpTimeout() {}  // No RTP received for RTP_TIMEOUT_MS
         fun onRtpStats(stats: String) {}  // Periodic detailed stats
     }
 
     fun start() {
+        if (requireSrtp && (srtpSend == null || srtpRecv == null)) {
+            listener?.onRtpError("SRTP was required but keys were not installed")
+            return
+        }
+        if (context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            listener?.onRtpError("RECORD_AUDIO permission is not granted")
+            return
+        }
         if (running.getAndSet(true)) return
         Log.i(TAG, "Starting RTP session: local=$localPort remote=$remoteAddr:$remotePort pt=$payloadType")
 
@@ -217,8 +237,24 @@ class RtpSession(
             return
         }
 
-        if (!initAudio()) {
-            running.set(false)
+        var audioFailureReason: String? = null
+        val audioReady = try {
+            initAudio()
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Audio initialization denied by platform permission policy", e)
+            audioFailureReason = e.message
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "Audio initialization failed: ${e.message}", e)
+            audioFailureReason = e.message
+            false
+        }
+        if (!audioReady) {
+            stop()
+            listener?.onRtpError(
+                audioFailureReason?.let { "Audio initialization failed: $it" }
+                    ?: "Required audio capability is unavailable"
+            )
             return
         }
 
@@ -372,15 +408,9 @@ class RtpSession(
         var record: AudioRecord? = null
         var usedRate = 8000
 
-        // No appops assertion and no propagation sleep here.  CallOrchestrator
-        // .startRtp() runs the very same grant sequence synchronously
-        // immediately before this, so doing it again was a second round of
-        // eight root commands — each of pm/appops/cmd forks an app_process —
-        // followed by a blind 500ms wait, on the path between answering the
-        // call and the first frame of audio.  The wait was there for a retry
-        // loop that no longer exists: this only ever made one attempt.
-        // captureInitAndLoop() still re-asserts and retries if nothing here
-        // initialises, which is the case the retry logic was really for.
+        // Permission is granted by the system/Magisk package policy. This
+        // method only probes whether the selected audio source is available;
+        // it must never rewrite app-ops or bypass PermissionController.
         for (cfg in configs) {
             try {
                 val minBuf = AudioRecord.getMinBufferSize(
@@ -391,12 +421,27 @@ class RtpSession(
                     continue
                 }
                 val bufSize = minBuf.coerceAtLeast(cfg.rate / 50 * 2 * 2) // 40ms (two RTP frames)
-                val rec = AudioRecord(
-                    cfg.source, cfg.rate,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufSize
-                )
+                if (context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
+                    PackageManager.PERMISSION_GRANTED
+                ) {
+                    throw SecurityException("RECORD_AUDIO permission was revoked during setup")
+                }
+                val rec = try {
+                    AudioRecord(
+                        cfg.source, cfg.rate,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        bufSize
+                    )
+                } catch (e: SecurityException) {
+                    if (context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
+                        throw SecurityException("RECORD_AUDIO permission was revoked during setup", e)
+                    }
+                    Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate} denied: ${e.message}")
+                    continue
+                }
                 if (profile.captureFromTelephonyRx) {
                     routeCaptureToTelephonyRx(rec)
                 }
@@ -410,6 +455,13 @@ class RtpSession(
                 } else {
                     Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate}: state=${rec.state}")
                     rec.release()
+                }
+            } catch (e: SecurityException) {
+                Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate} denied: ${e.message}")
+                if (context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
+                    PackageManager.PERMISSION_GRANTED
+                ) {
+                    throw SecurityException("RECORD_AUDIO permission was revoked during setup", e)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate} failed: ${e.message}")
@@ -463,15 +515,33 @@ class RtpSession(
         // earpiece but is NEVER injected into the modem uplink.
         // Using default (deep-buffer-playback → MultiMedia1) ensures the
         // Incall_Music Audio Mixer MultiMedia1 routes audio to the caller.
-        val usage = if (profile.playbackUsage >= 0) profile.playbackUsage
-                    else AudioAttributes.USAGE_MEDIA
-        val contentType = if (usage == AudioAttributes.USAGE_VOICE_COMMUNICATION)
-            AudioAttributes.CONTENT_TYPE_SPEECH else AudioAttributes.CONTENT_TYPE_MUSIC
-        playbackUsageName = when (usage) {
-            AudioAttributes.USAGE_MEDIA -> "MEDIA"
-            AudioAttributes.USAGE_VOICE_COMMUNICATION -> "VOICE_COMMUNICATION"
-            else -> "usage=$usage"
+        val requestedUsage = profile.playbackUsage
+        val contentType = when (requestedUsage) {
+            AudioAttributes.USAGE_VOICE_COMMUNICATION -> AudioAttributes.CONTENT_TYPE_SPEECH
+            -1, AudioAttributes.USAGE_MEDIA -> AudioAttributes.CONTENT_TYPE_MUSIC
+            else -> throw IllegalArgumentException(
+                "Unsupported audio profile playback usage: $requestedUsage"
+            )
         }
+        val attributes = AudioAttributes.Builder().apply {
+            // Pass only the documented public constants to setUsage. An
+            // unexpected OEM profile value is a configuration error; do not
+            // coerce it to a different stream and silently change call routing.
+            when (requestedUsage) {
+                -1, AudioAttributes.USAGE_MEDIA -> {
+                    playbackUsageName = "MEDIA"
+                    setUsage(AudioAttributes.USAGE_MEDIA)
+                }
+                AudioAttributes.USAGE_VOICE_COMMUNICATION -> {
+                    playbackUsageName = "VOICE_COMMUNICATION"
+                    setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                }
+                else -> throw IllegalArgumentException(
+                    "Unsupported audio profile playback usage: $requestedUsage"
+                )
+            }
+            setContentType(contentType)
+        }.build()
         // Must happen before the track exists on HALs that pick the output
         // usecase at creation time — see DeviceProfile.incallMusicBeforeTrack.
         if (profile.incallMusicBeforeTrack) {
@@ -480,10 +550,7 @@ class RtpSession(
 
         val track = AudioTrack.Builder()
             .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(usage)
-                    .setContentType(contentType)
-                    .build()
+                attributes
             )
             .setAudioFormat(
                 AudioFormat.Builder()
@@ -578,7 +645,6 @@ class RtpSession(
             for (attempt in 1..maxAttempts) {
                 if (!running.get()) return
 
-                reAssertAppOps()
                 sendSilencePackets(500, defaultRemoteInet)
 
                 for (cfg in configs) {
@@ -589,16 +655,37 @@ class RtpSession(
                         )
                         if (minBuf <= 0) continue
                         val bufSize = minBuf.coerceAtLeast(cfg.rate / 50 * 2 * 2)
-                        val rec = AudioRecord(
-                            cfg.source, cfg.rate,
-                            AudioFormat.CHANNEL_IN_MONO,
-                            AudioFormat.ENCODING_PCM_16BIT,
-                            bufSize
-                        )
+                        if (context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
+                            PackageManager.PERMISSION_GRANTED
+                        ) {
+                            Log.e(TAG, "RECORD_AUDIO permission was revoked during capture setup")
+                            stop()
+                            listener?.onRtpError("RECORD_AUDIO permission was revoked")
+                            return
+                        }
+                        val rec = try {
+                            AudioRecord(
+                                cfg.source, cfg.rate,
+                                AudioFormat.CHANNEL_IN_MONO,
+                                AudioFormat.ENCODING_PCM_16BIT,
+                                bufSize
+                            )
+                        } catch (e: SecurityException) {
+                            if (context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
+                                PackageManager.PERMISSION_GRANTED
+                            ) {
+                                Log.e(TAG, "RECORD_AUDIO permission was revoked during capture setup", e)
+                                stop()
+                                listener?.onRtpError("RECORD_AUDIO permission was revoked")
+                                return
+                            }
+                            Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate} denied: ${e.message}")
+                            continue
+                        }
                         if (profile.captureFromTelephonyRx) {
-                        routeCaptureToTelephonyRx(rec)
-                    }
-                    if (rec.state == AudioRecord.STATE_INITIALIZED) {
+                            routeCaptureToTelephonyRx(rec)
+                        }
+                        if (rec.state == AudioRecord.STATE_INITIALIZED) {
                             if (!running.get()) { rec.release(); return }
                             audioRecord = rec
                             audioSessionId = rec.audioSessionId
@@ -637,13 +724,9 @@ class RtpSession(
             Log.w(TAG, "Source $audioSourceName silent after 3s (skip: $silentSourceIds), trying next fallback")
         }
 
-        // All sources exhausted — DON'T tear down the call.  Playback
-        // (SIP→GSM via incall_music) still works if we keep NAT alive.
-        // Continue sending silence RTP so the caller at least hears the agent.
-        Log.e(TAG, "All capture sources exhausted — capture disabled, keeping NAT alive for playback")
-        while (running.get()) {
-            sendSilencePackets(5000, defaultRemoteInet)
-        }
+        Log.e(TAG, "No permitted AudioRecord source is available; stopping the media bridge")
+        stop()
+        listener?.onRtpError("No permitted audio capture source is available")
     }
 
     /** Build the prioritized list of capture source configs, excluding
@@ -761,6 +844,7 @@ class RtpSession(
     fun stop() {
         if (!running.getAndSet(false)) return
         Log.i(TAG, "Stopping RTP session on port $localPort")
+        telephoneEvents?.reset()
 
         setMonitorEnabled(false)
 
@@ -1119,6 +1203,10 @@ class RtpSession(
                 var data = buf
                 var len = packet.length
                 val ctx = srtpRecv
+                if (requireSrtp && ctx == null) {
+                    srtpAuthFailures++
+                    continue
+                }
                 if (ctx != null) {
                     val plain = ctx.unprotect(buf, packet.length)
                     if (plain == null) {
@@ -1137,7 +1225,18 @@ class RtpSession(
                 }
                 val rtp = RtpPacket.decode(data, len) ?: continue
 
-                // Symmetric RTP: latch onto the actual source address
+                val isTelephoneEvent = telephoneEventPayloadType != null &&
+                    rtp.payloadType == telephoneEventPayloadType
+                if (isTelephoneEvent) {
+                    if (telephoneEvents?.accept(rtp) != true) continue
+                } else if (rtp.payloadType != payloadType) {
+                    // Only the exact codec and event payloads from the SDP
+                    // negotiation are valid on this media stream.
+                    continue
+                }
+
+                // Symmetric RTP: source changes only after SRTP authentication
+                // and RTP/negotiated-payload validation above.
                 if (latchedAddr == null) {
                     latchedAddr = packet.address
                     latchedPort = packet.port
@@ -1150,7 +1249,8 @@ class RtpSession(
                 if (rxPacketCount == 1L) {
                     Log.i(TAG, "First RX: pt=${rtp.payloadType} len=${rtp.payload.size}")
                 }
-                if (rtp.payloadType == payloadType || rtp.payloadType == RtpPacket.PT_PCMA || rtp.payloadType == RtpPacket.PT_G722) {
+                if (isTelephoneEvent) continue
+                if (rtp.payloadType == payloadType) {
                     if (!jitterBuffer.offer(rtp.payload)) {
                         jitterBuffer.poll() // drop oldest
                         jitterBuffer.offer(rtp.payload)
@@ -1158,7 +1258,7 @@ class RtpSession(
                     }
                 }
             } catch (_: SocketTimeoutException) {
-                // normal
+                telephoneEvents?.expire()
             } catch (e: Exception) {
                 if (running.get()) Log.e(TAG, "Receive error: ${e.message}")
             }
@@ -1168,12 +1268,9 @@ class RtpSession(
     // ── RTP inactivity timeout ─────────────────────────
 
     private fun timeoutLoop() {
-        // Early re-assertion at 3s: combat Android re-revoking RECORD_AUDIO
-        // when screen is off, and re-toggle incall_music after speaker route
-        // is fully settled (~1.5s after configureAudioBridge).
+        // Re-toggle incall_music after speaker route has settled.
         try { Thread.sleep(3_000) } catch (_: InterruptedException) { return }
         if (running.get()) {
-            reAssertAppOps()
             reToggleIncallMusic()
         }
 
@@ -1186,14 +1283,6 @@ class RtpSession(
                 // with afterwards — which is exactly when it is wanted.
                 Thread.sleep(if (tick < 3) 5_000L else 15_000L)
                 tick++
-
-                // Periodic appops check: Android's AppOpsService can revoke
-                // RECORD_AUDIO for background apps when the screen goes off.
-                // The check is cheap now (see reAssertAppOps), but there is no
-                // reason to make it at all once a call has been up and
-                // capturing for a while — the revocation, when it happens,
-                // happens early.  First minute at 15s, then once a minute.
-                if (tick <= 4 || tick % 4 == 0) reAssertAppOps()
 
                 // Stats.  The stream volumes and mic-mute state used to be
                 // queried and appended here every cycle; they are set once at
@@ -1724,78 +1813,6 @@ class RtpSession(
                 listener?.onRtpStats("Mixer incall_music FAILED: ${e.message}")
             }
         }, "RTP-Mixer").start()
-    }
-
-    /**
-     * Re-assert RECORD_AUDIO appops via root.  Android's AppOpsService
-     * re-revokes this permission for background apps when the screen turns
-     * off, killing VOICE_CALL capture (rawCapRMS drops to ~6).  Called
-     * at 3s and then every 5s from timeoutLoop to keep capture alive.
-     *
-     * CRITICAL: Must use --uid flag to set the UID-level mode.
-     * `appops set <pkg>` sets the package mode, but AudioFlinger checks
-     * the UID mode (set by PermissionController).  UID mode overrides
-     * package mode.  Without --uid, the command "succeeds" (exit=0) but
-     * AudioFlinger still denies with "Request denied by app op: 27".
-     */
-    private fun reAssertAppOps() {
-        try {
-            val pkg = context.packageName
-            val uidProbe = if (Build.VERSION.SDK_INT >= 29) "--uid " else ""
-            // Ask before acting.  The sequence below is eight root commands,
-            // two of them killing PermissionController, and pm/appops/cmd each
-            // fork an app_process; running it unconditionally every 15s cost
-            // hundreds of process launches across a single call to re-grant a
-            // permission that was already granted.  One `appops get` is cheap,
-            // and the expensive path now only runs when something really has
-            // revoked it — which is the situation it was written for.
-            val probe = RootShell.execForOutput(
-                "appops get ${uidProbe}$pkg RECORD_AUDIO 2>&1"
-            )
-            if (probe.contains("allow", ignoreCase = true)) {
-                Log.d(TAG, "appops RECORD_AUDIO still allow — nothing to do")
-                return
-            }
-            Log.w(TAG, "appops RECORD_AUDIO not allowed [$probe] — re-granting")
-            val t0 = System.currentTimeMillis()
-            // Use execForOutput to capture stderr/stdout from appops commands.
-            // Previous approach hid all errors and put killall last (exit=1 always).
-            // Now: appops get --uid is the LAST command so exit code is meaningful,
-            // and all errors are captured via 2>&1.
-            // AUTO_REVOKE_PERMISSIONS_IF_UNUSED: Android 11+ (API 30)
-            // appops --uid flag: Android 10+ (API 29)
-            val autoRevoke = if (Build.VERSION.SDK_INT >= 30)
-                "appops set $pkg AUTO_REVOKE_PERMISSIONS_IF_UNUSED ignore 2>&1; " else ""
-            val uidFlag = if (Build.VERSION.SDK_INT >= 29) "--uid " else ""
-            val result = RootShell.execForOutput(
-                "killall com.google.android.permissioncontroller 2>/dev/null; " +
-                "killall com.android.permissioncontroller 2>/dev/null; " +
-                "pm grant $pkg android.permission.RECORD_AUDIO 2>&1; " +
-                autoRevoke +
-                "appops set ${uidFlag}$pkg RECORD_AUDIO allow 2>&1; " +
-                "appops set $pkg RECORD_AUDIO allow 2>&1; " +
-                "killall com.google.android.permissioncontroller 2>/dev/null; " +
-                "killall com.android.permissioncontroller 2>/dev/null; " +
-                "appops get ${uidFlag}$pkg RECORD_AUDIO 2>&1"
-            )
-            val elapsed = System.currentTimeMillis() - t0
-            val allowed = result.contains("allow", ignoreCase = true)
-            Log.i(TAG, "appops re-assert: [$result] ok=$allowed (${elapsed}ms)")
-
-            if (!allowed) {
-                // Fallback: try cmd appops (different IPC path to AppOpsService)
-                val fb = RootShell.execForOutput(
-                    "cmd appops set ${uidFlag}$pkg RECORD_AUDIO allow 2>&1; " +
-                    "cmd appops set $pkg RECORD_AUDIO allow 2>&1; " +
-                    "cmd appops get ${uidFlag}$pkg RECORD_AUDIO 2>&1"
-                )
-                Log.w(TAG, "appops fallback cmd: [$fb]")
-            } else {
-                Log.d(TAG, "appops RECORD_AUDIO verified: allow")
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "appops re-assert failed: ${e.message}")
-        }
     }
 
     /**

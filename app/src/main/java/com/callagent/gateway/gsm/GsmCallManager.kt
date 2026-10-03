@@ -2,7 +2,6 @@ package com.callagent.gateway.gsm
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.Intent
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Bundle
@@ -17,6 +16,9 @@ import android.telephony.TelephonyManager
 import android.util.Log
 import com.callagent.gateway.DeviceProfile
 import com.callagent.gateway.RootShell
+import com.callagent.gateway.sim.SimRegistry
+import java.util.Collections
+import java.util.IdentityHashMap
 
 /**
  * GSM call manager: answers/makes/hangs up GSM calls, tracks state.
@@ -43,6 +45,8 @@ object GsmCallManager {
     // Current active GSM call
     @Volatile var activeCall: Call? = null; private set
     @Volatile var activeCallState: Int = Call.STATE_NEW; private set
+    private val callLock = Any()
+    private val incomingCallsSeen = Collections.newSetFromMap(IdentityHashMap<Call, Boolean>())
 
     /**
      * Why the last GSM call ended.
@@ -82,18 +86,31 @@ object GsmCallManager {
 
     fun onCallAdded(call: Call, service: InCallService) {
         inCallService = service
-        activeCall = call
-        activeCallState = call.state
-        lastDisconnectCause = null
-        // Release the previous call's object; the dedupe only needs to span
-        // one call's own disconnect.
-        endedCall = null
+        val isPrimary = synchronized(callLock) {
+            val current = activeCall
+            if (current == null || activeCallState == Call.STATE_DISCONNECTED) {
+                activeCall = call
+                activeCallState = call.state
+                lastDisconnectCause = null
+                // Release the previous call's object; the dedupe only needs to
+                // span one primary call's own disconnect.
+                endedCall = null
+                incomingCallsSeen.remove(call)
+                true
+            } else current === call
+        }
 
         val number = call.details?.handle?.schemeSpecificPart ?: "unknown"
 
+        if (!isPrimary) {
+            Log.i(TAG, "Additional Telecom call observed while primary call is active")
+            if (call.state == Call.STATE_RINGING) notifyIncomingCallOnce(call, number)
+            return
+        }
+
         when (call.state) {
             Call.STATE_RINGING -> {
-                Log.i(TAG, "Incoming GSM call from $number")
+                Log.i(TAG, "Incoming GSM call detected")
                 // Silence the ringtone immediately — this is a gateway device,
                 // not a user-facing phone.  The call will be auto-answered
                 // once the SIP leg is established.
@@ -103,13 +120,13 @@ object GsmCallManager {
                 } catch (e: Exception) {
                     Log.w(TAG, "Ringer silence failed: ${e.message}")
                 }
-                listener?.onIncomingGsmCall(call, number)
+                notifyIncomingCallOnce(call, number)
             }
             Call.STATE_DIALING, Call.STATE_CONNECTING -> {
-                Log.i(TAG, "Outgoing GSM call to $number")
+                Log.i(TAG, "Outgoing GSM call dialing")
             }
             Call.STATE_ACTIVE -> {
-                Log.i(TAG, "GSM call active: $number")
+                Log.i(TAG, "GSM call active")
                 configureAudioBridge()
                 listener?.onGsmCallActive(call)
             }
@@ -133,6 +150,11 @@ object GsmCallManager {
         listener?.onGsmCallEnded(call)
     }
 
+    private fun notifyIncomingCallOnce(call: Call, number: String) {
+        val first = synchronized(callLock) { incomingCallsSeen.add(call) }
+        if (first) listener?.onIncomingGsmCall(call, number)
+    }
+
     /**
      * Telecom has unbound the InCallService.
      *
@@ -150,16 +172,26 @@ object GsmCallManager {
 
     fun onCallRemoved(call: Call) {
         Log.i(TAG, "GSM call removed")
-        if (activeCall == call) {
-            activeCall = null
-            activeCallState = Call.STATE_DISCONNECTED
+        val wasPrimary = synchronized(callLock) {
+            incomingCallsSeen.remove(call)
+            val primary = activeCall === call || endedCall === call
+            if (activeCall === call) {
+                activeCall = null
+                activeCallState = Call.STATE_DISCONNECTED
+            }
+            primary
         }
-        restoreAudio()
-        notifyCallEnded(call)
+        if (wasPrimary) {
+            restoreAudio()
+            notifyCallEnded(call)
+        }
     }
 
     fun onCallStateChanged(call: Call, state: Int) {
-        activeCallState = state
+        val isPrimary = synchronized(callLock) {
+            if (activeCall === call) activeCallState = state
+            activeCall === call
+        }
 
         when (state) {
             Call.STATE_RINGING -> {
@@ -167,29 +199,37 @@ object GsmCallManager {
                 // transition to RINGING via the callback.  Without this,
                 // the orchestrator never learns about the incoming call.
                 val number = call.details?.handle?.schemeSpecificPart ?: "unknown"
-                Log.i(TAG, "GSM call ringing: $number (via state change)")
-                listener?.onIncomingGsmCall(call, number)
+                Log.i(TAG, "GSM call ringing (via state change)")
+                notifyIncomingCallOnce(call, number)
             }
             Call.STATE_ACTIVE -> {
+                if (!isPrimary) {
+                    Log.w(TAG, "Non-primary Telecom call became active; it will not replace the bridged call")
+                    return
+                }
                 Log.i(TAG, "GSM call active")
                 configureAudioBridge()
                 listener?.onGsmCallActive(call)
             }
             Call.STATE_DISCONNECTED -> {
-                lastDisconnectCause = try {
-                    call.details?.disconnectCause
-                } catch (e: Exception) {
-                    Log.w(TAG, "Disconnect cause unavailable: ${e.message}")
-                    null
+                if (isPrimary) {
+                    lastDisconnectCause = try {
+                        call.details?.disconnectCause
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Disconnect cause unavailable: ${e.message}")
+                        null
+                    }
                 }
-                Log.i(TAG, "GSM call disconnected (cause=${lastDisconnectCause?.code})")
-                notifyCallEnded(call)
-                if (activeCall == call) {
-                    activeCall = null
+                Log.i(TAG, "GSM call disconnected (primary=$isPrimary, cause=${if (isPrimary) lastDisconnectCause?.code else "n/a"})")
+                if (isPrimary) {
+                    notifyCallEnded(call)
+                    synchronized(callLock) {
+                        if (activeCall === call) activeCall = null
+                    }
                 }
             }
         }
-        listener?.onGsmCallStateChanged(call, state)
+        if (isPrimary) listener?.onGsmCallStateChanged(call, state)
     }
 
     // ── Call control ────────────────────────────────────
@@ -229,9 +269,8 @@ object GsmCallManager {
      * simply never happens.  placeCall is a binder call into Telecom, needs no
      * Activity, and we hold CALL_PHONE (plus CALL_PRIVILEGED as a priv-app);
      * as the default dialer, Telecom hands the call back to our InCallService.
-     *
-     * The ACTION_CALL path is kept as a fallback for the case where Telecom
-     * refuses the direct call — it still works whenever an Activity is up.
+     * This path always supplies the verified PhoneAccountHandle selected by
+     * the SIM registry; it never falls back to the user's default account.
      */
     /**
      * True for dial strings that are MMI/USSD codes rather than phone numbers
@@ -267,22 +306,22 @@ object GsmCallManager {
                         override fun onReceiveUssdResponse(
                             tm: TelephonyManager, request: String, response: CharSequence
                         ) {
-                            Log.i(TAG, "USSD $request → $response")
+                            Log.i(TAG, "USSD response received")
                             onResult(response.toString())
                         }
 
                         override fun onReceiveUssdResponseFailed(
                             tm: TelephonyManager, request: String, failureCode: Int
                         ) {
-                            Log.w(TAG, "USSD $request failed (code $failureCode)")
-                            onResult("USSD $request failed (code $failureCode)")
+                            Log.w(TAG, "USSD request failed")
+                            onResult("USSD request failed (code $failureCode)")
                         }
                     },
                     Handler(Looper.getMainLooper())
                 )
                 return
             } catch (e: Exception) {
-                Log.w(TAG, "sendUssdRequest failed (${e.message}) — falling back to Telecom")
+                Log.w(TAG, "sendUssdRequest failed — falling back to Telecom")
             }
         }
         try {
@@ -290,27 +329,41 @@ object GsmCallManager {
             val handled = telecom.handleMmi(code)
             onResult(if (handled) "MMI $code sent" else "MMI $code not recognised")
         } catch (e: Exception) {
-            onResult("MMI $code failed: ${e.message}")
+            onResult("MMI request failed")
         }
     }
 
     @SuppressLint("MissingPermission")
-    fun makeCall(context: Context, destination: String) {
-        Log.i(TAG, "Making GSM call to $destination")
-        val uri = Uri.fromParts("tel", destination, null)
-        try {
-            val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-            telecom.placeCall(uri, Bundle())
-            return
-        } catch (e: Exception) {
-            Log.w(TAG, "placeCall failed (${e.message}) — falling back to ACTION_CALL")
+    fun makeCall(
+        context: Context,
+        destination: String,
+        simId: String,
+        mappingRevision: Long,
+        localRevisionBarrier: Long
+    ): Boolean {
+        val dialString = destination.trim()
+        if (dialString.isEmpty() || isMmiCode(dialString)) {
+            Log.w(TAG, "Rejecting empty/MMI destination from SIM call dispatcher")
+            return false
         }
-        try {
-            context.startActivity(
-                Intent(Intent.ACTION_CALL, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
+        val mapping = try {
+            SimRegistry.resolveForVoice(context, simId, mappingRevision, localRevisionBarrier)
+        } catch (e: SimRegistry.SimMappingException) {
+            Log.w(TAG, "SIM-directed call refused (${e.code})")
+            return false
+        }
+        val handle = mapping.phoneAccountHandle ?: return false
+        return try {
+            val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+            val extras = Bundle().apply {
+                putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
+            }
+            telecom.placeCall(Uri.fromParts("tel", dialString, null), extras)
+            Log.i(TAG, "Telecom call dispatched with explicit SIM account")
+            true
         } catch (e: Exception) {
-            Log.e(TAG, "ACTION_CALL fallback failed: ${e.message}")
+            Log.e(TAG, "Explicit SIM Telecom placeCall failed: ${e.javaClass.simpleName}")
+            false
         }
     }
 

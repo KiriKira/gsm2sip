@@ -2,7 +2,6 @@
 *.apk
 gateway-magisk.zip
 magisk/system/priv-app/Gateway/
-!magisk/system/priv-app/PermissionController/
 local.properties
 .env.build
 
@@ -16,3 +15,7 @@ app/build/
 .idea/
 *.iml
 .vscode/
+
+# Local signing material
+*.keystore
+*.jks

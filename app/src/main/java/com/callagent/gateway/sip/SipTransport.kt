@@ -9,6 +9,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.util.ArrayDeque
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
@@ -108,8 +109,8 @@ class UdpSipTransport(
 }
 
 /**
- * SIP over TLS (RFC 3261 §18), signalling only -- RTP is untouched and still
- * travels in the clear.
+ * SIP over TLS (RFC 3261 §18). This protects signalling and SDES keys; the
+ * separate RTP socket is protected by SRTP negotiated by SipClient.
  *
  * One connection carries everything in both directions, including requests the
  * server originates: an inbound INVITE arrives on the same socket this opened,
@@ -137,12 +138,9 @@ class TlsSipTransport(
     private var input: InputStream? = null
     private var output: OutputStream? = null
 
-    /**
-     * Bytes read but not yet consumed as a message.  A single read can return
-     * half a message or three of them; this is what makes the difference
-     * invisible to the caller.
-     */
-    private val pending = StringBuilder()
+    /** Byte framing preserves UTF-8 bodies split at arbitrary read boundaries. */
+    private val framer = SipStreamFramer()
+    private val completeMessages = ArrayDeque<ByteArray>()
 
     override val isOpen: Boolean
         get() = socket?.let { it.isConnected && !it.isClosed } == true
@@ -191,7 +189,8 @@ class TlsSipTransport(
         socket = s
         input = s.inputStream
         output = s.outputStream
-        pending.setLength(0)
+        framer.reset()
+        completeMessages.clear()
         log("TLS connected to $host:$port (${s.session.protocol}, ${s.session.cipherSuite})")
     }
 
@@ -204,10 +203,10 @@ class TlsSipTransport(
     }
 
     override fun receive(): Pair<String, Pair<String, Int>>? {
-        // Anything already buffered may hold a complete message, so try before
-        // going back to the socket -- otherwise a read that delivered two
-        // messages would strand the second until more traffic arrived.
-        takeMessage()?.let { return it to peer }
+        // A single TLS read can complete several messages. Return queued
+        // frames before reading again so a later partial message cannot delay
+        // one that was already complete.
+        completeMessages.pollFirst()?.let { return decodeFrame(it) to peer }
 
         val ins = input ?: return null
         val buf = ByteArray(4096)
@@ -218,62 +217,27 @@ class TlsSipTransport(
                 // caller reconnects rather than spinning on a dead stream.
                 throw java.io.EOFException("TLS connection closed by server")
             }
-            pending.append(String(buf, 0, n, Charsets.UTF_8))
-            takeMessage()?.let { it to peer }
+            completeMessages.addAll(framer.append(buf, 0, n))
+            completeMessages.pollFirst()?.let { decodeFrame(it) to peer }
         } catch (_: SocketTimeoutException) {
             null
         }
     }
 
-    /**
-     * Pull one complete message off [pending], or null if there isn't one yet.
-     *
-     * A SIP message over a stream is framed by its Content-Length: headers run
-     * to the first blank line, and exactly that many bytes of body follow.
-     * Guessing from the blank line alone would truncate every message with a
-     * body, which here means every SDP offer and every inbound SMS.
-     */
-    private fun takeMessage(): String? {
-        while (true) {
-            // RFC 5626 keepalives are bare CRLFs between messages.  They are
-            // not messages and must not be parsed as one.
-            var start = 0
-            while (start < pending.length &&
-                (pending[start] == '\r' || pending[start] == '\n')
-            ) start++
-            if (start > 0) pending.delete(0, start)
-
-            val headerEnd = pending.indexOf("\r\n\r\n")
-            if (headerEnd < 0) return null
-            val headers = pending.substring(0, headerEnd)
-
-            val bodyLen = CONTENT_LENGTH.find(headers)
-                ?.groupValues?.get(1)?.trim()?.toIntOrNull() ?: 0
-            val total = headerEnd + 4 + bodyLen
-            if (pending.length < total) return null
-
-            val msg = pending.substring(0, total)
-            pending.delete(0, total)
-            return msg
-        }
-    }
+    private fun decodeFrame(frame: ByteArray): String = String(frame, Charsets.UTF_8)
 
     override fun close() {
         try { socket?.close() } catch (e: Exception) { Log.d(TAG, "TLS close: ${e.message}") }
         socket = null
         input = null
         output = null
-        pending.setLength(0)
+        framer.reset()
+        completeMessages.clear()
     }
 
     private companion object {
         const val TAG = "TlsSipTransport"
         const val CONNECT_TIMEOUT_MS = 10_000
 
-        /** Both spellings are legal; `l` is the compact form (RFC 3261 §7.3.3). */
-        val CONTENT_LENGTH = Regex(
-            "^(?:Content-Length|l)\\s*:\\s*(\\d+)\\s*$",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE)
-        )
     }
 }

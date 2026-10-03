@@ -1,4 +1,45 @@
-> **本 fork 的三端项目计划（2026-10-03）**：请先阅读 [双 SIM 网关实施计划](PLAN-selfhosted-gateway.md)、[代码审查](docs/REVIEW-2026-10-03.md) 和 [server 联合实施顺序](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/roadmap.md)。本页下方保留上游说明，其 Callagent/chan_sip 示例不是本项目推荐部署方案；三端功能尚未按新计划实现。
+# 双 SIM 远程网关（开发中）
+
+目标：旧 root Android 保留两张 SIM，未 root Android 主机通过自建服务器收发短信、接打电话。
+本批实现 **M1/M2 的短信基础**；完整三端通话尚未完成，也没有通过目标手机的真实短信或通话验收。
+
+- 网关：HTTPS 配对、服务器分配 SIM 身份与本机确认、SQLite 事件/执行账本、指定订阅发送短信、分片回执。
+- [服务器](https://github.com/KiriKira/gsm2sip-server)：PostgreSQL 控制与消息接口，权威协议和联合实施顺序。
+- [主机](https://github.com/KiriKira/gsm2sip-client-android)：配对、两卡状态、消息、草稿和同请求重试。
+
+先读 [网关计划](PLAN-selfhosted-gateway.md)、[实施审查](https://github.com/KiriKira/gsm2sip-server/blob/56f55f77a4840f0e6797a1765165db601f7c08b4/docs/IMPLEMENTATION-REVIEW-2026-10-03.md) 与 [设备验收状态](docs/devices.md)。
+[本批实施状态与固定协议](docs/implementation-state.md)。
+本批采用轮询；WSS/FCM 唤醒、ARI、主机 SIP SDK 和完整 Telecom 通话仍待后续实施。
+短信不再以 SIP MESSAGE 作为生产执行通道。不确定发送保留 `unknown`，不能自动重发或回落默认 SIM。
+
+## 开发与初次连接
+
+需要 JDK 17+、Android SDK 34；本机调试 APK：
+
+```bash
+./gradlew :app:assembleDebug :app:testDebugUnitTest
+```
+
+产物为 `app/build/outputs/apk/debug/app-debug.apk`。特权系统安装还需按设备计划检查 Magisk 与应用签名；
+没有发布签名的 release 不能直接打包。不要用卸载重装解决签名冲突而丢弃未决发送账本。
+
+1. 在服务器创建 owner，分别生成 gateway/client 一次性配对码；按 server README 配置可信 HTTPS。
+2. 旧机填写 `HTTPS control server`、`Device name`、`One-time pairing code`，点击 `PAIR GATEWAY`。
+3. 点击 `SYNC SIM LIST`，逐卡核对本机订阅与服务器 SIM 行，再点击 `CONFIRM SELECTED SIMS`。
+4. 主机使用同一 owner 的 client 配对码连接，选择已确认的 SIM 后提交短信任务。
+
+健康连接下旧机约每 30 秒同步；失败会退避到最长 5 分钟。服务器接收任务不代表 modem 已发送，
+`submitted` 不代表对方已收到。没有可靠卡身份的确认在重启后失效，需要重新核对。
+API 26–30 可使用指定订阅短信；通用可靠语音选卡要求 API 31+，且仍需 OEM 音频与双卡实测。
+
+## 原上游历史说明
+
+下面保留原项目的设备经验和旧 SIP 使用说明，供音频移植研究。它们未经过本 fork 的双卡验证，
+旧 Callagent/chan_sip 部署、SIP MESSAGE 发短信、启动时强制录音授权等描述不适用于本批三端实现。
+上游发布 APK 也不包含本批修改。
+
+<details>
+<summary>展开原上游 README</summary>
 
 <p align="center">
   <img src="icon.png" width="128" alt="gsm2sip">
@@ -606,3 +647,5 @@ The `gateway-magisk.zip` module does two critical things:
 - **SIP not registering**: Check WiFi connectivity, server address, and credentials
 - **Calls not auto-answering**: Ensure the app is set as the default phone app
 - **Audio drops**: Check WiFi stability; the app holds a WiFi lock but poor signal will cause issues
+
+</details>

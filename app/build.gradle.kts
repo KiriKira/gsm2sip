@@ -11,23 +11,20 @@ android {
         applicationId = "com.callagent.gateway"
         minSdk = 26
         targetSdk = 34
-        versionCode = 425
-        versionName = "1.2.0"
+        versionCode = 426
+        versionName = "1.3.0-dev"
     }
 
-    // A release build is signed with the same debug key the debug build uses.
-    // That is deliberate: it keeps the signature identical, so a release APK can
-    // replace a debug one inside the Magisk module without PackageManager
-    // rejecting it for a signature mismatch.  The point of building release here
-    // is not secrecy, it is `debuggable=false` — ART compiles a debuggable app in
-    // a deoptimizable mode with much weaker inlining, which costs real CPU in the
-    // per-frame audio loops.
+    // Release identity is supplied outside the repository and persists across upgrades.
+    val releaseStore = providers.environmentVariable("GSM_RELEASE_STORE_FILE").orNull
     signingConfigs {
-        create("shared") {
-            storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+        if (!releaseStore.isNullOrBlank()) {
+            create("production") {
+                storeFile = file(releaseStore)
+                storePassword = providers.environmentVariable("GSM_RELEASE_STORE_PASSWORD").orNull
+                keyAlias = providers.environmentVariable("GSM_RELEASE_KEY_ALIAS").orNull
+                keyPassword = providers.environmentVariable("GSM_RELEASE_KEY_PASSWORD").orNull
+            }
         }
     }
 
@@ -35,8 +32,12 @@ android {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = signingConfigs.getByName("shared")
+            if (!releaseStore.isNullOrBlank()) signingConfig = signingConfigs.getByName("production")
         }
+    }
+
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
     }
 
     buildFeatures {
@@ -54,6 +55,8 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.12.2")
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")

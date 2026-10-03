@@ -49,6 +49,16 @@ class SipCall(
     var remoteRtpPort: Int = 0
     var remoteRtpAddress: String? = null
     var negotiatedPayloadType: Int = 9 // default G.722, updated from SDP
+    var negotiatedTelephoneEventPayloadType: Int? = null
+
+    /**
+     * For inbound calls this is populated only by SipClient after parsing a
+     * complete v1 metadata set from the verified TLS peer. Outbound calls
+     * retain the locally validated mapping metadata for auth retries.
+     */
+    var trustedGsmMetadata: GsmCallMetadata? = null
+        internal set
+    val requiresSrtp: Boolean get() = sipClient.srtpEnabled
 
     // ── SRTP (RFC 3711 / RFC 4568) ──────────────────────
     // Two independent keys, one per direction: ours protects what we send,
@@ -73,10 +83,21 @@ class SipCall(
      * decides, and answering plain RTP with encrypted audio produces a call
      * where neither side hears anything and nothing looks wrong.
      */
-    fun absorbRemoteSrtp(msg: SipMessage): Boolean {
+    fun absorbRemoteSrtp(
+        msg: SipMessage,
+        expectedTag: Int? = null,
+        expectedSuite: SrtpCryptoSuite? = null
+    ): Boolean {
         if (!msg.sdpIsSavp) return false
-        for ((tag, suiteName, inlineValue) in msg.sdpCryptoLines) {
-            val suite = SrtpCryptoSuite.byName(suiteName) ?: continue
+        val cryptoLines = msg.sdpCryptoLines
+        if (cryptoLines.size != msg.sdpCryptoLineCount) return false
+        val tags = cryptoLines.map { it.first }
+        if (tags.any { it <= 0 } || tags.toSet().size != tags.size) return false
+        for ((tag, suiteName, inlineValue) in cryptoLines) {
+            if (expectedTag != null && tag != expectedTag) continue
+            val suite = SrtpCryptoSuite.byName(suiteName)
+                ?.takeIf { it == SrtpCryptoSuite.offered } ?: continue
+            if (expectedSuite != null && suite != expectedSuite) continue
             val keys = SrtpKeys.fromInline(suite, inlineValue) ?: continue
             remoteSrtpKeys = keys
             srtpTag = tag
@@ -121,22 +142,14 @@ class SipCall(
                 msg.sdpRtpPort?.let { remoteRtpPort = it }
                 msg.sdpAddress?.let { remoteRtpAddress = it }
                 negotiatedPayloadType = msg.sdpPreferredPayloadType
+                negotiatedTelephoneEventPayloadType = msg.sdpTelephoneEventPayloadType
 
-                // We offered SRTP; this is where we find out whether they took
-                // it.  If they did not, our key is dropped so the media path
-                // does not try to protect a stream the far end will read as
-                // plain RTP -- but it is a downgrade, so it is said out loud
-                // rather than logged at debug and forgotten.
-                if (localSrtpKeys != null) {
-                    if (absorbRemoteSrtp(msg)) {
-                        Log.i(TAG, "SRTP negotiated: ${remoteSrtpKeys?.suite?.sdpName}")
-                        sipClient.logListener?.invoke("SRTP active (${remoteSrtpKeys?.suite?.sdpName})")
-                    } else {
-                        localSrtpKeys = null
-                        Log.w(TAG, "Peer declined SRTP — media will be unencrypted")
-                        sipClient.logListener?.invoke("SRTP declined by server — audio NOT encrypted")
-                    }
-                }
+                val srtpAccepted = !requiresSrtp ||
+                    (localSrtpKeys != null && absorbRemoteSrtp(
+                        msg,
+                        expectedTag = srtpTag,
+                        expectedSuite = localSrtpKeys?.suite
+                    ))
 
                 // ACK must use the same CSeq as the INVITE being acknowledged
                 val ackCseq = msg.cseq?.split(" ")?.firstOrNull()?.toIntOrNull() ?: localCseq
@@ -146,6 +159,20 @@ class SipCall(
                 if (state == State.ANSWERED) {
                     Log.i(TAG, "Duplicate 200 OK for call $callId (already answered), ACKed")
                     return true
+                }
+
+                if (!srtpAccepted) {
+                    // The remote 200 already established a dialog. ACK then
+                    // close it; never remove the keys and continue in RTP.
+                    state = State.ANSWERED
+                    Log.w(TAG, "Peer answered without the required SDES suite; closing call")
+                    sipClient.logListener?.invoke("Call rejected: required SRTP negotiation failed")
+                    hangup()
+                    return true
+                }
+                if (requiresSrtp) {
+                    Log.i(TAG, "SRTP negotiated: ${remoteSrtpKeys?.suite?.sdpName}")
+                    sipClient.logListener?.invoke("SRTP active (${remoteSrtpKeys?.suite?.sdpName})")
                 }
 
                 Log.i(TAG, "SDP codec: pt=$negotiatedPayloadType codecs=${msg.sdpCodecs}")
@@ -252,7 +279,7 @@ class SipCall(
             }
 
             else -> {
-                Log.w(TAG, "Unhandled SIP message for call $callId: ${msg.startLine}")
+                Log.w(TAG, "Unhandled SIP method or response for call $callId")
                 return false
             }
         }
@@ -267,7 +294,9 @@ class SipCall(
         val ok = SipBuilder.ok200(
             invite, sipClient.username, sipClient.publicIp, sipClient.localPort,
             localRtpPort = localRtpPort, toTag = toTag,
-            srtp = localSrtpKeys, srtpTag = srtpTag
+            srtp = localSrtpKeys, srtpTag = srtpTag,
+            codecPayloadType = negotiatedPayloadType,
+            telephoneEventPayloadType = negotiatedTelephoneEventPayloadType
         )
 
         val address = invite.contactAddress ?: sipClient.serverAddress
@@ -292,7 +321,7 @@ class SipCall(
 
     /** Send ACK for a received 200 OK */
     private fun sendAck(cseq: Int) {
-        val uri = remoteContactUri ?: return
+        val uri = remoteContactUri ?: "sip:${sipClient.serverDomain}:${sipClient.serverPort}"
         val ack = SipBuilder.ack(
             uri, null, toHeader, fromHeader,
             callId, cseq,

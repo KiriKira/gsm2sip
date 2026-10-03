@@ -14,12 +14,21 @@
 # Usage:  tools/check-device.sh [adb-serial]
 
 set -u
+if ! command -v adb >/dev/null 2>&1; then
+    echo "adb is required; install Android platform-tools." >&2
+    exit 2
+fi
 SERIAL="${1:-}"
 ADB=(adb); [ -n "$SERIAL" ] && ADB=(adb -s "$SERIAL")
 
 sh_()  { "${ADB[@]}" shell "$@" 2>/dev/null | tr -d '\r'; }
 su_()  { "${ADB[@]}" shell "su -c '$1'" 2>/dev/null | tr -d '\r'; }
 have_root() { [ "$(su_ 'id -u')" = "0" ]; }
+
+if ! "${ADB[@]}" get-state >/dev/null 2>&1; then
+    echo "No uniquely selected authorized ADB device. Pass its serial explicitly." >&2
+    exit 2
+fi
 
 pass=0; fail=0; unknown=0
 ok()  { echo "  [ok]      $1"; pass=$((pass+1)); }
@@ -31,13 +40,19 @@ echo "  model    : $(sh_ getprop ro.product.model)"
 echo "  board    : $(sh_ getprop ro.board.platform)"
 echo "  hardware : $(sh_ getprop ro.hardware)"
 echo "  android  : $(sh_ getprop ro.build.version.release)"
+API_LEVEL=$(sh_ getprop ro.build.version.sdk)
+echo "  API      : $API_LEVEL"
+if [ "${API_LEVEL:-0}" -lt 31 ] 2>/dev/null; then
+    echo "  Voice: generic public SIM/account routing requires API 31+."
+    echo "  SMS: explicit subscription routing remains available on API 26+."
+fi
 echo "  vendor   : $(sh_ getprop ro.vendor.build.fingerprint)"
 echo
 
 if [ "$(sh_ getprop ro.hardware)" != "qcom" ]; then
-    echo "Not a Qualcomm device — stop here."
+    echo "Not a Qualcomm device — this Qualcomm-specific probe cannot evaluate it."
     echo "Injection needs incall_music and capture needs the in-call record"
-    echo "session; neither exists outside the Qualcomm audio HAL.  A Samsung"
+    echo "session; this probe only evaluates the Qualcomm implementation.  A Samsung"
     echo "Exynos S10e was checked and has no telephony route in its audio"
     echo "policy at all: three mixPorts (deep, fast, primary) and nothing else."
     exit 1
@@ -111,7 +126,7 @@ fi
 echo
 echo "=== Verdict ==="
 if [ "$fail" -eq 0 ] && [ "$unknown" -eq 0 ]; then
-    echo "  Fully supported on paper: $pass/$pass checks passed."
+    echo "  Capability probe passed: $pass/$pass checks passed; voice remains unverified."
     echo "  A DeviceProfile entry will still be needed — the mixer names are"
     echo "  generic, but which front-end the playback track lands on is not."
     echo "  The 'Mixer BEFORE/AFTER' lines logged around each call show it."
@@ -126,3 +141,6 @@ else
     echo "  without the in-call record usecases the agent can only hear the"
     echo "  caller acoustically, through the phone's own microphone."
 fi
+
+echo "  This read-only probe never makes a call or sends SMS."
+echo "  Both SIMs still require real incoming/outgoing two-way audio and IVR tests."

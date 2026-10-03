@@ -1,6 +1,7 @@
 package com.callagent.gateway.sim
 
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -88,5 +89,16 @@ class SimRegistryPolicyTest {
         assertTrue(SimRegistry.Policy.resyncRevisionIsAcceptable(8, 8))
         assertTrue(SimRegistry.Policy.resyncRevisionIsAcceptable(8, 9))
         assertFalse(SimRegistry.Policy.resyncRevisionIsAcceptable(8, 7))
+    }
+
+    @Test
+    fun voiceResolutionUsesAvailablePublicOrBrokerPathByCapability() {
+        assertEquals(SimRegistry.VoiceAccountApiPath.MAGISK_BROKER, SimRegistry.Policy.voiceAccountApiPath(26))
+        assertEquals(SimRegistry.VoiceAccountApiPath.MAGISK_BROKER, SimRegistry.Policy.voiceAccountApiPath(29))
+        assertEquals(SimRegistry.VoiceAccountApiPath.PUBLIC_REVERSE, SimRegistry.Policy.voiceAccountApiPath(30))
+        assertEquals(
+            SimRegistry.VoiceAccountApiPath.PUBLIC_FORWARD_AND_REVERSE,
+            SimRegistry.Policy.voiceAccountApiPath(31)
+        )
     }
 }

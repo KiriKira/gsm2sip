@@ -7,8 +7,9 @@
 - [服务器](https://github.com/KiriKira/gsm2sip-server)：PostgreSQL 控制与消息接口，权威协议和联合实施顺序。
 - [主机](https://github.com/KiriKira/gsm2sip-client-android)：配对、两卡状态、消息、草稿和同请求重试。
 
-先读 [网关计划](PLAN-selfhosted-gateway.md)、[实施审查](https://github.com/KiriKira/gsm2sip-server/blob/56f55f77a4840f0e6797a1765165db601f7c08b4/docs/IMPLEMENTATION-REVIEW-2026-10-03.md) 与 [设备验收状态](docs/devices.md)。
+先读 [网关计划](PLAN-selfhosted-gateway.md)、[实施审查](https://github.com/KiriKira/gsm2sip-server/blob/b93fc9c8036108e36b2652673c1dd8ceee8d197f/docs/IMPLEMENTATION-REVIEW-2026-10-03.md) 与 [设备验收状态](docs/devices.md)。
 [本批实施状态与固定协议](docs/implementation-state.md)。
+按用户要求，本批后续增加 [Magisk 通用适配](docs/magisk-runtime.md)：模块探测、受限账户 broker 和本地数字音频配置，不再按机型自动选 preset 或以 API 31 作为整体语音门槛。
 本批采用轮询；WSS/FCM 唤醒、ARI、主机 SIP SDK 和完整 Telecom 通话仍待后续实施。
 短信不再以 SIP MESSAGE 作为生产执行通道。不确定发送保留 `unknown`，不能自动重发或回落默认 SIM。
 
@@ -30,7 +31,7 @@
 
 健康连接下旧机约每 30 秒同步；失败会退避到最长 5 分钟。服务器接收任务不代表 modem 已发送，
 `submitted` 不代表对方已收到。没有可靠卡身份的确认在重启后失效，需要重新核对。
-API 26–30 可使用指定订阅短信；通用可靠语音选卡要求 API 31+，且仍需 OEM 音频与双卡实测。
+构建最低 Android API 26。语音按实际 Telephony/Telecom 能力精确映射，公开接口不足时通过 Magisk 的受限 system-UID broker 查询；缺失或不唯一时报告不可用。音频按系统实际路由探测，不回落默认卡。
 
 ## 原上游历史说明
 

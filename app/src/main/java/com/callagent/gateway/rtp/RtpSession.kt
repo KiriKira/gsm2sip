@@ -23,19 +23,12 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * RTP session: handles bidirectional audio between speaker/mic and remote RTP endpoint.
+ * RTP session: bridges audio between an active cellular call and a remote RTP endpoint.
  *
- * On S4 Mini (MSM8930), VOICE_DOWNLINK routes through the physical mic
- * (HAL usecase incall-rec-downlink → voice-handset-mic).  Speaker mode
- * plays GSM caller audio through the speaker; the mic picks it up.
- *
- * Audio path:
- * - Capture: VOICE_DOWNLINK via mic → gain boost → encode → RTP → SIP agent.
- * - Playback: RTP → decode → AudioTrack (usage from profile).
- *   MSM8930: USAGE_MEDIA → STREAM_MUSIC.  incall_music_enabled=true
- *   injects STREAM_MUSIC into voice TX, bypassing modem AEC.
- *   Exynos 9820: USAGE_VOICE_COMMUNICATION → STREAM_VOICE_CALL.
- *   Samsung HAL may route this into the modem uplink directly.
+ * The generic profile requests Android's public telephony RX/TX routes and
+ * verifies the active devices. Capture sources are tested by reading frames;
+ * opening an AudioRecord alone does not establish cellular audio support.
+ * Acoustic capture is appended only by an explicit local profile option.
  *
  * The Magisk module disables Android's audio concurrency restrictions.
  * Uses G.722 codec for wideband (16 kHz), falls back to PCMA (G.711 A-law).
@@ -50,6 +43,7 @@ class RtpSession(
     private val requireSrtp: Boolean = false
 ) {
     private val running = AtomicBoolean(false)
+    private val mediaFailureReported = AtomicBoolean(false)
     /** The four loop threads, so [stop] can wait for them to leave the
      *  AudioRecord/AudioTrack before those get released. */
     @Volatile private var workers: List<Thread> = emptyList()
@@ -175,14 +169,23 @@ class RtpSession(
     // Audio session ID from AudioRecord (for logging/diagnostics)
     private var audioSessionId: Int = AudioManager.AUDIO_SESSION_ID_GENERATE
 
-    // Silence detection: track audio source IDs that produce no audio so we
-    // can fall back to alternatives.  E.g., VOICE_CALL initializes on
-    // Exynos 9820 but delivers silence — the HAL doesn't route voice data
-    // to the capture path.  Falling back to MIC captures the caller's voice
-    // acoustically from the speaker.
+    // Silence detection: track audio source IDs that initialize but deliver
+    // no usable frames. Remaining digital sources are tried first; acoustic
+    // inputs only appear when the local profile explicitly allows them.
     private val silentSourceIds = mutableSetOf<Int>()
     @Volatile private var currentSourceId: Int = -1
-    private data class SourceConfig(val source: Int, val name: String, val rate: Int)
+    @Volatile private var currentSourceIsDigital: Boolean = false
+    private data class SourceConfig(
+        val source: Int,
+        val name: String,
+        val rate: Int,
+        val digital: Boolean,
+    )
+    private data class AudioCapabilities(
+        val telephonyInput: AudioDeviceInfo?,
+        val telephonyOutput: AudioDeviceInfo?,
+    )
+    @Volatile private var audioInitFailureReason: String? = null
     // Silence detection thresholds — only counted during non-echo periods
     // (when decayingPlaybackRms <= echoGateThreshold) to avoid false resets
     // from incall_music echo leaking back through VOICE_CALL capture.
@@ -212,6 +215,17 @@ class RtpSession(
     fun start() {
         if (requireSrtp && (srtpSend == null || srtpRecv == null)) {
             listener?.onRtpError("SRTP was required but keys were not installed")
+            return
+        }
+        val activeProfile = profile
+        Log.i(TAG, "Audio profile: name=${activeProfile.name}, generic=${activeProfile.useGenericRouting}, " +
+            "rxRequired=${activeProfile.requireTelephonyRx}, txRequired=${activeProfile.requireTelephonyTx}, " +
+            "micFallback=${activeProfile.allowMicFallback}")
+        if (activeProfile.configError != null) {
+            val error = "Local audio profile configuration is unavailable: ${activeProfile.configError}"
+            Log.e(TAG, error)
+            listener?.onRtpStats("Audio capability failure: invalid local profile")
+            listener?.onRtpError(error)
             return
         }
         if (context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
@@ -250,11 +264,13 @@ class RtpSession(
             false
         }
         if (!audioReady) {
+            val reason = audioFailureReason ?: audioInitFailureReason
+            val error = reason?.let { "Audio initialization failed: $it" }
+                ?: "Required audio capability is unavailable"
+            Log.e(TAG, error)
+            listener?.onRtpStats("Audio capability failure: $error")
             stop()
-            listener?.onRtpError(
-                audioFailureReason?.let { "Audio initialization failed: $it" }
-                    ?: "Required audio capability is unavailable"
-            )
+            listener?.onRtpError(error)
             return
         }
 
@@ -294,21 +310,22 @@ class RtpSession(
                 body()
             } catch (e: InterruptedException) {
                 Log.d(TAG, "$name interrupted")
+                if (running.get() && (name.startsWith("RTP-Play-") || name.startsWith("RTP-Capt-"))) {
+                    failAudioMedia("$name was interrupted while the media session was active")
+                }
             } catch (e: Throwable) {
                 if (running.get()) Log.e(TAG, "$name died: ${e.javaClass.simpleName}: ${e.message}", e)
                 else Log.d(TAG, "$name ended during shutdown: ${e.message}")
+                if (running.get() && (name.startsWith("RTP-Play-") || name.startsWith("RTP-Capt-"))) {
+                    failAudioMedia("$name failed: ${e.javaClass.simpleName}: ${e.message}")
+                }
             }
         }, name)
 
     /**
-     * Initialize AudioRecord and AudioTrack.
-     *
-     * AudioRecord: Tries VOICE_DOWNLINK first (on S4 Mini this routes through
-     * the physical mic via incall-rec-downlink HAL usecase).
-     * AudioTrack: USAGE_MEDIA (STREAM_MUSIC) so that Qualcomm's
-     * incall_music_enabled=true parameter injects it into voice TX (uplink).
-     * USAGE_VOICE_COMMUNICATION maps to STREAM_VOICE_CALL which the HAL
-     * does NOT inject via incall_music — that's why SIP→GSM was silent.
+     * Initialize AudioRecord and AudioTrack according to the selected local
+     * profile. The generic profile requests Android telephony routes and does
+     * not configure OEM mixer controls.
      */
     private fun initAudio(): Boolean {
         // Before anything is opened: in-call recording and the per-session
@@ -324,86 +341,17 @@ class RtpSession(
             else -> 16000  // G.722
         }
 
-        // Try telephony capture sources, then mic sources.
-        // When using G.722 (wideband), prefer 16kHz capture to avoid upsampling
-        // artifacts.  HD Voice (AMR-WB/EVS) provides native 16kHz audio.
-        val configs = mutableListOf<SourceConfig>()
-
         val wideband = payloadType != RtpPacket.PT_PCMA && payloadType != RtpPacket.PT_PCMU
-
-        // VOICE_CALL (source 4): captures uplink+downlink mixed digitally.
-        // Best option on MSM8930 — if it initializes, it provides clean
-        // digital capture of the caller's voice.  Requires CAPTURE_AUDIO_OUTPUT.
-        if (wideband) {
-            // G.722: prefer 16kHz native capture — avoids upsampling artifacts
-            // in the 4-8kHz upper band that cause AI agent false interruptions.
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL@16k", 16000))
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000))
-        } else {
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000))
+        val capabilities = logAudioCapabilities()
+        if (profile.requireTelephonyRx && capabilities.telephonyInput == null) {
+            audioInitFailureReason = "Required TYPE_TELEPHONY input is not exposed by AudioManager"
+            return false
         }
-        // Mic-based sources: in speaker mode, the physical mic picks up the
-        // caller's voice from the speaker.  This is acoustic coupling — not
-        // ideal but functional when digital capture sources fail.
-        // VOICE_RECOGNITION bypasses noise suppression that can mute call audio.
-        // VOICE_DOWNLINK ahead of the acoustic sources when the profile says
-        // it works here.  It captures the caller's voice digitally, off the
-        // modem downlink, which is what lets the physical mic stay muted — on
-        // the acoustic path the mic is the capture source, so the caller hears
-        // the room and the agent hears itself through the speaker.
-        if (profile.voiceDownlinkWorks) {
-            if (wideband) {
-                configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK@16k", 16000))
-            }
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
+        if (profile.requireTelephonyTx && capabilities.telephonyOutput == null) {
+            audioInitFailureReason = "Required TYPE_TELEPHONY output is not exposed by AudioManager"
+            return false
         }
-        if (profile.preferUnprocessedMic) {
-            // Raw mic, ahead of the voice-tuned sources: no AEC, no noise
-            // suppression, no AGC.  When the caller reaches us as sound out of
-            // the phone's own speaker, those are all working against us.
-            configs.add(SourceConfig(MediaRecorder.AudioSource.UNPROCESSED, "UNPROCESSED", 8000))
-            configs.add(SourceConfig(MediaRecorder.AudioSource.CAMCORDER, "CAMCORDER", 8000))
-        }
-        configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_RECOGNITION, "VOICE_RECOGNITION", 8000))
-        configs.add(SourceConfig(MediaRecorder.AudioSource.MIC, "MIC", 8000))
-        configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_COMMUNICATION, "VOICE_COMMUNICATION", 8000))
-
-        if (profile.voiceDownlinkWorks) {
-            // Where the modem downlink is capturable, it is the only source we
-            // want: VOICE_CALL mixes uplink AND downlink, and the uplink now
-            // carries the agent's own injected voice, so the agent hears itself
-            // folded into the caller — which is what the far end perceives as
-            // noise.  The downlink alone is the caller.  Acoustic sources stay
-            // behind it purely as a last resort.
-            configs.removeAll { it.source == MediaRecorder.AudioSource.VOICE_CALL }
-            val downlink = configs.filter {
-                it.source == MediaRecorder.AudioSource.VOICE_DOWNLINK
-            }
-            configs.removeAll(downlink)
-            configs.addAll(0, downlink)
-        }
-        // VOICE_DOWNLINK (source 3): DEAD LAST — on MSM8930 it initializes
-        // successfully (STATE_INITIALIZED) but captures SILENCE because the
-        // Incall_Rec mixer controls don't exist on this SoC.  If it were
-        // earlier in the list, it would "win" over mic-based sources that
-        // actually work.  Kept only for devices where it genuinely works.
-        if (!profile.voiceDownlinkWorks) {
-            if (wideband) {
-                configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK@16k", 16000))
-            }
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
-        }
-
-        // Same preference as the fallback list, applied here too -- this is
-        // the list that picks the source a call actually opens on, and
-        // reordering only the fallback list left every call still starting on
-        // VOICE_CALL@16k and discovering it was dead ~11s later.  The agent
-        // heard silence for those 11 seconds of every call.
-        if (profile.preferVoiceRecognition) {
-            val vr = configs.filter { it.source == MediaRecorder.AudioSource.VOICE_RECOGNITION }
-            configs.removeAll(vr)
-            configs.addAll(0, vr)
-        }
+        val configs = buildCaptureConfigs(wideband)
 
         var record: AudioRecord? = null
         var usedRate = 8000
@@ -442,15 +390,22 @@ class RtpSession(
                     Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate} denied: ${e.message}")
                     continue
                 }
-                if (profile.captureFromTelephonyRx) {
-                    routeCaptureToTelephonyRx(rec)
+                if (cfg.digital && profile.captureFromTelephonyRx) {
+                    val accepted = routeCaptureToTelephonyRx(rec)
+                    if (profile.requireTelephonyRx && !accepted) {
+                        rec.release()
+                        audioInitFailureReason = "AudioRecord rejected the required TYPE_TELEPHONY input route"
+                        return false
+                    }
                 }
                 if (rec.state == AudioRecord.STATE_INITIALIZED) {
                     record = rec
                     usedRate = cfg.rate
                     audioSourceName = cfg.name
                     currentSourceId = cfg.source
-                    Log.i(TAG, "AudioRecord OK: ${cfg.name} @ ${cfg.rate}Hz (buf=$bufSize)")
+                    currentSourceIsDigital = cfg.digital
+                    Log.i(TAG, "AudioRecord opened: ${cfg.name} @ ${cfg.rate}Hz " +
+                        "digital=${cfg.digital}; audio delivery remains unproven until reads (buf=$bufSize)")
                     break
                 } else {
                     Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate}: state=${rec.state}")
@@ -572,10 +527,19 @@ class RtpSession(
                 }
             }
             .build()
+        if (track.state != AudioTrack.STATE_INITIALIZED) {
+            audioInitFailureReason = "AudioTrack could not initialize (state=${track.state})"
+            track.release()
+            return false
+        }
         audioTrack = track
 
-        if (profile.playbackToTelephonyTx) {
-            routeToTelephonyTx(track)
+        if (profile.playbackToTelephonyTx || profile.requireTelephonyTx) {
+            val accepted = routeToTelephonyTx(track)
+            if (profile.requireTelephonyTx && !accepted) {
+                audioInitFailureReason = "AudioTrack rejected the required TYPE_TELEPHONY output route"
+                return false
+            }
         }
 
         // No platform AEC — AudioTrack is on USAGE_MEDIA (different stream
@@ -602,7 +566,7 @@ class RtpSession(
      * track, status: -1").  The audio HAL needs time to fully initialize
      * the recording infrastructure after the modem voice path starts.
      *
-     * Playback (SIP→GSM via incall_music) runs in a separate thread and
+     * Playback runs in a separate thread and
      * starts immediately.  This method retries capture init for up to 30s
      * so the caller hears the agent right away, even if the reverse
      * direction (GSM→SIP) takes longer to come up.
@@ -622,7 +586,7 @@ class RtpSession(
         // on Exynos 9820 where the HAL doesn't route voice data to capture).
         val wideband = payloadType != RtpPacket.PT_PCMA && payloadType != RtpPacket.PT_PCMU
         val defaultRemoteInet = InetAddress.getByName(remoteAddr)
-        val maxFallbacks = 5  // Maximum silent-source fallback cycles
+        val maxFallbacks = 10  // Enough cycles for every digital and explicit acoustic candidate
 
         for (fallback in 0 until maxFallbacks) {
             if (!running.get()) return
@@ -682,8 +646,13 @@ class RtpSession(
                             Log.w(TAG, "AudioRecord ${cfg.name}@${cfg.rate} denied: ${e.message}")
                             continue
                         }
-                        if (profile.captureFromTelephonyRx) {
-                            routeCaptureToTelephonyRx(rec)
+                        if (cfg.digital && profile.captureFromTelephonyRx) {
+                            val accepted = routeCaptureToTelephonyRx(rec)
+                            if (profile.requireTelephonyRx && !accepted) {
+                                rec.release()
+                                failAudioMedia("AudioRecord rejected the required TYPE_TELEPHONY input route")
+                                return
+                            }
                         }
                         if (rec.state == AudioRecord.STATE_INITIALIZED) {
                             if (!running.get()) { rec.release(); return }
@@ -692,7 +661,9 @@ class RtpSession(
                             captureRate = cfg.rate
                             audioSourceName = cfg.name
                             currentSourceId = cfg.source
-                            Log.i(TAG, "AudioRecord OK: ${cfg.name} @ ${cfg.rate}Hz (buf=$bufSize, fallback=$fallback attempt=$attempt)")
+                            currentSourceIsDigital = cfg.digital
+                            Log.i(TAG, "AudioRecord opened: ${cfg.name} @ ${cfg.rate}Hz " +
+                                "digital=${cfg.digital} (delivery is pending readback, fallback=$fallback attempt=$attempt)")
                             sourceFound = true
                             break
                         } else {
@@ -724,71 +695,54 @@ class RtpSession(
             Log.w(TAG, "Source $audioSourceName silent after 3s (skip: $silentSourceIds), trying next fallback")
         }
 
-        Log.e(TAG, "No permitted AudioRecord source is available; stopping the media bridge")
-        stop()
-        listener?.onRtpError("No permitted audio capture source is available")
+        val reason = if (profile.allowMicFallback) {
+            "No permitted digital or explicitly allowed microphone capture source is available"
+        } else {
+            "No permitted digital telephony capture source delivered usable audio"
+        }
+        failAudioMedia(reason)
     }
 
-    /** Build the prioritized list of capture source configs, excluding
-     *  sources already detected as silent. */
+    /** Build the single prioritized source list used by initial and fallback setup. */
     private fun buildCaptureConfigs(wideband: Boolean): List<SourceConfig> {
         val configs = mutableListOf<SourceConfig>()
-        if (wideband) {
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL@16k", 16000))
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000))
-        } else {
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000))
+        fun add(source: Int, name: String, rate: Int, digital: Boolean) {
+            configs.add(SourceConfig(source, name, rate, digital))
         }
-        // VOICE_DOWNLINK ahead of the acoustic sources when the profile says
-        // it works here.  It captures the caller's voice digitally, off the
-        // modem downlink, which is what lets the physical mic stay muted — on
-        // the acoustic path the mic is the capture source, so the caller hears
-        // the room and the agent hears itself through the speaker.
-        if (profile.voiceDownlinkWorks) {
-            if (wideband) {
-                configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK@16k", 16000))
-            }
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
-        }
-        if (profile.preferUnprocessedMic) {
-            // Raw mic, ahead of the voice-tuned sources: no AEC, no noise
-            // suppression, no AGC.  When the caller reaches us as sound out of
-            // the phone's own speaker, those are all working against us.
-            configs.add(SourceConfig(MediaRecorder.AudioSource.UNPROCESSED, "UNPROCESSED", 8000))
-            configs.add(SourceConfig(MediaRecorder.AudioSource.CAMCORDER, "CAMCORDER", 8000))
-        }
-        configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_RECOGNITION, "VOICE_RECOGNITION", 8000))
-        configs.add(SourceConfig(MediaRecorder.AudioSource.MIC, "MIC", 8000))
-        configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_COMMUNICATION, "VOICE_COMMUNICATION", 8000))
 
-        if (profile.voiceDownlinkWorks) {
-            // Where the modem downlink is capturable, it is the only source we
-            // want: VOICE_CALL mixes uplink AND downlink, and the uplink now
-            // carries the agent's own injected voice, so the agent hears itself
-            // folded into the caller — which is what the far end perceives as
-            // noise.  The downlink alone is the caller.  Acoustic sources stay
-            // behind it purely as a last resort.
-            configs.removeAll { it.source == MediaRecorder.AudioSource.VOICE_CALL }
-            val downlink = configs.filter {
-                it.source == MediaRecorder.AudioSource.VOICE_DOWNLINK
+        // A profile that explicitly says its downlink source works can prefer
+        // that digital source to avoid VOICE_CALL's mixed uplink. The generic
+        // profile probes both digital Android telephony sources in order.
+        if (profile.voiceDownlinkWorks && !profile.useGenericRouting) {
+            if (wideband) add(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK@16k", 16000, true)
+            add(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000, true)
+        } else {
+            if (wideband) add(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL@16k", 16000, true)
+            add(MediaRecorder.AudioSource.VOICE_CALL, "VOICE_CALL", 8000, true)
+            if (wideband) add(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK@16k", 16000, true)
+            add(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000, true)
+        }
+
+        if (profile.allowMicFallback) {
+            val acoustic = mutableListOf<SourceConfig>()
+            fun addMic(source: Int, name: String) {
+                acoustic.add(SourceConfig(source, name, 8000, digital = false))
             }
-            configs.removeAll(downlink)
-            configs.addAll(0, downlink)
-        }
-        if (!profile.voiceDownlinkWorks) {
-            if (wideband) {
-                configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK@16k", 16000))
+            if (profile.preferUnprocessedMic) {
+                addMic(MediaRecorder.AudioSource.UNPROCESSED, "UNPROCESSED")
+                addMic(MediaRecorder.AudioSource.CAMCORDER, "CAMCORDER")
             }
-            configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
+            if (profile.preferVoiceRecognition) {
+                addMic(MediaRecorder.AudioSource.VOICE_RECOGNITION, "VOICE_RECOGNITION")
+            }
+            addMic(MediaRecorder.AudioSource.MIC, "MIC")
+            if (!profile.preferVoiceRecognition) {
+                addMic(MediaRecorder.AudioSource.VOICE_RECOGNITION, "VOICE_RECOGNITION")
+            }
+            addMic(MediaRecorder.AudioSource.VOICE_COMMUNICATION, "VOICE_COMMUNICATION")
+            configs.addAll(acoustic)
         }
-        if (profile.preferVoiceRecognition) {
-            // Ahead of everything, including VOICE_DOWNLINK: on these handsets
-            // it is the source that actually delivers a steady frame rate, and
-            // arriving steadily matters more than arriving digitally.
-            val vr = configs.filter { it.source == MediaRecorder.AudioSource.VOICE_RECOGNITION }
-            configs.removeAll(vr)
-            configs.addAll(0, vr)
-        }
+
         return configs.filterNot { it.source in silentSourceIds }
     }
 
@@ -955,6 +909,18 @@ class RtpSession(
 
         record.startRecording()
 
+        if (profile.requireTelephonyRx && currentSourceIsDigital) {
+            val routed = waitForTelephonyRoute { record.routedDevice }
+            if (!running.get()) return true
+            if (routed?.type != AudioDeviceInfo.TYPE_TELEPHONY) {
+                failAudioMedia(
+                    "Digital capture route did not settle on TYPE_TELEPHONY " +
+                        "(actual=${routed?.let(::describeDevice) ?: "none"})"
+                )
+                return true
+            }
+        }
+
         // Re-assert in-call capture routing now that the stream exists — see
         // DeviceProfile.mixerCaptureCmd.  Off the capture thread, because the
         // su round-trip takes ~100ms and would stall the first RTP frames.
@@ -966,10 +932,13 @@ class RtpSession(
             }, "mixer-capture").start()
         }
 
-        Log.i(TAG, "Capture routedFrom=${record.routedDevice?.type}")
-        Log.i(TAG, "Capture started: source=$audioSourceName capRate=$captureRate session=$audioSessionId gain=${captureGain}x profile=${profile.name} state=${record.recordingState}")
+        Log.i(TAG, "Capture route: source=$audioSourceName digital=$currentSourceIsDigital " +
+            "routedFrom=${record.routedDevice?.let(::describeDevice) ?: "none"}")
+        Log.i(TAG, "Capture started: source=$audioSourceName capRate=$captureRate session=$audioSessionId " +
+            "gain=${captureGain}x profile=${profile.name} state=${record.recordingState}; deliveryProbe=pending")
         // Also report via RTP stats so it appears in the app log viewer
-        listener?.onRtpStats("Capture: source=$audioSourceName rate=$captureRate gain=${captureGain}x profile=${profile.name}")
+        listener?.onRtpStats("Capture opened: source=$audioSourceName rate=$captureRate " +
+            "digital=$currentSourceIsDigital route=${record.routedDevice?.type ?: "none"}; audio delivery pending")
 
         // Buffer: 20ms of PCM at the actual capture sample rate
         val samplesPerFrame = captureRate / 50  // 160 @ 8kHz, 320 @ 16kHz
@@ -1080,6 +1049,13 @@ class RtpSession(
                     } else {
                         // Source delivered audio during non-echo → working
                         silenceFrameCount = 0
+                        if (!sourceProven) {
+                            val route = record.routedDevice?.let(::describeDevice) ?: "none"
+                            val message = "Capture readback observed non-silent frames: source=$audioSourceName " +
+                                "digital=$currentSourceIsDigital route=$route"
+                            Log.i(TAG, message)
+                            listener?.onRtpStats(message)
+                        }
                         sourceProven = true
                     }
                 }
@@ -1309,54 +1285,81 @@ class RtpSession(
         }
     }
 
-    // ── Playback: jitter buffer → decode → speaker → mic → GSM uplink ──
+    // ── Playback: jitter buffer → decode → selected AudioTrack route ──
 
-    /**
-     * Ask this recorder to take its audio from the telephony downlink.
-     *
-     * Logs the available input device types, since whether TYPE_TELEPHONY is
-     * offered at all is the thing worth knowing when the agent ends up hearing
-     * the room instead of the caller.
-     */
-    private fun routeCaptureToTelephonyRx(rec: AudioRecord) {
-        try {
-            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-            val inputs = am.getDevices(AudioManager.GET_DEVICES_INPUTS)
+    private fun logAudioCapabilities(): AudioCapabilities {
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        val inputs = try { am?.getDevices(AudioManager.GET_DEVICES_INPUTS).orEmpty() } catch (_: Exception) { emptyArray() }
+        val outputs = try { am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS).orEmpty() } catch (_: Exception) { emptyArray() }
+        val telephonyInput = inputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
+        val telephonyOutput = outputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
+        val inputSummary = inputs.joinToString { describeDevice(it) }.ifEmpty { "none" }
+        val outputSummary = outputs.joinToString { describeDevice(it) }.ifEmpty { "none" }
+        val message = "Audio capability: exposedTelephonyRx=${telephonyInput != null} " +
+            "exposedTelephonyTx=${telephonyOutput != null} inputs=[$inputSummary] outputs=[$outputSummary]"
+        Log.i(TAG, message)
+        listener?.onRtpStats(message)
+        return AudioCapabilities(telephonyInput, telephonyOutput)
+    }
+
+    private fun describeDevice(device: AudioDeviceInfo): String =
+        "type=${device.type},id=${device.id},name=${device.productName}"
+
+    /** Request the public telephony RX device on a digital AudioRecord source. */
+    private fun routeCaptureToTelephonyRx(rec: AudioRecord): Boolean {
+        return try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            val inputs = am?.getDevices(AudioManager.GET_DEVICES_INPUTS).orEmpty()
             val telephony = inputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
             if (telephony == null) {
-                Log.w(TAG, "No TYPE_TELEPHONY input exposed — capture stays on the mic; " +
-                    "inputs: " + inputs.joinToString { "${it.type}/${it.productName}" })
-                return
+                Log.w(TAG, "No TYPE_TELEPHONY input exposed; inputs=[${inputs.joinToString { describeDevice(it) }}]")
+                return false
             }
             val accepted = rec.setPreferredDevice(telephony)
             Log.i(TAG, "Capture preferred device -> TELEPHONY id=${telephony.id} accepted=$accepted")
+            accepted
         } catch (e: Exception) {
             Log.w(TAG, "routeCaptureToTelephonyRx failed: ${e.message}")
+            false
         }
     }
 
-    /**
-     * Ask for this track to be routed to the telephony uplink.
-     *
-     * Logs every output device type it can see, because whether the platform
-     * exposes TYPE_TELEPHONY at all is the thing worth knowing when injection
-     * does not work.
-     */
-    private fun routeToTelephonyTx(track: AudioTrack) {
-        try {
-            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-            val outputs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+    /** Request the telephony TX device and leave route confirmation to playbackLoop after play(). */
+    private fun routeToTelephonyTx(track: AudioTrack): Boolean {
+        return try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            val outputs = am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS).orEmpty()
             val telephony = outputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_TELEPHONY }
             if (telephony == null) {
-                Log.w(TAG, "No TYPE_TELEPHONY output exposed — cannot request the uplink route; " +
-                    "outputs: " + outputs.joinToString { "${it.type}/${it.productName}" })
-                return
+                Log.w(TAG, "No TYPE_TELEPHONY output exposed; outputs=${outputs.joinToString { describeDevice(it) }}")
+                return false
             }
             val accepted = track.setPreferredDevice(telephony)
-            Log.i(TAG, "Preferred device -> TELEPHONY id=${telephony.id} accepted=$accepted")
+            Log.i(TAG, "Playback preferred device -> TELEPHONY id=${telephony.id} accepted=$accepted")
+            accepted
         } catch (e: Exception) {
             Log.w(TAG, "routeToTelephonyTx failed: ${e.message}")
+            false
         }
+    }
+
+    private fun waitForTelephonyRoute(device: () -> AudioDeviceInfo?): AudioDeviceInfo? {
+        repeat(10) {
+            val routed = try { device() } catch (_: Exception) { null }
+            if (routed?.type == AudioDeviceInfo.TYPE_TELEPHONY) return routed
+            if (!running.get()) return routed
+            Thread.sleep(50)
+        }
+        return try { device() } catch (_: Exception) { null }
+    }
+
+    private fun failAudioMedia(error: String) {
+        if (!mediaFailureReported.compareAndSet(false, true)) return
+        val message = "Audio capability/media failure: $error"
+        Log.e(TAG, message)
+        listener?.onRtpStats(message)
+        listener?.onRtpError(error)
+        stop()
     }
 
     // ── Per-frame scratch buffers ────────────────────────────────────
@@ -1516,8 +1519,19 @@ class RtpSession(
         // continuously, preventing underruns.  Removing the old 20ms prefill
         // saves that much initial latency.
         track.play()
+        if (profile.requireTelephonyTx) {
+            val routed = waitForTelephonyRoute { track.routedDevice }
+            if (!running.get()) return
+            if (routed?.type != AudioDeviceInfo.TYPE_TELEPHONY) {
+                failAudioMedia(
+                    "AudioTrack did not settle on required TYPE_TELEPHONY output " +
+                        "(actual=${routed?.let(::describeDevice) ?: "none"})"
+                )
+                return
+            }
+        }
         Log.i(TAG, "Playback started (rate=$playbackRate usage=$playbackUsageName deepBuffer=true) " +
-            "routedTo=${track.routedDevice?.type}")
+            "routedTo=${track.routedDevice?.let(::describeDevice) ?: "none"}")
 
         // Set incall_music_enabled=true AFTER AudioTrack.play(): the Qualcomm
         // HAL on MSM8930 starts the incall-music usecase only once there is an
@@ -1528,14 +1542,13 @@ class RtpSession(
         // in-call record session the HAL has just started — measured on SM6150:
         // VOICE_CALL delivered real audio (rawRMS=208) until this second toggle
         // fired 8ms later, after which capture went to zero.
-        if (!profile.incallMusicBeforeTrack) {
-            enableIncallMusic()
+        if (!profile.useGenericRouting) {
+            if (!profile.incallMusicBeforeTrack) {
+                enableIncallMusic()
+            }
+            // Set mixer controls only for an operator-selected legacy profile.
+            enableIncallMusicViaMixer()
         }
-        // Set mixer controls via root — also handles Voice Tx Mute=0.
-        // No separate ensureVoiceTxOpen() call here: the mixer thread below
-        // already issues that command, and waiting for su -c was blocking
-        // the playback thread for ~100ms.
-        enableIncallMusicViaMixer()
 
         // Silence frame for when jitter buffer is empty — prevents underruns
         // that cause BUFFER TIMEOUT and AudioTrack disable/restart cycles.

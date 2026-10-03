@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.telecom.Call
 import android.telecom.DisconnectCause
+import android.telecom.PhoneAccountHandle
 import android.telephony.PhoneNumberUtils
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
@@ -26,7 +27,9 @@ import com.callagent.gateway.sip.GsmCallMetadata
 import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.util.UUID
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
@@ -54,17 +57,33 @@ import java.util.concurrent.TimeUnit
  */
 class CallOrchestrator(
     private val context: Context,
-    private val sipClient: SipClient
+    private val sipClient: SipClient,
+    private val incomingAccountResolver: (Context, PhoneAccountHandle?) -> SimRegistry.SimMapping? =
+        { appContext, handle -> SimRegistry.resolvePhoneAccount(appContext, handle) }
 ) : SipClient.Listener, GsmCallManager.Listener, SipCall.Listener {
 
     private var activeRtpSession: RtpSession? = null
-    private var activeSipCall: SipCall? = null
-    private var activeGsmCall: Call? = null
-    private var activeGsmMapping: SimRegistry.SimMapping? = null
-    private var activeBusinessCallId: String? = null
+    @Volatile private var activeSipCall: SipCall? = null
+    @Volatile private var activeGsmCall: Call? = null
+    @Volatile private var activeGsmMapping: SimRegistry.SimMapping? = null
+    @Volatile private var activeBusinessCallId: String? = null
+    @Volatile private var activeInboundCallerNumber: String? = null
+    private var pendingInboundCall: Call? = null
+    private var pendingInboundCallId: String? = null
+    private var pendingInboundGeneration = -1L
+    private var pendingInboundResolution: Future<*>? = null
+    private var inboundFlowTask: Future<*>? = null
+    @Volatile private var stopped = false
     @Volatile private var mediaBridgeEstablished = false
     private val telecomHandler = Handler(Looper.getMainLooper())
     @Volatile private var lastStateChangeTime = 0L
+
+    /** SIM-account resolution can cross the Magisk broker and take seconds.
+     *  Keep that IPC off Telecom's callback thread and make it interruptible
+     *  when the call or this orchestrator is torn down. */
+    private val inboundWorker: ExecutorService = Executors.newFixedThreadPool(2) { r ->
+        Thread(r, "inbound-sim-resolver").apply { isDaemon = true }
+    }
 
     // Pending RTP info: saved when SIP answers before GSM is picked up.
     // onGsmCallActive reads these to start RTP immediately after GSM pickup.
@@ -130,6 +149,7 @@ class CallOrchestrator(
     }
 
     fun start() {
+        stopped = false
         synchronized(dispatchRecoveryLock) {
             if (!dispatchRecoveryComplete) {
                 try {
@@ -148,7 +168,11 @@ class CallOrchestrator(
         Log.i(TAG, "CallOrchestrator started")
     }
 
+    @Synchronized
     fun stop() {
+        stopped = true
+        cancelPendingInboundWork()
+        inboundWorker.shutdownNow()
         tearDown("Orchestrator stopped", ledgerStateOverride = "unknown")
         sipClient.listener = null
         GsmCallManager.listener = null
@@ -419,16 +443,22 @@ class CallOrchestrator(
                 val callId = activeBusinessCallId
                 val gsmCall = activeGsmCall
                 if (mapping != null && callId != null && gsmCall != null) {
-                    handleInboundFlow(
-                        gsmCall,
-                        mapping,
-                        GsmCallMetadata(
-                            GsmCallMetadata.SUPPORTED_PROTOCOL_VERSION,
-                            callId,
-                            mapping.simId,
-                            mapping.mappingRevision
-                        )
-                    )
+                    val retryGeneration = generation
+                    val callerNumber = activeInboundCallerNumber.orEmpty()
+                    if (!submitInboundFlow(
+                            gsmCall,
+                            mapping,
+                            GsmCallMetadata(
+                                GsmCallMetadata.SUPPORTED_PROTOCOL_VERSION,
+                                callId,
+                                mapping.simId,
+                                mapping.mappingRevision
+                            ),
+                            callerNumber,
+                            retryGeneration
+                        )) {
+                        tearDown("Could not restart authenticated SIP call")
+                    }
                 } else {
                     Log.e(TAG, "SIP retry lacks the durable GSM call mapping; aborting")
                     tearDown("SIP retry mapping unavailable")
@@ -447,39 +477,102 @@ class CallOrchestrator(
     override fun onIncomingGsmCall(call: Call, number: String) {
         Log.i(TAG, "Incoming GSM call detected")
 
+        // InCallService callbacks normally arrive on the main looper. Keep the
+        // reservation there even on OEMs which invoke the listener elsewhere.
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            telecomHandler.post { onIncomingGsmCall(call, number) }
+            return
+        }
+
+        // Telecom can report the same Call through more than one callback.
+        // Once reserved, it is already being resolved and must not be treated
+        // as a competing call.
+        if (activeGsmCall === call && bridgeState != BridgeState.IDLE) {
+            Log.d(TAG, "Ignoring duplicate incoming callback for the reserved GSM call")
+            return
+        }
+
+        if (stopped || !isRingingOrActive(call)) {
+            Log.w(TAG, "Ignoring incoming callback for a stopped or ended GSM call")
+            return
+        }
+
         if (bridgeState != BridgeState.IDLE) {
             Log.w(TAG, "Busy — rejecting GSM call")
-            GsmCallManager.rejectCall(call)
+            rejectOrDisconnect(call)
             return
         }
 
         if (!hasRecordAudioPermission()) {
             Log.w(TAG, "Rejecting GSM call because microphone permission is unavailable")
-            GsmCallManager.rejectCall(call)
+            rejectOrDisconnect(call)
             listener?.onError("Call rejected: microphone permission is not granted")
             return
         }
 
-        val mapping = try {
-            SimRegistry.resolvePhoneAccount(context, call.details?.accountHandle)
+        val callId = UUID.randomUUID().toString()
+        val callGeneration = generation
+        val accountHandle = call.details?.accountHandle
+
+        // Reserve the one-call bridge before any slow broker work. This keeps
+        // a second incoming call from taking over while account mapping runs.
+        sipCallRetries = 0
+        activeGsmMapping = null
+        activeBusinessCallId = null
+        activeInboundCallerNumber = number
+        mediaBridgeEstablished = false
+        bridgeState = BridgeState.GSM_RINGING
+        activeGsmCall = call
+        pendingInboundCall = call
+        pendingInboundCallId = callId
+        pendingInboundGeneration = callGeneration
+        listener?.onStateChanged(bridgeState, "Incoming GSM call")
+
+        try {
+            pendingInboundResolution = inboundWorker.submit {
+                val mapping = try {
+                    incomingAccountResolver(context, accountHandle)
+                } catch (e: Exception) {
+                    Log.w(TAG, "SIM account resolution failed: ${e.javaClass.simpleName}")
+                    null
+                }
+                telecomHandler.post {
+                    completeInboundSimResolution(call, number, callId, callGeneration, mapping)
+                }
+            }
         } catch (e: Exception) {
-            Log.w(TAG, "SIM registry unavailable; rejecting incoming GSM call")
-            null
+            Log.e(TAG, "Could not schedule SIM account resolution: ${e.javaClass.simpleName}")
+            failPendingInbound(call, callId, callGeneration,
+                "Call rejected: SIM account mapping is unavailable")
+        }
+    }
+
+    /** Runs on the main looper after the slow SIM lookup has returned. */
+    @Synchronized
+    private fun completeInboundSimResolution(
+        call: Call,
+        number: String,
+        callId: String,
+        callGeneration: Long,
+        mapping: SimRegistry.SimMapping?
+    ) {
+        if (!isPendingInbound(call, callId, callGeneration)) return
+        pendingInboundResolution = null
+
+        if (!isRingingOrActive(call)) {
+            Log.i(TAG, "Incoming GSM call ended before SIM mapping completed")
+            tearDown("GSM call ended during SIM mapping")
+            return
         }
         if (mapping == null) {
             Log.w(TAG, "Incoming GSM call has no verified SIM account mapping; rejecting")
-            GsmCallManager.rejectCall(call)
-            listener?.onError("Call rejected: SIM account mapping is unavailable")
+            failPendingInbound(call, callId, callGeneration,
+                "Call rejected: SIM account mapping is unavailable")
             return
         }
 
-        val callId = UUID.randomUUID().toString()
-        val metadata = GsmCallMetadata(
-            GsmCallMetadata.SUPPORTED_PROTOCOL_VERSION,
-            callId,
-            mapping.simId,
-            mapping.mappingRevision
-        )
+        // Persist dispatching before any network send. This write is small and
+        // local; the potentially slow root/broker lookup above never runs here.
         val recorded = try {
             GatewayDatabase.get(context).beginCallDispatch(
                 callId, mapping.simId, mapping.mappingRevision, "incoming"
@@ -489,32 +582,74 @@ class CallOrchestrator(
             false
         }
         if (!recorded) {
-            GsmCallManager.rejectCall(call)
-            listener?.onError("Call rejected: durable call ledger is unavailable")
+            failPendingInbound(call, callId, callGeneration,
+                "Call rejected: durable call ledger is unavailable")
             return
         }
 
-        sipCallRetries = 0
         activeGsmMapping = mapping
         activeBusinessCallId = callId
-        mediaBridgeEstablished = false
-        bridgeState = BridgeState.GSM_RINGING
-        activeGsmCall = call
-        listener?.onStateChanged(bridgeState, "Incoming GSM call")
+        activeInboundCallerNumber = number
+        clearPendingInbound()
 
-        // Don't answer GSM yet — place SIP call to Asterisk first.
-        // When the agent answers on SIP, we'll answer GSM so the caller
-        // hears the agent immediately with no dead air.
-        // The caller hears normal ringing in the meantime.
-        Log.i(TAG, "GSM call is ringing; placing authenticated SIP call")
-        Thread({
-            try {
-                handleInboundFlow(call, mapping, metadata)
-            } catch (e: Exception) {
-                Log.e(TAG, "Could not start authenticated SIP call for GSM leg: ${e.javaClass.simpleName}")
-                tearDown("SIP call setup failed")
+        val metadata = GsmCallMetadata(
+            GsmCallMetadata.SUPPORTED_PROTOCOL_VERSION,
+            callId,
+            mapping.simId,
+            mapping.mappingRevision
+        )
+        Log.i(TAG, "GSM call is ringing; resolving the confirmed SIM before SIP dispatch")
+        if (!submitInboundFlow(call, mapping, metadata, number, callGeneration)) {
+            tearDown("Could not start authenticated SIP call")
+        }
+    }
+
+    @Synchronized
+    private fun failPendingInbound(
+        call: Call,
+        callId: String,
+        callGeneration: Long,
+        error: String
+    ) {
+        if (!isPendingInbound(call, callId, callGeneration)) return
+        listener?.onError(error)
+        tearDown(error)
+    }
+
+    private fun isPendingInbound(call: Call, callId: String, callGeneration: Long): Boolean =
+        !stopped && generation == callGeneration && bridgeState == BridgeState.GSM_RINGING &&
+            activeGsmCall === call && pendingInboundCall === call &&
+            pendingInboundCallId == callId && pendingInboundGeneration == callGeneration
+
+    private fun clearPendingInbound() {
+        pendingInboundResolution?.cancel(true)
+        pendingInboundResolution = null
+        pendingInboundCall = null
+        pendingInboundCallId = null
+        pendingInboundGeneration = -1L
+    }
+
+    private fun cancelPendingInboundWork() {
+        clearPendingInbound()
+        inboundFlowTask?.cancel(true)
+        inboundFlowTask = null
+    }
+
+    private fun rejectOrDisconnect(call: Call) {
+        try {
+            when (call.state) {
+                Call.STATE_RINGING -> GsmCallManager.rejectCall(call)
+                Call.STATE_ACTIVE, Call.STATE_DIALING, Call.STATE_CONNECTING -> call.disconnect()
             }
-        }, "SIP-OutCall").start()
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not reject competing GSM call: ${e.javaClass.simpleName}")
+        }
+    }
+
+    private fun isRingingOrActive(call: Call): Boolean = try {
+        call.state == Call.STATE_RINGING || call.state == Call.STATE_ACTIVE
+    } catch (_: Exception) {
+        false
     }
 
     /** GSM call is now active (answered) */
@@ -646,6 +781,10 @@ class CallOrchestrator(
     // onCallTerminated is already implemented above (shared by SipClient.Listener and SipCall.Listener)
 
     override fun onRtpReady(call: SipCall, remoteRtpAddr: String, remoteRtpPort: Int, payloadType: Int) {
+        if (call !== activeSipCall) {
+            Log.d(TAG, "Ignoring RTP-ready callback from a stale SIP call")
+            return
+        }
         val codecName = when (payloadType) {
             RtpPacket.PT_G722 -> "G.722"
             RtpPacket.PT_PCMA -> "PCMA"
@@ -683,9 +822,27 @@ class CallOrchestrator(
                 pendingPayloadType = payloadType
                 pendingLocalRtpPort = call.localRtpPort
 
-                Log.i(TAG, "SIP answered (codec=$codecName) — answering GSM call now")
-                activeGsmCall?.let { GsmCallManager.answerCall(it) }
-                    ?: Log.e(TAG, "SIP answered but no active GSM call to answer!")
+                val targetCall = activeGsmCall
+                if (targetCall == null) {
+                    Log.e(TAG, "SIP answered but no active GSM call to answer!")
+                } else {
+                    val callGeneration = generation
+                    Log.i(TAG, "SIP answered (codec=$codecName) — checking GSM call before answering")
+                    telecomHandler.post {
+                        synchronized(this) {
+                            if (stopped || generation != callGeneration ||
+                                activeSipCall !== call || activeGsmCall !== targetCall ||
+                                bridgeState !in setOf(BridgeState.SIP_CALLING, BridgeState.SIP_RINGING)) {
+                                return@post
+                            }
+                            when (targetCall.state) {
+                                Call.STATE_RINGING -> GsmCallManager.answerCall(targetCall)
+                                Call.STATE_ACTIVE -> Unit
+                                else -> tearDown("GSM call ended before answer")
+                            }
+                        }
+                    }
+                }
             }
         } else if (bridgeState == BridgeState.GSM_ANSWERED) {
             // Edge case: GSM was already answered (e.g. user picked up manually)
@@ -710,7 +867,9 @@ class CallOrchestrator(
     private fun handleInboundFlow(
         gsmCall: Call,
         mapping: SimRegistry.SimMapping,
-        metadata: GsmCallMetadata
+        metadata: GsmCallMetadata,
+        callerNumber: String,
+        callGeneration: Long
     ) {
         try {
             SimRegistry.resolveForVoice(
@@ -718,33 +877,128 @@ class CallOrchestrator(
             )
         } catch (e: SimRegistry.SimMappingException) {
             Log.w(TAG, "Inbound call mapping changed before SIP dispatch (${e.code})")
-            tearDown("SIM mapping changed before SIP dispatch")
+            postInboundFlowFailure(gsmCall, metadata, callGeneration,
+                "SIM mapping changed before SIP dispatch")
+            return
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not revalidate inbound SIM mapping: ${e.javaClass.simpleName}")
+            postInboundFlowFailure(gsmCall, metadata, callGeneration,
+                "SIM mapping could not be revalidated")
             return
         }
-        val callerNumber = gsmCall.details?.handle?.schemeSpecificPart ?: "unknown"
-        Log.i(TAG, "Inbound flow: placing authenticated SIP call")
+        if (!isInboundFlowIdentityCurrent(gsmCall, metadata, callGeneration)) return
 
+        val sipDestination: String
+        val rtpPort: Int
+        try {
+            // These may call into telephony and bind a socket; keep them away
+            // from Telecom's callback looper as well.
+            sipDestination = inboundSipDestination(mapping)
+            rtpPort = allocateRtpPort()
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not prepare inbound SIP call: ${e.javaClass.simpleName}")
+            postInboundFlowFailure(gsmCall, metadata, callGeneration,
+                "Could not prepare inbound SIP call")
+            return
+        }
+
+        dispatchInboundFlow(
+            gsmCall, metadata, callerNumber, sipDestination, rtpPort, callGeneration
+        )
+    }
+
+    @Synchronized
+    private fun submitInboundFlow(
+        gsmCall: Call,
+        mapping: SimRegistry.SimMapping,
+        metadata: GsmCallMetadata,
+        callerNumber: String,
+        callGeneration: Long
+    ): Boolean {
+        if (stopped || inboundWorker.isShutdown ||
+            !isInboundFlowIdentityCurrent(gsmCall, metadata, callGeneration)) return false
+        return try {
+            inboundFlowTask = inboundWorker.submit {
+                handleInboundFlow(gsmCall, mapping, metadata, callerNumber, callGeneration)
+            }
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not schedule inbound flow: ${e.javaClass.simpleName}")
+            false
+        }
+    }
+
+    /** The last check and SIP send are serialized with tearDown(), so a
+     *  delayed resolver cannot dispatch after the current call was retired.
+     *  This runs on the inbound worker: makeCall sends an INVITE and must not
+     *  run on Telecom's main callback thread. */
+    @Synchronized
+    private fun dispatchInboundFlow(
+        gsmCall: Call,
+        metadata: GsmCallMetadata,
+        callerNumber: String,
+        sipDestination: String,
+        rtpPort: Int,
+        callGeneration: Long
+    ) {
+        if (!isInboundFlowIdentityCurrent(gsmCall, metadata, callGeneration)) return
+        if (!isRingingOrActive(gsmCall)) {
+            tearDown("GSM call ended before SIP dispatch", sipStatusFor(GsmCallManager.lastDisconnectCause))
+            return
+        }
+        if (bridgeState !in setOf(
+                BridgeState.GSM_RINGING, BridgeState.GSM_ANSWERED,
+                BridgeState.SIP_CALLING, BridgeState.SIP_RINGING
+            )) return
+
+        Log.i(TAG, "Inbound flow: placing authenticated SIP call")
         bridgeState = BridgeState.SIP_CALLING
         listener?.onStateChanged(bridgeState, "Calling Asterisk")
 
-        val rtpPort = allocateRtpPort()
-        val sipCall = sipClient.makeCall(
-            targetExtension = inboundSipDestination(mapping),
-            localRtpPort = rtpPort,
-            callerIdNumber = callerNumber,
-            callerIdName = callerNumber,
-            gsmMetadata = metadata
-        )
-        sipCall.listener = this
-        activeSipCall = sipCall
+        try {
+            val sipCall = sipClient.makeCall(
+                targetExtension = sipDestination,
+                localRtpPort = rtpPort,
+                callerIdNumber = callerNumber,
+                callerIdName = callerNumber,
+                gsmMetadata = metadata
+            )
+            sipCall.listener = this
+            activeSipCall = sipCall
+            Log.i(TAG, "SIP INVITE sent to Asterisk")
 
-        Log.i(TAG, "SIP INVITE sent to Asterisk")
+            // Timeout: if Asterisk doesn't answer within 30s, tear down.
+            schedule(SIP_CALL_TIMEOUT_MS) {
+                if (generation == callGeneration &&
+                    (bridgeState == BridgeState.SIP_CALLING || bridgeState == BridgeState.SIP_RINGING)) {
+                    Log.w(TAG, "SIP call timeout — Asterisk didn't answer in ${SIP_CALL_TIMEOUT_MS / 1000}s")
+                    tearDown("Asterisk not answering")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not send authenticated SIP call: ${e.javaClass.simpleName}")
+            tearDown("SIP call setup failed")
+        }
+    }
 
-        // Timeout: if Asterisk doesn't answer within 30s, tear down
-        schedule(SIP_CALL_TIMEOUT_MS) {
-            if (bridgeState == BridgeState.SIP_CALLING || bridgeState == BridgeState.SIP_RINGING) {
-                Log.w(TAG, "SIP call timeout — Asterisk didn't answer in ${SIP_CALL_TIMEOUT_MS / 1000}s")
-                tearDown("Asterisk not answering")
+    private fun isInboundFlowIdentityCurrent(
+        gsmCall: Call,
+        metadata: GsmCallMetadata,
+        callGeneration: Long
+    ): Boolean = !stopped && generation == callGeneration && activeGsmCall === gsmCall &&
+        activeBusinessCallId == metadata.callId && activeGsmMapping?.simId == metadata.simId &&
+        bridgeState != BridgeState.IDLE && bridgeState != BridgeState.TEARING_DOWN
+
+    private fun postInboundFlowFailure(
+        gsmCall: Call,
+        metadata: GsmCallMetadata,
+        callGeneration: Long,
+        reason: String
+    ) {
+        telecomHandler.post {
+            synchronized(this) {
+                if (!isInboundFlowIdentityCurrent(gsmCall, metadata, callGeneration)) return@synchronized
+                tearDown(reason, sipStatusFor(GsmCallManager.lastDisconnectCause))
             }
         }
     }
@@ -908,6 +1162,7 @@ class CallOrchestrator(
             else -> "failed"
         }
         bridgeState = BridgeState.TEARING_DOWN
+        cancelPendingInboundWork()
         Log.i(TAG, "Tearing down bridge: $reason")
 
         try {
@@ -962,6 +1217,7 @@ class CallOrchestrator(
             lastStateChangeTime = System.currentTimeMillis()
             activeBusinessCallId = null
             activeGsmMapping = null
+            activeInboundCallerNumber = null
             mediaBridgeEstablished = false
             listener?.onStateChanged(BridgeState.IDLE, reason)
             Log.i(TAG, "Bridge torn down: $reason")
@@ -1003,6 +1259,7 @@ class CallOrchestrator(
     private fun forceReset(reason: String) {
         Log.w(TAG, "Force-resetting bridge: $reason")
         val businessCallId = activeBusinessCallId
+        cancelPendingInboundWork()
         try {
             activeRtpSession?.stop()
         } catch (_: Exception) {}
@@ -1028,6 +1285,7 @@ class CallOrchestrator(
         }
         activeBusinessCallId = null
         activeGsmMapping = null
+        activeInboundCallerNumber = null
         mediaBridgeEstablished = false
         bridgeState = BridgeState.IDLE
         generation++

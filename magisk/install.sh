@@ -80,6 +80,8 @@ DEVICE_ABI=$(getprop ro.product.cpu.abi 2>/dev/null)
 case "$DEVICE_ABI" in
     arm64*|aarch64*) TINYMIX_SRC="$MODPATH/tinymix" ;;
     arm*)            TINYMIX_SRC="$MODPATH/tinymix32" ;;
+    x86_64*|amd64*)  TINYMIX_SRC="$MODPATH/tinymix-x86_64" ;;
+    x86*|i686*)       TINYMIX_SRC="$MODPATH/tinymix-x86" ;;
     *)               TINYMIX_SRC="" ;;
 esac
 
@@ -101,18 +103,12 @@ if [ -d "$PRIV_DIR" ]; then
     set_perm_recursive $MODPATH/system/priv-app 0 0 0755 0644
 fi
 # tinymix/tinycap need execute permission
-if [ -f "$MODPATH/tinymix" ]; then
-    chmod 755 "$MODPATH/tinymix"
-fi
-if [ -f "$MODPATH/tinymix32" ]; then
-    chmod 755 "$MODPATH/tinymix32"
-fi
-if [ -f "$MODPATH/tinycap" ]; then
-    chmod 755 "$MODPATH/tinycap"
-fi
-if [ -f "$MODPATH/system/bin/tinymix" ]; then
-    chmod 755 "$MODPATH/system/bin/tinymix"
-fi
+for TOOL in "$MODPATH/tinymix" "$MODPATH/tinymix32" \
+            "$MODPATH/tinymix-x86_64" "$MODPATH/tinymix-x86" \
+            "$MODPATH/tinycap" "$MODPATH/system/bin/tinymix" \
+            "$MODPATH/bin/gsm2sipctl"; do
+    [ -f "$TOOL" ] && chmod 755 "$TOOL"
+done
 
 # Ensure module mount is never skipped
 rm -f "$MODPATH/skip_mount"

@@ -129,3 +129,11 @@ DTMF 是 v1 呼叫验收项。当前 SDP 声明 telephone-event/8000，但 RTP �
 新增`sim/SimRegistry.kt`、`data/GatewayDatabase.kt`（journal/ledger/parts/tombstones）、`net/ControlApiClient.kt`、`net/ControlEventsClient.kt`、`service/HealthReporter.kt`，保留现有Telecom/media实现并小步改造。优先执行联合M0设备探针与G0/G1/G3基础修复，之后按联合M2–M5对接；G5中的安全发布项是生产门槛，不能等正式上线后再处理。
 
 SIM account映射优先使用目标Android版本支持的Telephony/Telecom关联API；API26–30与API31+分支分别验证，不把PhoneAccountHandle.id字符串解析成subId的猜测作为可靠映射。通话中能否发送SMS按两卡各自实测能力声明，未验证时留原任务/原卡/原TTL等待，不自动切卡。
+# 用户实施方向补充（Magisk 通用接口）
+
+先实现 Magisk 模块生命周期、只读能力探测、精确 SIM/Telecom 账户 broker
+与可配置数字音频适配；不以具体旧机型号、机型白名单或 API 31 整体门槛
+阻塞实现。系统接口不足时由模块在受限 system UID 子进程查询；依然不猜
+PhoneAccountHandle.id、不使用默认卡、不把探测当成实际通话验收。
+设备记录是后续验证证据，音频默认按实际 Rx/Tx 端点配置，历史机型 preset
+只允许显式本地选择。具体接口见 [Magisk runtime](docs/magisk-runtime.md)。

@@ -1,6 +1,8 @@
 # Build outputs
 *.apk
 gateway-magisk.zip
+magisk/tinymix-x86
+magisk/tinymix-x86_64
 magisk/system/priv-app/Gateway/
 local.properties
 .env.build

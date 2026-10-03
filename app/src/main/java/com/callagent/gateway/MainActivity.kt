@@ -531,30 +531,30 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Pair the gateway first", Toast.LENGTH_LONG).show()
             return
         }
-        val snapshot = try { SimRegistry.snapshot(this) } catch (_: Exception) { null }
-        val subscriptions = snapshot?.subscriptions.orEmpty()
-        if (subscriptions.isEmpty()) {
-            Toast.makeText(this, "No active SIM subscriptions are available", Toast.LENGTH_LONG).show()
-            return
-        }
         val operationId = UUID.randomUUID().toString()
         val controlBase = findViewById<EditText>(R.id.etControlUrl).text.toString().trim()
-        val mappings = JSONArray()
-        val existingBySubscription = snapshot?.mappings.orEmpty().associateBy { it.subscriptionId }
-        subscriptions.sortedBy { it.slotIndex }.forEach { sub ->
-            val row = JSONObject().put("slot_index", sub.slotIndex)
-                .put("label", sub.displayName.ifBlank { "SIM ${sub.slotIndex + 1}" })
-                .put("carrier_name", sub.carrierName)
-                .put("phone_number", JSONObject.NULL)
-            val known = existingBySubscription[sub.subscriptionId]
-            if (known != null && known.identityState != SimRegistry.IdentityState.UNVERIFIED) {
-                row.put("existing_sim_id", known.simId).put("same_sim_verified", true)
-            }
-            mappings.put(row)
-        }
-        setControlBusy(true, "Requesting server SIM identifiers…")
+        setControlBusy(true, "Reading local SIM capabilities…")
         Thread({
             try {
+                // Magisk may start a short-lived Binder broker; never block the UI waiting for it.
+                val snapshot = SimRegistry.snapshot(this)
+                val subscriptions = snapshot.subscriptions
+                if (subscriptions.isEmpty()) {
+                    throw ControlApiException("SIM_UNAVAILABLE", "No active SIM subscriptions are available")
+                }
+                val mappings = JSONArray()
+                val existingBySubscription = snapshot.mappings.associateBy { it.subscriptionId }
+                subscriptions.sortedBy { it.slotIndex }.forEach { sub ->
+                    val row = JSONObject().put("slot_index", sub.slotIndex)
+                        .put("label", sub.displayName.ifBlank { "SIM ${sub.slotIndex + 1}" })
+                        .put("carrier_name", sub.carrierName)
+                        .put("phone_number", JSONObject.NULL)
+                    val known = existingBySubscription[sub.subscriptionId]
+                    if (known != null && known.identityState != SimRegistry.IdentityState.UNVERIFIED) {
+                        row.put("existing_sim_id", known.simId).put("same_sim_verified", true)
+                    }
+                    mappings.put(row)
+                }
                 val proposal = ControlApiClient(this, controlBase).proposeSimBindings(operationId, mappings)
                 val encoded = JSONObject().put("mapping_revision", proposal.mappingRevision)
                     .put("mappings", JSONArray().apply {
@@ -579,6 +579,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun restorePendingSimProposal() {
+        val session = CredentialStore.load(this) ?: return
+        Thread({ restorePendingSimProposalInBackground(session) }, "gateway-sim-restore").start()
+    }
+
+    private fun restorePendingSimProposalInBackground(expectedSession: CredentialStore.Session) {
         val saved = runCatching { GatewayDatabase.get(this).pendingSimProposal() }.getOrNull() ?: return
         try {
             val json = JSONObject(saved.second)
@@ -590,16 +595,25 @@ class MainActivity : AppCompatActivity() {
                     m.getString("state"), m.getLong("mapping_revision"))
             }
             val proposal = MappingProposal(saved.first, revision, mappings)
-            pendingMappingProposal = proposal
             val snapshot = runCatching { SimRegistry.snapshot(this) }.getOrNull() ?: return
-            simProposalSubscriptions = snapshot.subscriptions
             val selected = json.optJSONObject("selected") ?: JSONObject()
+            val restoredSelections = mutableMapOf<String, SimRegistry.SimSubscription>()
             selected.keys().forEach { simId ->
                 val subId = selected.optInt(simId, Int.MIN_VALUE)
                 snapshot.subscriptions.firstOrNull { it.subscriptionId == subId }
-                    ?.let { selectedSimBindings[simId] = it }
+                    ?.let { restoredSelections[simId] = it }
             }
-            renderSimProposal(proposal, snapshot.subscriptions)
+            runOnUiThread {
+                if (isFinishing || isDestroyed || controlBusy || pendingMappingProposal != null) return@runOnUiThread
+                val currentSession = CredentialStore.load(this) ?: return@runOnUiThread
+                if (currentSession.gatewayId != expectedSession.gatewayId ||
+                    currentSession.controlBaseUrl != expectedSession.controlBaseUrl) return@runOnUiThread
+                pendingMappingProposal = proposal
+                simProposalSubscriptions = snapshot.subscriptions
+                selectedSimBindings.clear()
+                selectedSimBindings.putAll(restoredSelections)
+                renderSimProposal(proposal, snapshot.subscriptions)
+            }
         } catch (_: Exception) {
             GatewayDatabase.get(this).clearSimProposal(saved.first)
         }
@@ -693,15 +707,6 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Each server SIM row must use a different local subscription", Toast.LENGTH_LONG).show()
             return
         }
-        val initialSnapshot = runCatching { SimRegistry.snapshot(this) }.getOrNull()
-        if (initialSnapshot == null || chosenBySimId.values.any { chosen ->
-                initialSnapshot.subscriptions.none {
-                    it.subscriptionId == chosen.subscriptionId && it.slotIndex == chosen.slotIndex
-                }
-            }) {
-            Toast.makeText(this, "SIM subscriptions changed. Refresh the SIM list and select again.", Toast.LENGTH_LONG).show()
-            return
-        }
         val controlBase = findViewById<EditText>(R.id.etControlUrl).text.toString().trim()
         val confirmations = JSONArray()
         proposal.mappings.forEach { mapping ->
@@ -711,6 +716,14 @@ class MainActivity : AppCompatActivity() {
         setControlBusy(true, "Confirming SIM bindings with the server…")
         Thread({
             try {
+                val initialSnapshot = SimRegistry.snapshot(this)
+                if (chosenBySimId.values.any { chosen ->
+                        initialSnapshot.subscriptions.none {
+                            it.subscriptionId == chosen.subscriptionId && it.slotIndex == chosen.slotIndex
+                        }
+                    }) {
+                    throw ControlApiException("SIM_SUBSCRIPTION_CHANGED", "SIM subscriptions changed. Refresh and select again.")
+                }
                 val results = ControlApiClient(this, controlBase)
                     .confirmSimBindings(proposal.operationId, confirmations)
                 val proposedById = proposal.mappings.associateBy { it.simId }

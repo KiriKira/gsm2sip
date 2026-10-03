@@ -3,14 +3,17 @@ package com.callagent.gateway.sim
 import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Build
+import android.os.Process
 import android.provider.Settings
 import android.telecom.PhoneAccount
 import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
+import android.os.UserHandle
 import android.telephony.SubscriptionInfo
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import com.callagent.gateway.data.CredentialStore
+import com.callagent.gateway.root.MagiskRuntime
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
@@ -23,9 +26,8 @@ import java.util.UUID
  * fingerprint; neither the ICCID nor its fingerprint leaves this device.
  *
  * The registry deliberately separates SMS availability from voice-account
- * availability. Android versions before API 31 do not expose a supported
- * subscription-to-PhoneAccountHandle association to ordinary apps, so SMS can
- * still use a confirmed subscription there while voice is rejected.
+ * availability. Voice requires an exact, unique Telephony/Telecom association;
+ * it never infers a subId from the opaque PhoneAccountHandle id.
  */
 object SimRegistry {
 
@@ -44,8 +46,20 @@ object SimRegistry {
         UNVERIFIED
     }
 
+    internal enum class VoiceAccountApiPath {
+        MAGISK_BROKER,
+        PUBLIC_REVERSE,
+        PUBLIC_FORWARD_AND_REVERSE
+    }
+
     /** Pure safety predicates shared by registry operations and regression tests. */
     internal object Policy {
+        fun voiceAccountApiPath(apiLevel: Int): VoiceAccountApiPath = when {
+            apiLevel >= Build.VERSION_CODES.S -> VoiceAccountApiPath.PUBLIC_FORWARD_AND_REVERSE
+            apiLevel >= Build.VERSION_CODES.R -> VoiceAccountApiPath.PUBLIC_REVERSE
+            else -> VoiceAccountApiPath.MAGISK_BROKER
+        }
+
         fun fingerprintMismatch(pinned: String?, observed: String?): Boolean =
             pinned != null && observed != null && pinned != observed
 
@@ -174,9 +188,10 @@ object SimRegistry {
         val appContext = context.applicationContext
         val state = loadState(appContext)
         ensureGatewayOwner(appContext, state)
-        refreshBindings(appContext, state)
+        val current = readCurrentSubscriptions(appContext, state.salt, includeVoice = true)
+        refreshBindings(appContext, state, current)
         persist(appContext, state)
-        makeSnapshot(appContext, state)
+        makeSnapshot(appContext, state, current)
     }
 
     /** Clear server-owned SIM UUIDs after the gateway is paired to a new owner. */
@@ -233,9 +248,10 @@ object SimRegistry {
             }
         }
         state.mappingRevision = serverRevision
-        refreshBindings(appContext, state)
+        val current = readCurrentSubscriptions(appContext, state.salt, includeVoice = true)
+        refreshBindings(appContext, state, current)
         persist(appContext, state)
-        makeSnapshot(appContext, state)
+        makeSnapshot(appContext, state, current)
     }
 
     /** Fail closed after a 409/resync by adopting the server revision only. */
@@ -257,9 +273,10 @@ object SimRegistry {
             }
         }
         state.mappingRevision = serverRevision
-        refreshBindings(appContext, state)
+        val current = readCurrentSubscriptions(appContext, state.salt, includeVoice = true)
+        refreshBindings(appContext, state, current)
         persist(appContext, state)
-        makeSnapshot(appContext, state)
+        makeSnapshot(appContext, state, current)
     }
 
     /** Re-confirm an existing unchanged binding after local user review. */
@@ -286,11 +303,11 @@ object SimRegistry {
         if (state.ownerId.isEmpty()) {
             throw SimMappingException(ErrorCode.SIM_UNAVAILABLE, "Gateway is not paired to a server")
         }
-        refreshBindings(appContext, state)
+        val current = readCurrentSubscriptions(appContext, state.salt, includeVoice = true)
+        refreshBindings(appContext, state, current)
         if (serverRevision != null && serverRevision < state.mappingRevision) {
             throw SimMappingException(ErrorCode.SIM_MAPPING_CHANGED, "Server SIM mapping revision is stale")
         }
-        val current = readCurrentSubscriptions(appContext, state.salt)
         val selected = current.firstOrNull { it.info.subscriptionId == subId }
             ?: throw SimMappingException(ErrorCode.SIM_UNAVAILABLE, "Selected SIM subscription is unavailable")
 
@@ -326,10 +343,12 @@ object SimRegistry {
         } else {
             IdentityState.LOCAL_CONFIRMED
         }
+        val accountChanged = existing?.accountHandleKey != null && currentAccountKey != null &&
+            existing.accountHandleKey != currentAccountKey
         val bindingChanged = existing == null ||
             existing.subscriptionId != subId ||
             existing.slotIndex != slot ||
-            existing.accountHandleKey != currentAccountKey
+            accountChanged
         if (!Policy.canUseSingleConfirmation(state.mappingRevision, serverRevision, bindingChanged)) {
             throw SimMappingException(
                 ErrorCode.SIM_MAPPING_CHANGED,
@@ -346,7 +365,7 @@ object SimRegistry {
             accountHandleKey = currentAccountKey ?: existing?.accountHandleKey
         )
         persist(appContext, state)
-        mappingFor(appContext, state, state.mappings.getValue(canonicalSimId), selected)
+        mappingFor(state, state.mappings.getValue(canonicalSimId), selected)
     }
 
     /** Atomically adopt the complete active local binding set from one server proposal. */
@@ -368,11 +387,12 @@ object SimRegistry {
         if (state.ownerId.isEmpty()) {
             throw SimMappingException(ErrorCode.SIM_UNAVAILABLE, "Gateway is not paired to a server")
         }
-        refreshBindings(appContext, state)
+        val currentSubscriptions = readCurrentSubscriptions(appContext, state.salt, includeVoice = true)
+        refreshBindings(appContext, state, currentSubscriptions)
         if (!Policy.isNewProposal(state.mappingRevision, serverRevision)) {
             throw SimMappingException(ErrorCode.SIM_MAPPING_CHANGED, "Changed SIM binding requires a newer server revision")
         }
-        val current = readCurrentSubscriptions(appContext, state.salt).associateBy { it.info.subscriptionId }
+        val current = currentSubscriptions.associateBy { it.info.subscriptionId }
         val prepared = confirmations.mapIndexed { index, confirmation ->
             val simId = canonical[index]
             val selected = current[confirmation.subscriptionId]
@@ -416,13 +436,13 @@ object SimRegistry {
         state.mappings.clear()
         prepared.forEach { (stored, _) -> state.mappings[stored.simId] = stored }
         persist(appContext, state)
-        prepared.map { (stored, currentSubscription) -> mappingFor(appContext, state, stored, currentSubscription) }
+        prepared.map { (stored, currentSubscription) -> mappingFor(state, stored, currentSubscription) }
     }
 
     /**
-     * Resolve a mapping for a SIM-directed operation such as SMS. Voice is
-     * intentionally a separate check because older Android releases can still
-     * bind SMS to a subscription while lacking a supported Telecom association.
+     * Resolve a mapping for a SIM-directed operation such as SMS. This path
+     * does not wait on the Telecom broker; voice dispatch performs a separate
+     * exact account revalidation immediately before using Telecom.
      */
     @JvmStatic
     fun resolve(
@@ -430,11 +450,26 @@ object SimRegistry {
         simId: String,
         expectedRevision: Long,
         expectedLocalRevisionBarrier: Long? = null
+    ): SimMapping = resolveInternal(
+        context,
+        simId,
+        expectedRevision,
+        expectedLocalRevisionBarrier,
+        includeVoice = false
+    )
+
+    private fun resolveInternal(
+        context: Context,
+        simId: String,
+        expectedRevision: Long,
+        expectedLocalRevisionBarrier: Long?,
+        includeVoice: Boolean
     ): SimMapping = synchronized(lock) {
         val appContext = context.applicationContext
         val state = loadState(appContext)
         ensureGatewayOwner(appContext, state)
-        refreshBindings(appContext, state)
+        val active = readCurrentSubscriptions(appContext, state.salt, includeVoice)
+        refreshBindings(appContext, state, active)
         persist(appContext, state)
 
         val canonicalSimId = canonicalServerSimId(simId)
@@ -449,7 +484,6 @@ object SimRegistry {
         }
         val stored = state.mappings[canonicalSimId]
             ?: throw SimMappingException(ErrorCode.SIM_MAPPING_CHANGED, "SIM id is not locally mapped")
-        val active = readCurrentSubscriptions(appContext, state.salt)
         val current = active.firstOrNull { it.info.subscriptionId == stored.subscriptionId }
             ?: throw SimMappingException(ErrorCode.SIM_UNAVAILABLE, "Mapped SIM subscription is unavailable")
         if (Policy.fingerprintMismatch(stored.fingerprint, current.fingerprint) ||
@@ -467,7 +501,7 @@ object SimRegistry {
         if (current.info.simSlotIndex != stored.slotIndex) {
             throw SimMappingException(ErrorCode.SIM_MAPPING_CHANGED, "Mapped SIM moved to a different slot")
         }
-        mappingFor(appContext, state, stored, current)
+        mappingFor(state, stored, current)
     }
 
     /** Resolve a mapping that is safe for explicit Telecom placeCall. */
@@ -478,7 +512,14 @@ object SimRegistry {
         expectedRevision: Long,
         expectedLocalRevisionBarrier: Long? = null
     ): SimMapping {
-        val mapping = resolve(context, simId, expectedRevision, expectedLocalRevisionBarrier)
+        MagiskRuntime.invalidatePhoneAccounts()
+        val mapping = resolveInternal(
+            context,
+            simId,
+            expectedRevision,
+            expectedLocalRevisionBarrier,
+            includeVoice = true
+        )
         if (!mapping.voiceAvailable || mapping.phoneAccountHandle == null) {
             throw SimMappingException(ErrorCode.SIM_UNAVAILABLE, "No verified Telecom account is available for this SIM")
         }
@@ -487,47 +528,54 @@ object SimRegistry {
 
     /** Resolve an incoming Telecom call's exact account handle to a local SIM. */
     @JvmStatic
-    fun resolvePhoneAccount(context: Context, handle: PhoneAccountHandle?): SimMapping? = synchronized(lock) {
+    fun resolvePhoneAccount(context: Context, handle: PhoneAccountHandle?): SimMapping? {
         if (handle == null) return null
-        val appContext = context.applicationContext
-        val state = loadState(appContext)
-        ensureGatewayOwner(appContext, state)
-        refreshBindings(appContext, state)
-        val current = readCurrentSubscriptions(appContext, state.salt)
-        val handleKey = accountHandleKey(handle)
-        val match = state.mappings.values.firstNotNullOfOrNull { stored ->
-            val subscription = current.firstOrNull { it.info.subscriptionId == stored.subscriptionId } ?: return@firstNotNullOfOrNull null
-            val identityChanged = subscription.info.simSlotIndex != stored.slotIndex ||
-                Policy.fingerprintMismatch(stored.fingerprint, subscription.fingerprint) ||
-                Policy.newFingerprintNeedsConfirmation(
-                    stored.identityState, stored.fingerprint, subscription.fingerprint
-                ) ||
-                (stored.identityState == IdentityState.FINGERPRINT_VERIFIED &&
-                    stored.fingerprint != null && subscription.fingerprint == null) ||
-                (stored.accountHandleKey != null &&
-                    stored.accountHandleKey != subscription.phoneAccountHandle?.let(::accountHandleKey))
-            if (identityChanged && stored.identityState != IdentityState.UNVERIFIED) {
-                stored.identityState = IdentityState.UNVERIFIED
-                bumpLocalBarrier(state)
+        MagiskRuntime.invalidatePhoneAccounts()
+        return synchronized(lock) {
+            val appContext = context.applicationContext
+            val state = loadState(appContext)
+            ensureGatewayOwner(appContext, state)
+            val current = readCurrentSubscriptions(appContext, state.salt, includeVoice = true)
+            refreshBindings(appContext, state, current)
+            val match = state.mappings.values.firstNotNullOfOrNull { stored ->
+                val subscription = current.firstOrNull { it.info.subscriptionId == stored.subscriptionId }
+                    ?: return@firstNotNullOfOrNull null
+                val subscriptionAccountKey = subscription.phoneAccountHandle?.let(::accountHandleKey)
+                val identityChanged = subscription.info.simSlotIndex != stored.slotIndex ||
+                    Policy.fingerprintMismatch(stored.fingerprint, subscription.fingerprint) ||
+                    Policy.newFingerprintNeedsConfirmation(
+                        stored.identityState, stored.fingerprint, subscription.fingerprint
+                    ) ||
+                    (stored.identityState == IdentityState.FINGERPRINT_VERIFIED &&
+                        stored.fingerprint != null && subscription.fingerprint == null) ||
+                    (stored.accountHandleKey != null && subscriptionAccountKey != null &&
+                        stored.accountHandleKey != subscriptionAccountKey)
+                if (identityChanged && stored.identityState != IdentityState.UNVERIFIED) {
+                    stored.identityState = IdentityState.UNVERIFIED
+                    bumpLocalBarrier(state)
+                }
+                if (identityChanged || stored.identityState == IdentityState.UNVERIFIED ||
+                    subscription.phoneAccountHandle != handle ||
+                    handle.userHandle != UserHandle.getUserHandleForUid(Process.myUid())) {
+                    null
+                } else {
+                    mappingFor(state, stored, subscription)
+                }
             }
-            if (identityChanged || stored.identityState == IdentityState.UNVERIFIED ||
-                subscription.phoneAccountHandle != handle ||
-                !isCallCapableAccount(appContext, handle)) {
-                null
-            } else {
-                mappingFor(appContext, state, stored, subscription)
-            }
+            persist(appContext, state)
+            match?.takeIf { it.voiceAvailable && it.phoneAccountHandle == handle }
         }
-        persist(appContext, state)
-        match?.takeIf { it.voiceAvailable && it.phoneAccountHandle == handle }
     }
 
-    private fun makeSnapshot(context: Context, state: RegistryState): SimRegistrySnapshot {
-        val current = readCurrentSubscriptions(context, state.salt)
+    private fun makeSnapshot(
+        context: Context,
+        state: RegistryState,
+        current: List<CurrentSubscription> = readCurrentSubscriptions(context, state.salt)
+    ): SimRegistrySnapshot {
         val currentBySubId = current.associateBy { it.info.subscriptionId }
         val mappings = state.mappings.values.map { stored ->
             val selected = currentBySubId[stored.subscriptionId]
-            mappingFor(context, state, stored, selected)
+            mappingFor(state, stored, selected)
         }
         val mappedSubIds = state.mappings.values.mapTo(HashSet()) { it.subscriptionId }
         val subscriptions = current.map { item ->
@@ -547,7 +595,6 @@ object SimRegistry {
     }
 
     private fun mappingFor(
-        context: Context,
         state: RegistryState,
         stored: StoredMapping,
         current: CurrentSubscription?
@@ -555,7 +602,7 @@ object SimRegistry {
         val account = current?.phoneAccountHandle
         val accountMatches = stored.accountHandleKey == null ||
             (account != null && stored.accountHandleKey == accountHandleKey(account))
-        val voiceAvailable = account != null && accountMatches && isCallCapableAccount(context, account)
+        val voiceAvailable = account != null && accountMatches
         return SimMapping(
             simId = stored.simId,
             subscriptionId = stored.subscriptionId,
@@ -569,8 +616,12 @@ object SimRegistry {
         )
     }
 
-    private fun refreshBindings(context: Context, state: RegistryState) {
-        val current = readCurrentSubscriptions(context, state.salt).associateBy { it.info.subscriptionId }
+    private fun refreshBindings(
+        context: Context,
+        state: RegistryState,
+        subscriptions: List<CurrentSubscription> = readCurrentSubscriptions(context, state.salt)
+    ) {
+        val current = subscriptions.associateBy { it.info.subscriptionId }
         state.mappings.values.forEach { stored ->
             val active = current[stored.subscriptionId]
             if (active == null) {
@@ -611,7 +662,11 @@ object SimRegistry {
     }
 
     @SuppressLint("MissingPermission")
-    private fun readCurrentSubscriptions(context: Context, salt: ByteArray): List<CurrentSubscription> {
+    private fun readCurrentSubscriptions(
+        context: Context,
+        salt: ByteArray,
+        includeVoice: Boolean = true
+    ): List<CurrentSubscription> {
         val subscriptionManager = context.getSystemService(SubscriptionManager::class.java)
             ?: throw SimMappingException(ErrorCode.SIM_UNAVAILABLE, "Subscription service is unavailable")
         val subscriptions = try {
@@ -621,43 +676,79 @@ object SimRegistry {
         } catch (e: RuntimeException) {
             throw SimMappingException(ErrorCode.SIM_UNAVAILABLE, "Cannot read active SIM subscriptions")
         }
+        val voiceHandles = if (includeVoice) resolveVoiceHandles(context, subscriptions) else emptyMap()
         return subscriptions.map { info ->
             CurrentSubscription(
                 info = info,
                 fingerprint = fingerprint(info, salt),
-                phoneAccountHandle = phoneAccountFor(context, info.subscriptionId)
+                phoneAccountHandle = voiceHandles[info.subscriptionId]
             )
         }
     }
 
-    private fun phoneAccountFor(context: Context, subId: Int): PhoneAccountHandle? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null
+    private fun resolveVoiceHandles(
+        context: Context,
+        subscriptions: List<SubscriptionInfo>
+    ): Map<Int, PhoneAccountHandle> {
+        val publicResult = publicVoiceHandles(context, subscriptions)
+        if (publicResult != null) return publicResult
+
+        val rootResult = MagiskRuntime.phoneAccounts().orEmpty()
+        val activeCounts = subscriptions.groupingBy { it.subscriptionId }.eachCount()
+        return rootResult.filterKeys { activeCounts[it] == 1 }
+    }
+
+    /**
+     * API 30 adds the public PhoneAccountHandle -> subscriptionId query; API
+     * 31 adds the public subId-pinned manager -> PhoneAccountHandle direction.
+     * These checks keep pre-31 support capability-based rather than disabling
+     * voice for an entire Android release.
+     */
+    @SuppressLint("MissingPermission", "NewApi")
+    private fun publicVoiceHandles(
+        context: Context,
+        subscriptions: List<SubscriptionInfo>
+    ): Map<Int, PhoneAccountHandle>? {
+        val apiPath = Policy.voiceAccountApiPath(Build.VERSION.SDK_INT)
+        if (apiPath == VoiceAccountApiPath.MAGISK_BROKER) return null
         return try {
             val telephony = context.getSystemService(TelephonyManager::class.java) ?: return null
             val telecom = context.getSystemService(TelecomManager::class.java) ?: return null
-            val handle = telephony.createForSubscriptionId(subId).phoneAccountHandle ?: return null
-            val account = telecom.getPhoneAccount(handle) ?: return null
-            if (!account.hasCapabilities(PhoneAccount.CAPABILITY_SIM_SUBSCRIPTION)) return null
-            if (telecom.callCapablePhoneAccounts?.contains(handle) != true) return null
-            handle
-        } catch (_: SecurityException) {
-            null
-        } catch (_: RuntimeException) {
-            null
-        }
-    }
+            val expectedUser = UserHandle.getUserHandleForUid(Process.myUid())
+            val callCapable = telecom.callCapablePhoneAccounts.orEmpty().distinct()
+            val activeCounts = subscriptions.groupingBy { it.subscriptionId }.eachCount()
+            val uniqueActive = activeCounts.filterValues { it == 1 }.keys
+            val candidates = ArrayList<Pair<Int, PhoneAccountHandle>>()
 
-    private fun isCallCapableAccount(context: Context, handle: PhoneAccountHandle): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
-        return try {
-            val telecom = context.getSystemService(TelecomManager::class.java) ?: return false
-            val account = telecom.getPhoneAccount(handle) ?: return false
-            account.hasCapabilities(PhoneAccount.CAPABILITY_SIM_SUBSCRIPTION) &&
-                telecom.callCapablePhoneAccounts?.contains(handle) == true
+            if (apiPath == VoiceAccountApiPath.PUBLIC_FORWARD_AND_REVERSE) {
+                for (subId in uniqueActive) {
+                    val handle = telephony.createForSubscriptionId(subId).phoneAccountHandle ?: continue
+                    if (handle.userHandle != expectedUser || handle !in callCapable) continue
+                    val account = telecom.getPhoneAccount(handle) ?: continue
+                    if (!account.hasCapabilities(PhoneAccount.CAPABILITY_SIM_SUBSCRIPTION)) continue
+                    if (telephony.getSubscriptionId(handle) != subId) continue
+                    candidates += subId to handle
+                }
+            } else {
+                for (handle in callCapable) {
+                    if (handle.userHandle != expectedUser) continue
+                    val account = telecom.getPhoneAccount(handle) ?: continue
+                    if (!account.hasCapabilities(PhoneAccount.CAPABILITY_SIM_SUBSCRIPTION)) continue
+                    val subId = telephony.getSubscriptionId(handle)
+                    if (subId !in uniqueActive) continue
+                    candidates += subId to handle
+                }
+            }
+
+            val subCounts = candidates.groupingBy { it.first }.eachCount()
+            val handleCounts = candidates.groupingBy { it.second }.eachCount()
+            candidates.asSequence()
+                .filter { subCounts[it.first] == 1 && handleCounts[it.second] == 1 }
+                .associate { it.first to it.second }
         } catch (_: SecurityException) {
-            false
+            null
         } catch (_: RuntimeException) {
-            false
+            null
         }
     }
 

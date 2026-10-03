@@ -95,6 +95,8 @@ DEVICE_ABI=$(getprop ro.product.cpu.abi 2>/dev/null)
 case "$DEVICE_ABI" in
     arm64*|aarch64*) TINYMIX_SRC="$MODDIR/tinymix" ;;
     arm*)            TINYMIX_SRC="$MODDIR/tinymix32" ;;
+    x86_64*|amd64*)  TINYMIX_SRC="$MODDIR/tinymix-x86_64" ;;
+    x86*|i686*)       TINYMIX_SRC="$MODDIR/tinymix-x86" ;;
     *)               TINYMIX_SRC="" ;;
 esac
 if [ -n "$TINYMIX_SRC" ] && [ -f "$TINYMIX_SRC" ]; then

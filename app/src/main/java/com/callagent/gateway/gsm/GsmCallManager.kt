@@ -24,7 +24,8 @@ import java.util.IdentityHashMap
  * GSM call manager: answers/makes/hangs up GSM calls, tracks state.
  *
  * Calls are controlled through the InCallService (GsmCallService).
- * Audio routing uses device-specific mixer controls via [DeviceProfile].
+ * Audio defaults to stream-scoped Telephony Rx/Tx routing. Legacy mixer
+ * presets require explicit local configuration through the Magisk module.
  *
  * SIP→GSM: AudioTrack (USAGE_MEDIA / deep-buffer) → incall_music →
  * HAL injects STREAM_MUSIC digitally into voice TX (uplink).
@@ -58,6 +59,14 @@ object GsmCallManager {
     @Volatile var lastDisconnectCause: DisconnectCause? = null
         private set
     @Volatile var inCallService: InCallService? = null; private set
+
+    private data class GenericAudioState(
+        val call: Call?,
+        val service: InCallService,
+        val route: Int?,
+        val microphoneMuted: Boolean?
+    )
+    private var genericAudioState: GenericAudioState? = null
 
     @Volatile var listener: Listener? = null
 
@@ -346,6 +355,10 @@ object GsmCallManager {
             Log.w(TAG, "Rejecting empty/MMI destination from SIM call dispatcher")
             return false
         }
+        if (profile.configError != null) {
+            appLog("Call refused: invalid local Magisk audio configuration")
+            return false
+        }
         val mapping = try {
             SimRegistry.resolveForVoice(context, simId, mappingRevision, localRevisionBarrier)
         } catch (e: SimRegistry.SimMappingException) {
@@ -419,6 +432,34 @@ object GsmCallManager {
 
     /** Configure audio for GSM↔SIP bridge using the active device profile. */
     private fun configureAudioBridge() {
+        if (profile.configError != null) {
+            appLog("Audio unavailable: invalid local Magisk audio configuration")
+            return
+        }
+        if (profile.useGenericRouting) {
+            // The generic route belongs to each AudioRecord/AudioTrack and
+            // is released with that stream. Never alter the user's speaker,
+            // microphone mute, stream volumes or vendor mixer defaults.
+            appLog("Audio: Magisk generic digital routing; capabilities are verified by the media session")
+            if (profile.allowMicFallback && profile.requireSpeakerMode) {
+                // Acoustic capture is an explicit local option. Keep the
+                // original state; never restore guessed volume/mute defaults.
+                inCallService?.let { service ->
+                    val am = service.getSystemService(AudioManager::class.java)
+                    if (genericAudioState?.call !== activeCall || genericAudioState == null) {
+                        genericAudioState = GenericAudioState(
+                            activeCall, service,
+                            runCatching { service.callAudioState?.route }.getOrNull(),
+                            runCatching { am?.isMicrophoneMute }.getOrNull()
+                        )
+                    }
+                    runCatching { service.setAudioRoute(CallAudioState.ROUTE_SPEAKER) }
+                    runCatching { am?.isMicrophoneMute = false }
+                    appLog("Audio: locally enabled microphone fallback requested; no volume changes")
+                }
+            }
+            return
+        }
         try {
             // Run ALSA mixer discovery on first call for diagnostics
             runMixerDiscovery()
@@ -495,6 +536,7 @@ object GsmCallManager {
      *  Called multiple times: immediately, after delayed route change,
      *  and from RtpSession as a secondary safeguard. */
     fun enforceVolumes(am: AudioManager) {
+        if (profile.useGenericRouting || profile.configError != null) return
         // Clear any stale ADJUST_MUTE flag from a previous call.
         // CRITICAL: Do NOT use ADJUST_MUTE on STREAM_VOICE_CALL — on
         // MSM8930 it kills the incall_music injection path, preventing
@@ -548,6 +590,22 @@ object GsmCallManager {
 
     /** Restore audio state when call ends */
     private fun restoreAudio() {
+        // Digital routing has no global changes; explicitly enabled acoustic
+        // routing restores only the state saved for this same call.
+        if (profile.useGenericRouting || profile.configError != null) {
+            val saved = genericAudioState
+            genericAudioState = null
+            if (saved != null && (activeCall == null || activeCall === saved.call)) {
+                val am = saved.service.getSystemService(AudioManager::class.java)
+                saved.microphoneMuted?.let { muted -> runCatching { am?.isMicrophoneMute = muted } }
+                if (inCallService === saved.service) saved.route?.let { route ->
+                    if (route > 0 && Integer.bitCount(route) == 1) {
+                        runCatching { saved.service.setAudioRoute(route) }
+                    }
+                }
+            }
+            return
+        }
         // The mixer restore is a root shell round trip, and this runs on the
         // main thread: onCallRemoved is an InCallService callback.  Setup
         // already does its su work on a thread of its own; teardown did not,

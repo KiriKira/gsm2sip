@@ -46,14 +46,16 @@ the prior un-fingerprinted confirmation is invalidated and must be repeated.
 Missing subscriptions and identity mismatches are marked unverified once and
 advance the local barrier.
 
-SMS availability is independent of voice-account availability. API 26–30 can
-use a confirmed `subscriptionId` for SMS, but the registry reports voice
-unavailable because those releases lack the supported public
-subscription-to-`PhoneAccountHandle` association used here. On API 31+, the
-registry obtains the handle from `TelephonyManager.createForSubscriptionId`,
-checks the Telecom account and call capability, and uses exact handle equality
-for incoming calls. Outgoing calls always use `TelecomManager.placeCall` with
-`EXTRA_PHONE_ACCOUNT_HANDLE`; there is no default-account fallback.
+SMS availability is independent of voice-account availability. Voice mapping
+now follows actual platform capabilities rather than an API 31 gate. The app
+uses the public exact inverse on API 30 and verifies the public forward map
+where available. The Magisk module can query the framework's exact relation
+in an isolated system-UID broker on older releases. Only unique active SIM
+subscriptions and call-capable SIM accounts for the same Android user qualify.
+Handle IDs remain opaque. A broker failure disables voice, without inventing
+a different SIM identity. Incoming calls use exact handle equality; outgoing
+calls use `TelecomManager.placeCall` with `EXTRA_PHONE_ACCOUNT_HANDLE` and never
+the default account. See [Magisk runtime](magisk-runtime.md).
 
 The gateway's call dispatch ledger persists `(call_id, sim_id, mapping_revision,
 direction)` before either SIP-to-GSM or GSM-to-SIP dispatch. Existing call IDs

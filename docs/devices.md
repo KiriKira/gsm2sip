@@ -4,15 +4,16 @@ No target dual-SIM device has been connected to this development environment.
 The existing README's historical single-device audio reports are not evidence
 that the current three-component system works on either target SIM.
 
-Run `tools/check-device.sh <adb-serial>` before selecting a voice target.
-The script only reads policy/HAL/mixer capabilities. It neither places calls
+Implementation proceeds through Magisk's general interfaces without a model
+allowlist. Run `tools/check-device.sh <adb-serial>` to inspect runtime capabilities.
+The script only reads the module's probe output. It neither places calls
 nor sends SMS, and passing it does not prove audio works.
 
 | Requirement | Current evidence |
 | --- | --- |
 | Target model / SoC / ROM / Android / kernel | Awaiting target device |
 | SIM A / SIM B operator, radio mode | Awaiting target device |
-| API 31+ public subscription ↔ PhoneAccountHandle API | Required for generic voice routing; API 26–30 SMS supported, voice fails closed |
+| Exact subscription ↔ PhoneAccountHandle association | Public API or Magisk system-UID broker; actual unique active mapping required, no API 31 gate |
 | SIM A incoming / outgoing, both audio directions | Not tested |
 | SIM B incoming / outgoing, both audio directions | Not tested |
 | RFC4733 reaches a real cellular IVR on both SIMs | Not tested |

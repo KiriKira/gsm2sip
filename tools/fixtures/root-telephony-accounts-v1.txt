@@ -1,0 +1,12 @@
+protocol=1
+broker_version=1
+app_version=427
+broker_uid=1000
+source=magisk-system-telephony
+status=ok
+user_id=0
+count=1
+account.0.sub_id=14
+account.0.component_b64=Y29tLmFuZHJvaWQucGhvbmUvY29tLmFuZHJvaWQuc2VydmljZXMudGVsZXBob255LlRlbGVwaG9ueUNvbm5lY3Rpb25TZXJ2aWNl
+account.0.id_b64=dGVsZXBob255LWFjY291bnQ
+account.0.user_id=0

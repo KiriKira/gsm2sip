@@ -4,7 +4,8 @@
 [wire addendum](https://github.com/KiriKira/gsm2sip-server/blob/56f55f77a4840f0e6797a1765165db601f7c08b4/docs/server-wire-addendum.md)、
 [OpenAPI](https://github.com/KiriKira/gsm2sip-server/blob/56f55f77a4840f0e6797a1765165db601f7c08b4/openapi/openapi.yaml) 与
 [fixture](https://github.com/KiriKira/gsm2sip-server/tree/56f55f77a4840f0e6797a1765165db601f7c08b4/fixtures/api)。
-原计划仍是三个仓库的完整验收目标；本批只完成 M1/M2 短信基础。
+原计划仍是三个仓库的完整验收目标；首批完成 M1/M2 短信基础，后续按
+用户要求增加 [Magisk 通用能力适配](magisk-runtime.md)，继续推进通话基础。
 
 ## 已实现
 
@@ -30,8 +31,9 @@ modem 调用前先写入 dispatching。应用重启后不确定任务转 unknown
 开机/后台限制及 24h/72h 运行仍需验收。没有执行真实发送或计费拨号。
 重复身份校验不等于 Android 的换卡与 modem 调用具备原子性。
 
-M0 音频和 DSDS 尚未通过。通用 voice 选卡仅 API 31+，且还需要 OEM
-capture/uplink 验证；API 26–30 的本批功能保留短信，语音报告不可用。
+M0 音频和 DSDS 尚未通过。语音选卡按实际精确账户关联支持，公开接口
+不足时通过 Magisk 查询，不按机型或 API 31 整体拒绝。数字 capture/uplink
+按系统端点与实际路由验证；Magisk 无法创建系统未提供的蜂窝音频接口。
 主机 SIP SDK、Asterisk ARI、完整 Telecom 和三端通话未实现。网关已有
 SIP/媒体加固与呼叫账本，只是供后续 M3 的受限实现，不能作为已验收通话。
 

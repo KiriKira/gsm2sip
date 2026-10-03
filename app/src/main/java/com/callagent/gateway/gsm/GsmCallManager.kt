@@ -365,19 +365,58 @@ object GsmCallManager {
             Log.w(TAG, "SIM-directed call refused (${e.code})")
             return false
         }
-        val handle = mapping.phoneAccountHandle ?: return false
-        return try {
-            val telecom = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-            val extras = Bundle().apply {
-                putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
-            }
-            telecom.placeCall(Uri.fromParts("tel", dialString, null), extras)
-            Log.i(TAG, "Telecom call dispatched with explicit SIM account")
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Explicit SIM Telecom placeCall failed: ${e.javaClass.simpleName}")
-            false
+        return dispatchPreparedCall(context, dialString, mapping) { dispatch -> dispatch() }
+    }
+
+    /** Resolve local profile/config state before the short, guarded Telecom dispatch. */
+    fun prepareVoiceCallDispatch(): Boolean = try {
+        profile.configError == null
+    } catch (e: Exception) {
+        Log.e(TAG, "Could not prepare local audio configuration: ${e.javaClass.simpleName}")
+        false
+    }
+
+    /**
+     * Place a call with a mapping that was already resolved and revalidated on
+     * a worker. [guardedDispatch] must run [dispatch] atomically with the
+     * caller's call-cancellation/teardown checks. This method performs no SIM
+     * lookup or profile/root I/O.
+     */
+    @SuppressLint("MissingPermission")
+    fun dispatchPreparedCall(
+        context: Context,
+        destination: String,
+        mapping: SimRegistry.SimMapping,
+        guardedDispatch: ((() -> Boolean) -> Boolean)
+    ): Boolean {
+        val dialString = destination.trim()
+        if (dialString.isEmpty() || isMmiCode(dialString)) {
+            Log.w(TAG, "Rejecting empty/MMI destination from SIM call dispatcher")
+            return false
         }
+        val handle = mapping.phoneAccountHandle
+        if (!mapping.voiceAvailable || handle == null) return false
+
+        val telecom = try {
+            context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+        } catch (e: Exception) {
+            Log.e(TAG, "Telecom unavailable for SIM-directed call: ${e.javaClass.simpleName}")
+            return false
+        }
+        val extras = Bundle().apply {
+            putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
+        }
+        val placeCall = {
+            try {
+                telecom.placeCall(Uri.fromParts("tel", dialString, null), extras)
+                Log.i(TAG, "Telecom call dispatched with explicit SIM account")
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Explicit SIM Telecom placeCall failed: ${e.javaClass.simpleName}")
+                false
+            }
+        }
+        return guardedDispatch(placeCall)
     }
 
     /** Music volume percent — from device profile. */

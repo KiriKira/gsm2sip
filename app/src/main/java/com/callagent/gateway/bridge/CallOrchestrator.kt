@@ -58,6 +58,21 @@ import java.util.concurrent.TimeUnit
 class CallOrchestrator(
     private val context: Context,
     private val sipClient: SipClient,
+    private val outboundMappingResolver: (Context, String, Long) -> SimRegistry.SimMapping =
+        { appContext, simId, revision -> SimRegistry.resolveForVoice(appContext, simId, revision) },
+    private val outboundAudioPreparation: () -> Boolean = { GsmCallManager.prepareVoiceCallDispatch() },
+    private val outboundCallDispatcher: (
+        Context,
+        String,
+        SimRegistry.SimMapping,
+        ((() -> Boolean) -> Boolean)
+    ) -> Boolean = { appContext, destination, mapping, guardedDispatch ->
+        GsmCallManager.dispatchPreparedCall(appContext, destination, mapping, guardedDispatch)
+    },
+    private val callDispatchLedger: (Context, String, String, Long, String) -> Boolean =
+        { appContext, callId, simId, revision, direction ->
+            GatewayDatabase.get(appContext).beginCallDispatch(callId, simId, revision, direction)
+        },
     private val incomingAccountResolver: (Context, PhoneAccountHandle?) -> SimRegistry.SimMapping? =
         { appContext, handle -> SimRegistry.resolvePhoneAccount(appContext, handle) }
 ) : SipClient.Listener, GsmCallManager.Listener, SipCall.Listener {
@@ -73,6 +88,10 @@ class CallOrchestrator(
     private var pendingInboundGeneration = -1L
     private var pendingInboundResolution: Future<*>? = null
     private var inboundFlowTask: Future<*>? = null
+    @Volatile private var pendingOutboundCall: SipCall? = null
+    @Volatile private var pendingOutboundCallId: String? = null
+    @Volatile private var pendingOutboundGeneration = -1L
+    @Volatile private var outboundResolutionTask: Future<*>? = null
     @Volatile private var stopped = false
     @Volatile private var mediaBridgeEstablished = false
     private val telecomHandler = Handler(Looper.getMainLooper())
@@ -304,78 +323,82 @@ class CallOrchestrator(
         listener?.onError("SIP registration failed")
     }
 
-    /** Incoming SIP INVITE from Asterisk */
+    /** Incoming SIP INVITE from Asterisk. Slow SIM/profile work is delegated so
+     *  SipClient's single receive loop can continue processing responses and CANCEL. */
     @Synchronized
     override fun onIncomingCall(call: SipCall) {
         Log.i(TAG, "Incoming SIP call: ${call.callId}")
 
+        if (activeSipCall === call ||
+            (bridgeState != BridgeState.IDLE && activeSipCall?.callId == call.callId)) {
+            Log.d(TAG, "Ignoring duplicate callback for the reserved SIP call")
+            return
+        }
+        if (stopped) {
+            rejectSipCall(call, 480, "Service Unavailable", "Call rejected: gateway is stopping")
+            return
+        }
         if (bridgeState != BridgeState.IDLE) {
             Log.w(TAG, "Busy — rejecting SIP call 486")
-            call.reject(486, "Busy Here")
-            sipClient.removeCall(call.callId)
+            rejectSipCall(call, 486, "Busy Here")
             return
         }
 
         if (!hasRecordAudioPermission()) {
             Log.w(TAG, "Rejecting SIP call because microphone permission is unavailable")
-            call.reject(403, "Call Audio Permission Required")
-            sipClient.removeCall(call.callId)
-            listener?.onError("Call rejected: microphone permission is not granted")
+            rejectSipCall(call, 403, "Call Audio Permission Required",
+                "Call rejected: microphone permission is not granted")
             return
         }
 
         val metadata = call.trustedGsmMetadata
         if (metadata == null || metadata.protocolVersion != GsmCallMetadata.SUPPORTED_PROTOCOL_VERSION) {
             Log.w(TAG, "Rejecting SIP call with missing or untrusted GSM metadata")
-            listener?.onError("Call rejected: authenticated SIM routing metadata is required")
-            call.reject(403, "SIM Routing Metadata Required")
-            sipClient.removeCall(call.callId)
+            rejectSipCall(call, 403, "SIM Routing Metadata Required",
+                "Call rejected: authenticated SIM routing metadata is required")
             return
         }
 
-        val mapping = try {
-            SimRegistry.resolveForVoice(context, metadata.simId, metadata.mappingRevision)
-        } catch (e: SimRegistry.SimMappingException) {
-            val response = if (e.code == SimRegistry.ErrorCode.SIM_MAPPING_CHANGED) 409 else 480
-            Log.w(TAG, "Rejecting call ${metadata.callId}: SIM mapping ${e.code}")
-            listener?.onError("Call rejected: SIM mapping ${e.code}")
-            call.reject(response, if (response == 409) "SIM Mapping Changed" else "SIM Unavailable")
-            sipClient.removeCall(call.callId)
-            return
-        } catch (e: Exception) {
-            Log.w(TAG, "SIM registry unavailable; rejecting call ${metadata.callId}")
-            listener?.onError("Call rejected: SIM registry unavailable")
-            call.reject(480, "SIM Unavailable")
-            sipClient.removeCall(call.callId)
-            return
-        }
-
-        val gsmDest = outboundDestination(call, mapping)
-        if (gsmDest == null) {
-            Log.w(TAG, "Trusted SIP call has no valid GSM destination")
-            call.reject(488, "Not Acceptable Here")
-            sipClient.removeCall(call.callId)
-            return
-        }
-
-        val acceptedForDispatch = try {
-            GatewayDatabase.get(context).beginCallDispatch(
-                metadata.callId, metadata.simId, metadata.mappingRevision, "outgoing"
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Call ledger unavailable; refusing GSM dispatch")
-            false
-        }
-        if (!acceptedForDispatch) {
-            Log.w(TAG, "Duplicate or unpersistable call_id ${metadata.callId}; refusing dispatch")
-            call.reject(482, "Duplicate Call Id")
-            sipClient.removeCall(call.callId)
-            return
-        }
-        activeBusinessCallId = metadata.callId
+        val callGeneration = generation
+        activeSipCall = call
+        activeGsmCall = null
+        activeGsmMapping = null
+        activeBusinessCallId = null
+        activeInboundCallerNumber = null
         mediaBridgeEstablished = false
-        activeGsmMapping = mapping
-        handleOutboundFlow(call, gsmDest, mapping)
+        sipCallRetries = 0
+        bridgeState = BridgeState.GSM_DIALING
+        pendingOutboundCall = call
+        pendingOutboundCallId = metadata.callId
+        pendingOutboundGeneration = callGeneration
+        telecomHandler.post {
+            val target = synchronized(this) {
+                if (isPendingOutbound(call, metadata, callGeneration)) listener else null
+            }
+            target?.onStateChanged(BridgeState.GSM_DIALING, "Resolving SIM for authorized call")
+        }
+        call.originalInvite?.let { invite ->
+            val ringing = com.callagent.gateway.sip.SipBuilder.ringing180(invite, call.localTag)
+            sipClient.sendTo(ringing, call.remoteContactAddress ?: sipClient.serverAddress)
+        }
+
+        try {
+            outboundResolutionTask = inboundWorker.submit {
+                resolveAndDispatchOutbound(call, metadata, callGeneration)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not schedule outbound SIM resolution: ${e.javaClass.simpleName}")
+            failPendingOutbound(call, metadata, callGeneration, 480, "SIM Unavailable",
+                "Could not schedule SIM account resolution")
+        }
+    }
+
+    private fun rejectSipCall(call: SipCall, code: Int, reason: String, error: String? = null) {
+        error?.let(::postError)
+        try { call.reject(code, reason) } catch (e: Exception) {
+            Log.w(TAG, "SIP rejection failed: ${e.javaClass.simpleName}")
+        }
+        sipClient.removeCall(call.callId)
     }
 
     /**
@@ -421,7 +444,163 @@ class CallOrchestrator(
 
     private fun digitsOf(value: String): String = value.filter { it.isDigit() }
 
+    private fun isPendingOutbound(
+        call: SipCall,
+        metadata: GsmCallMetadata,
+        callGeneration: Long
+    ): Boolean = !stopped && generation == callGeneration &&
+        bridgeState == BridgeState.GSM_DIALING && activeSipCall === call &&
+        pendingOutboundCall === call && pendingOutboundCallId == metadata.callId &&
+        pendingOutboundGeneration == callGeneration
+
+    /** Runs SIM, number and local-profile lookups away from SipClient.receiveLoop. */
+    private fun resolveAndDispatchOutbound(
+        call: SipCall,
+        metadata: GsmCallMetadata,
+        callGeneration: Long
+    ) {
+        if (!isPendingOutbound(call, metadata, callGeneration)) return
+        val mapping = try {
+            outboundMappingResolver(context, metadata.simId, metadata.mappingRevision)
+        } catch (e: SimRegistry.SimMappingException) {
+            val response = if (e.code == SimRegistry.ErrorCode.SIM_MAPPING_CHANGED) 409 else 480
+            failPendingOutbound(call, metadata, callGeneration, response,
+                if (response == 409) "SIM Mapping Changed" else "SIM Unavailable",
+                "Call rejected: SIM mapping ${e.code}")
+            return
+        } catch (e: Exception) {
+            Log.w(TAG, "SIM registry unavailable for SIP call: ${e.javaClass.simpleName}")
+            failPendingOutbound(call, metadata, callGeneration, 480, "SIM Unavailable",
+                "Call rejected: SIM registry unavailable")
+            return
+        }
+        if (!isPendingOutbound(call, metadata, callGeneration)) return
+
+        val gsmDestination = try { outboundDestination(call, mapping) } catch (e: Exception) {
+            Log.w(TAG, "Could not resolve GSM destination: ${e.javaClass.simpleName}")
+            null
+        }
+        if (gsmDestination == null) {
+            failPendingOutbound(call, metadata, callGeneration, 488, "Not Acceptable Here",
+                "Trusted SIP call has no valid GSM destination")
+            return
+        }
+        if (!isPendingOutbound(call, metadata, callGeneration)) return
+
+        val destination = try { toInternational(gsmDestination, mapping.subscriptionId) } catch (e: Exception) {
+            Log.w(TAG, "Could not normalize GSM destination: ${e.javaClass.simpleName}")
+            gsmDestination
+        }
+        val prepared = try { outboundAudioPreparation() } catch (e: Exception) {
+            Log.w(TAG, "Could not prepare local call configuration: ${e.javaClass.simpleName}")
+            false
+        }
+        if (!prepared) {
+            failPendingOutbound(call, metadata, callGeneration, 480, "SIM Unavailable",
+                "Call rejected: local call configuration is unavailable")
+            return
+        }
+        if (!isPendingOutbound(call, metadata, callGeneration)) return
+
+        val freshMapping = try {
+            outboundMappingResolver(context, metadata.simId, metadata.mappingRevision)
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not revalidate outbound SIM mapping: ${e.javaClass.simpleName}")
+            failPendingOutbound(call, metadata, callGeneration, 409, "SIM Mapping Changed",
+                "Call rejected: SIM mapping could not be revalidated")
+            return
+        }
+        if (freshMapping != mapping || !freshMapping.voiceAvailable ||
+            freshMapping.phoneAccountHandle == null) {
+            failPendingOutbound(call, metadata, callGeneration, 409, "SIM Mapping Changed",
+                "Call rejected: SIM mapping changed during call preparation")
+            return
+        }
+        if (!isPendingOutbound(call, metadata, callGeneration)) return
+
+        var rejectionCode = 480
+        var rejectionReason = "SIM Unavailable"
+        val dispatched = try {
+            outboundCallDispatcher(context, destination, freshMapping) { placeCall ->
+                synchronized(this) {
+                    call.withPendingInvite {
+                        if (!isPendingOutbound(call, metadata, callGeneration)) return@withPendingInvite false
+
+                        val recorded = try {
+                            callDispatchLedger(
+                                context, metadata.callId, metadata.simId,
+                                metadata.mappingRevision, "outgoing"
+                            )
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Call ledger unavailable; refusing GSM dispatch")
+                            false
+                        }
+                        if (!recorded) {
+                            rejectionCode = 482
+                            rejectionReason = "Duplicate Call Id"
+                            return@withPendingInvite false
+                        }
+
+                        activeBusinessCallId = metadata.callId
+                        activeGsmMapping = freshMapping
+                        mediaBridgeEstablished = false
+
+                        val placed = placeCall()
+                        if (placed) {
+                            clearPendingOutbound(cancelTask = false)
+                            schedule(GSM_DIAL_TIMEOUT_MS) {
+                                if (bridgeState == BridgeState.GSM_DIALING) {
+                                    Log.w(TAG, "GSM dial timeout — no call events in ${GSM_DIAL_TIMEOUT_MS / 1000}s")
+                                    tearDown("GSM dial timeout", 480 to "Temporarily Unavailable")
+                                }
+                            }
+                        }
+                        placed
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "SIM-directed Telecom dispatch failed: ${e.javaClass.simpleName}")
+            false
+        }
+        if (!dispatched) {
+            failPendingOutbound(call, metadata, callGeneration, rejectionCode, rejectionReason,
+                "SIM-directed Telecom dispatch failed")
+        } else {
+            telecomHandler.post {
+                val target = synchronized(this) {
+                    if (!stopped && generation == callGeneration && activeSipCall === call &&
+                        activeBusinessCallId == metadata.callId && bridgeState == BridgeState.GSM_DIALING) {
+                        listener
+                    } else null
+                }
+                target?.onStateChanged(BridgeState.GSM_DIALING, "Dialing mapped SIM")
+            }
+        }
+    }
+
+    @Synchronized
+    private fun failPendingOutbound(
+        call: SipCall,
+        metadata: GsmCallMetadata,
+        callGeneration: Long,
+        responseCode: Int,
+        responseReason: String,
+        error: String
+    ) {
+        if (!isPendingOutbound(call, metadata, callGeneration)) return
+        clearPendingOutbound(cancelTask = false)
+        postError(error)
+        rejectSipCall(call, responseCode, responseReason)
+        tearDown("Outbound call rejected: $error")
+    }
+
+    private fun postError(error: String) {
+        telecomHandler.post { listener?.onError(error) }
+    }
+
     /** Handles termination from both SipClient.Listener and SipCall.Listener */
+    @Synchronized
     override fun onCallTerminated(call: SipCall) {
         Log.i(TAG, "SIP call terminated: ${call.callId} (bridge=$bridgeState, retries=$sipCallRetries)")
         if (call != activeSipCall) return
@@ -633,6 +812,15 @@ class CallOrchestrator(
         clearPendingInbound()
         inboundFlowTask?.cancel(true)
         inboundFlowTask = null
+        clearPendingOutbound(cancelTask = true)
+    }
+
+    private fun clearPendingOutbound(cancelTask: Boolean) {
+        if (cancelTask) outboundResolutionTask?.cancel(true)
+        outboundResolutionTask = null
+        pendingOutboundCall = null
+        pendingOutboundCallId = null
+        pendingOutboundGeneration = -1L
     }
 
     private fun rejectOrDisconnect(call: Call) {
@@ -1004,44 +1192,6 @@ class CallOrchestrator(
     }
 
     // ── Outbound flow (SIP → GSM) ──────────────────────
-
-    private fun handleOutboundFlow(
-        sipCall: SipCall,
-        gsmDestination: String,
-        mapping: SimRegistry.SimMapping
-    ) {
-        Log.i(TAG, "Outbound flow: dialing through confirmed SIM mapping")
-
-        bridgeState = BridgeState.GSM_DIALING
-        activeSipCall = sipCall
-        listener?.onStateChanged(bridgeState, "Dialing mapped SIM")
-
-        // Send 180 Ringing to SIP caller while GSM dials
-        sipCall.originalInvite?.let { invite ->
-            val ringing = com.callagent.gateway.sip.SipBuilder.ringing180(invite, sipCall.localTag)
-            sipClient.sendTo(ringing, sipCall.remoteContactAddress ?: sipClient.serverAddress)
-        }
-
-        // Dial via GSM SIM
-        val destination = toInternational(gsmDestination, mapping.subscriptionId)
-        val dispatched = GsmCallManager.makeCall(
-            context,
-            destination,
-            mapping.simId,
-            mapping.mappingRevision,
-            mapping.localRevisionBarrier
-        )
-        if (!dispatched) {
-            tearDown("SIM-directed Telecom dispatch failed", 480 to "SIM Unavailable")
-            return
-        }
-        schedule(GSM_DIAL_TIMEOUT_MS) {
-            if (bridgeState == BridgeState.GSM_DIALING) {
-                Log.w(TAG, "GSM dial timeout — no call events in ${GSM_DIAL_TIMEOUT_MS / 1000}s")
-                tearDown("GSM dial timeout", 480 to "Temporarily Unavailable")
-            }
-        }
-    }
 
     // ── RTP ─────────────────────────────────────────────
 

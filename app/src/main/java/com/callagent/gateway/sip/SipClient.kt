@@ -316,6 +316,13 @@ class SipClient(
             }
         }
 
+        // CANCEL has a separate transaction response even when its INVITE
+        // has already been removed or its Call-ID was never known here.
+        if (msg.isRequest && msg.method == "CANCEL") {
+            sendTo(SipBuilder.statusResponse(msg, 481, "Call/Transaction Does Not Exist"), address)
+            return
+        }
+
         // Page-mode MESSAGE from the server — an SMS to send.
         if (msg.isRequest && msg.method == "MESSAGE") {
             val (code, extra) = try {

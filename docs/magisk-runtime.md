@@ -52,6 +52,11 @@ broker 使用进程内 hidden API 能力探测，不修改系统全局 hidden-AP
 有界，超时或截断不作为有效映射。查询在工作线程进行，迟到结果不能
 恢复已结束的通话。broker 暂不可用只使 voice 不可用，不伪造新 SIM 身份。
 
+GSM 来电与 SIP 来电均先保留唯一的活动通话，再在工作线程解析账户。
+SIP 接收循环不等待 root 查询；取消、停止或通话代际变化后，迟到结果
+不能写入派发账本或调用 Telecom 拨号。匹配未接通 INVITE 的 CANCEL
+返回 200，并以 487 结束原 INVITE；不匹配的事务不能取消另一条通话。
+
 ## 本地音频配置
 
 持久文件为 `/data/adb/gsm2sip/audio-profile.json`，由 root 管理，server

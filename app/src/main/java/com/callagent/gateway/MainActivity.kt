@@ -58,11 +58,21 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.callagent.gateway.service.CallLogEntry
 import com.callagent.gateway.service.CallLogStore
-import com.callagent.gateway.sms.SmsOutbox
+import com.callagent.gateway.data.CredentialStore
+import com.callagent.gateway.data.GatewayDatabase
+import com.callagent.gateway.net.ControlApiClient
+import com.callagent.gateway.net.ControlApiException
+import com.callagent.gateway.net.MappingProposal
+import com.callagent.gateway.net.ServerMapping
 import com.callagent.gateway.service.GatewayService
+import com.callagent.gateway.sim.SimRegistry
+import com.callagent.gateway.sms.SmsOutbox
+import org.json.JSONArray
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
 class MainActivity : AppCompatActivity() {
 
@@ -117,6 +127,10 @@ class MainActivity : AppCompatActivity() {
      *  Incoming rather than in a category of its own. */
     private var callFilter = "all"
     private var agentMuted = false
+    private val selectedSimBindings = mutableMapOf<String, SimRegistry.SimSubscription>()
+    private var pendingMappingProposal: MappingProposal? = null
+    private var simProposalSubscriptions: List<SimRegistry.SimSubscription> = emptyList()
+    private var controlBusy = false
 
     private lateinit var tabLogs: LinearLayout
     private var currentTab = ""
@@ -330,6 +344,11 @@ class MainActivity : AppCompatActivity() {
         findViewById<View>(R.id.btnConfigBack).setOnClickListener { switchTab("home") }
         findViewById<View>(R.id.btnCfgSave).setOnClickListener { saveConfigFromView() }
         findViewById<View>(R.id.btnCfgClearRecents).setOnClickListener { confirmClearRecents() }
+        findViewById<View>(R.id.btnControlPair).setOnClickListener { pairControlGateway() }
+        findViewById<View>(R.id.btnSimPropose).setOnClickListener { proposeSimBindings() }
+        findViewById<View>(R.id.btnSimConfirm).setOnClickListener { confirmSimBindings() }
+        restoreControlUiState()
+        restorePendingSimProposal()
         tvHomeStatusPill = findViewById(R.id.tvHomeStatusPill)
         tvHomeTlsBadge = findViewById(R.id.tvHomeTlsBadge)
         tvHomeSrtpBadge = findViewById(R.id.tvHomeSrtpBadge)
@@ -427,12 +446,329 @@ class MainActivity : AppCompatActivity() {
         if (!prefs.getBoolean("autoconnect", true)) return
         val server = prefs.getString("server", "") ?: ""
         val user = prefs.getString("user", "") ?: ""
-        if (server.isEmpty() || user.isEmpty()) return
-        val port = prefs.getInt("port", 5060)
+        if (server.isEmpty() || user.isEmpty()) {
+            if (CredentialStore.load(this) != null) {
+                GatewayService.startControl(this)
+                appendLog("Auto-starting paired HTTPS control gateway")
+            }
+            return
+        }
+        val port = prefs.getInt("port", 5061)
         val pass = prefs.getString("pass", "") ?: ""
         GatewayService.start(this, server, port, user, pass)
         running = true
         appendLog("Auto-starting gateway: $user@$server:$port")
+    }
+
+    private fun restoreControlUiState() {
+        val session = CredentialStore.load(this)
+        val url = findViewById<EditText>(R.id.etControlUrl)
+        if (session != null) {
+            url.setText(session.controlBaseUrl)
+            findViewById<TextView>(R.id.tvControlStatus).text =
+                "Paired gateway ${session.gatewayId.take(8)}… · HTTPS sync enabled"
+        } else {
+            val saved = getSharedPreferences("gateway", MODE_PRIVATE)
+                .getString("control_base_url", "").orEmpty()
+            if (saved.isNotEmpty()) url.setText(saved)
+            findViewById<TextView>(R.id.tvControlStatus).text = "Not paired"
+        }
+        findViewById<EditText>(R.id.etControlDeviceName).setText(
+            getSharedPreferences("gateway", MODE_PRIVATE)
+                .getString("control_device_name", android.os.Build.MODEL ?: "Old Android phone")
+        )
+    }
+
+    private fun setControlBusy(busy: Boolean, status: String? = null) {
+        controlBusy = busy
+        findViewById<View>(R.id.btnControlPair).isEnabled = !busy
+        findViewById<View>(R.id.btnSimPropose).isEnabled = !busy
+        findViewById<View>(R.id.btnSimConfirm).isEnabled = !busy
+        pendingMappingProposal?.let { renderSimProposal(it, simProposalSubscriptions) }
+        if (status != null) findViewById<TextView>(R.id.tvControlStatus).text = status
+    }
+
+    private fun pairControlGateway() {
+        val base = findViewById<EditText>(R.id.etControlUrl).text.toString().trim()
+        val code = findViewById<EditText>(R.id.etControlPairingCode).text.toString().trim()
+        val deviceName = findViewById<EditText>(R.id.etControlDeviceName).text.toString().trim()
+            .ifEmpty { android.os.Build.MODEL ?: "Android gateway" }
+        if (base.isEmpty() || code.isEmpty()) {
+            Toast.makeText(this, "HTTPS server and one-time pairing code are required", Toast.LENGTH_LONG).show()
+            return
+        }
+        val normalizedBase = base.trimEnd('/')
+        setControlBusy(true, "Pairing over HTTPS…")
+        Thread({
+            try {
+                val result = ControlApiClient(this, normalizedBase).pair(code, deviceName)
+                val saved = getSharedPreferences("gateway", MODE_PRIVATE).edit()
+                    .putString("control_base_url", normalizedBase)
+                    .putString("control_device_name", deviceName)
+                    .commit()
+                if (!saved) throw IllegalStateException("Could not save control server settings")
+                runOnUiThread {
+                    findViewById<EditText>(R.id.etControlPairingCode).text.clear()
+                    findViewById<TextView>(R.id.tvControlStatus).text =
+                        "Paired ${result.gatewayId.take(8)}… · ${if (result.sipAvailable) "SIP available" else "HTTPS control only"}"
+                    setControlBusy(false)
+                    Toast.makeText(this, "Gateway paired. Review and confirm local SIM slots.", Toast.LENGTH_LONG).show()
+                    GatewayService.startControl(this)
+                    appendLog("Control gateway paired; HTTPS sync enabled")
+                }
+            } catch (e: Exception) {
+                val detail = (e as? ControlApiException)?.code ?: "PAIRING_FAILED"
+                runOnUiThread {
+                    setControlBusy(false, "Pairing failed: $detail")
+                    Toast.makeText(this, "Pairing failed: $detail", Toast.LENGTH_LONG).show()
+                }
+            }
+        }, "gateway-pair").start()
+    }
+
+    private fun proposeSimBindings() {
+        if (CredentialStore.load(this) == null) {
+            Toast.makeText(this, "Pair the gateway first", Toast.LENGTH_LONG).show()
+            return
+        }
+        val operationId = UUID.randomUUID().toString()
+        val controlBase = findViewById<EditText>(R.id.etControlUrl).text.toString().trim()
+        setControlBusy(true, "Reading local SIM capabilities…")
+        Thread({
+            try {
+                // Magisk may start a short-lived Binder broker; never block the UI waiting for it.
+                val snapshot = SimRegistry.snapshot(this)
+                val subscriptions = snapshot.subscriptions
+                if (subscriptions.isEmpty()) {
+                    throw ControlApiException("SIM_UNAVAILABLE", "No active SIM subscriptions are available")
+                }
+                val mappings = JSONArray()
+                val existingBySubscription = snapshot.mappings.associateBy { it.subscriptionId }
+                subscriptions.sortedBy { it.slotIndex }.forEach { sub ->
+                    val row = JSONObject().put("slot_index", sub.slotIndex)
+                        .put("label", sub.displayName.ifBlank { "SIM ${sub.slotIndex + 1}" })
+                        .put("carrier_name", sub.carrierName)
+                        .put("phone_number", JSONObject.NULL)
+                    val known = existingBySubscription[sub.subscriptionId]
+                    if (known != null && known.identityState != SimRegistry.IdentityState.UNVERIFIED) {
+                        row.put("existing_sim_id", known.simId).put("same_sim_verified", true)
+                    }
+                    mappings.put(row)
+                }
+                val proposal = ControlApiClient(this, controlBase).proposeSimBindings(operationId, mappings)
+                val encoded = JSONObject().put("mapping_revision", proposal.mappingRevision)
+                    .put("mappings", JSONArray().apply {
+                        proposal.mappings.forEach { m ->
+                            put(JSONObject().put("sim_id", m.simId).put("slot_index", m.slotIndex)
+                                .put("state", m.state).put("mapping_revision", m.mappingRevision))
+                        }
+                    }).put("selected", JSONObject()).toString()
+                GatewayDatabase.get(this).saveSimProposal(operationId, encoded)
+                runOnUiThread {
+                    pendingMappingProposal = proposal
+                    simProposalSubscriptions = subscriptions
+                    selectedSimBindings.clear()
+                    renderSimProposal(proposal, subscriptions)
+                    setControlBusy(false, "Server assigned SIM IDs. Select the matching local SIM for each row, then confirm.")
+                }
+            } catch (e: Exception) {
+                val detail = (e as? ControlApiException)?.code ?: "SIM_PROPOSAL_FAILED"
+                runOnUiThread { setControlBusy(false, "SIM proposal failed: $detail") }
+            }
+        }, "gateway-sim-propose").start()
+    }
+
+    private fun restorePendingSimProposal() {
+        val session = CredentialStore.load(this) ?: return
+        Thread({ restorePendingSimProposalInBackground(session) }, "gateway-sim-restore").start()
+    }
+
+    private fun restorePendingSimProposalInBackground(expectedSession: CredentialStore.Session) {
+        val saved = runCatching { GatewayDatabase.get(this).pendingSimProposal() }.getOrNull() ?: return
+        try {
+            val json = JSONObject(saved.second)
+            val revision = json.getLong("mapping_revision")
+            val mappingsJson = json.getJSONArray("mappings")
+            val mappings = (0 until mappingsJson.length()).map { i ->
+                val m = mappingsJson.getJSONObject(i)
+                ServerMapping(m.getString("sim_id"), m.getInt("slot_index"),
+                    m.getString("state"), m.getLong("mapping_revision"))
+            }
+            val proposal = MappingProposal(saved.first, revision, mappings)
+            val snapshot = runCatching { SimRegistry.snapshot(this) }.getOrNull() ?: return
+            val selected = json.optJSONObject("selected") ?: JSONObject()
+            val restoredSelections = mutableMapOf<String, SimRegistry.SimSubscription>()
+            selected.keys().forEach { simId ->
+                val subId = selected.optInt(simId, Int.MIN_VALUE)
+                snapshot.subscriptions.firstOrNull { it.subscriptionId == subId }
+                    ?.let { restoredSelections[simId] = it }
+            }
+            runOnUiThread {
+                if (isFinishing || isDestroyed || controlBusy || pendingMappingProposal != null) return@runOnUiThread
+                val currentSession = CredentialStore.load(this) ?: return@runOnUiThread
+                if (currentSession.gatewayId != expectedSession.gatewayId ||
+                    currentSession.controlBaseUrl != expectedSession.controlBaseUrl) return@runOnUiThread
+                pendingMappingProposal = proposal
+                simProposalSubscriptions = snapshot.subscriptions
+                selectedSimBindings.clear()
+                selectedSimBindings.putAll(restoredSelections)
+                renderSimProposal(proposal, snapshot.subscriptions)
+            }
+        } catch (_: Exception) {
+            GatewayDatabase.get(this).clearSimProposal(saved.first)
+        }
+    }
+
+    private fun persistSimProposalSelections(proposal: MappingProposal) {
+        val mappings = JSONArray().apply {
+            proposal.mappings.forEach { m ->
+                put(JSONObject().put("sim_id", m.simId).put("slot_index", m.slotIndex)
+                    .put("state", m.state).put("mapping_revision", m.mappingRevision))
+            }
+        }
+        val selected = JSONObject().apply {
+            selectedSimBindings.forEach { (simId, sub) -> put(simId, sub.subscriptionId) }
+        }
+        GatewayDatabase.get(this).saveSimProposal(proposal.operationId,
+            JSONObject().put("mapping_revision", proposal.mappingRevision)
+                .put("mappings", mappings).put("selected", selected).toString())
+    }
+
+    private fun renderSimProposal(proposal: MappingProposal, subscriptions: List<SimRegistry.SimSubscription>) {
+        val container = findViewById<LinearLayout>(R.id.llSimBindings)
+        container.removeAllViews()
+        findViewById<View>(R.id.btnSimConfirm).visibility = View.VISIBLE
+        val used = mutableSetOf<Int>()
+        proposal.mappings.forEach { mapping ->
+            val title = TextView(this).apply {
+                text = "Server SIM ${mapping.slotIndex + 1} · ${mapping.simId} · ${mapping.state}"
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+                textSize = 13f
+                setPadding(0, 12, 0, 4)
+            }
+            container.addView(title)
+            val group = android.widget.RadioGroup(this).apply { orientation = android.widget.RadioGroup.VERTICAL }
+            val options = subscriptions.filter { it.slotIndex == mapping.slotIndex }.sortedBy { it.slotIndex }
+            if (options.isEmpty()) {
+                container.addView(TextView(this).apply {
+                    text = "No active local SIM subscription in slot ${mapping.slotIndex + 1}"
+                    setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+                    textSize = 12f
+                    setPadding(0, 2, 0, 8)
+                })
+            }
+            options.forEach { sub ->
+                val radio = android.widget.RadioButton(this).apply {
+                    id = View.generateViewId()
+                    text = buildString {
+                        append("Local SIM ${sub.slotIndex + 1}")
+                        if (sub.carrierName.isNotBlank()) append(" · ${sub.carrierName}")
+                        if (sub.displayName.isNotBlank() && sub.displayName != sub.carrierName) append(" · ${sub.displayName}")
+                        if (!sub.phoneNumber.isNullOrBlank()) append(" · ${sub.phoneNumber}")
+                    }
+                    isEnabled = !controlBusy &&
+                        (sub.subscriptionId !in used || selectedSimBindings[mapping.simId]?.subscriptionId == sub.subscriptionId)
+                }
+                group.addView(radio)
+                if (selectedSimBindings[mapping.simId]?.subscriptionId == sub.subscriptionId) {
+                    radio.isChecked = true
+                    used += sub.subscriptionId
+                }
+                radio.setOnClickListener {
+                    selectedSimBindings[mapping.simId] = sub
+                    used.clear()
+                    used.addAll(selectedSimBindings.values.map { it.subscriptionId })
+                    persistSimProposalSelections(proposal)
+                    renderSimProposal(proposal, subscriptions)
+                }
+            }
+            container.addView(group)
+        }
+        val selected = proposal.mappings.mapNotNull { mapping ->
+            selectedSimBindings[mapping.simId]?.takeIf { it.slotIndex == mapping.slotIndex }
+        }
+        findViewById<View>(R.id.btnSimConfirm).isEnabled = !controlBusy &&
+            proposal.mappings.isNotEmpty() && selected.size == proposal.mappings.size &&
+            selected.map { it.subscriptionId }.distinct().size == selected.size
+    }
+
+    private fun confirmSimBindings() {
+        val proposal = pendingMappingProposal ?: return
+        val chosenBySimId = linkedMapOf<String, SimRegistry.SimSubscription>()
+        proposal.mappings.forEach { mapping ->
+            val selected = selectedSimBindings[mapping.simId]
+            if (selected == null || selected.slotIndex != mapping.slotIndex) {
+                Toast.makeText(this, "Select the local SIM in the matching slot for every server row", Toast.LENGTH_LONG).show()
+                return
+            }
+            chosenBySimId[mapping.simId] = selected
+        }
+        if (chosenBySimId.values.map { it.subscriptionId }.distinct().size != chosenBySimId.size) {
+            Toast.makeText(this, "Each server SIM row must use a different local subscription", Toast.LENGTH_LONG).show()
+            return
+        }
+        val controlBase = findViewById<EditText>(R.id.etControlUrl).text.toString().trim()
+        val confirmations = JSONArray()
+        proposal.mappings.forEach { mapping ->
+            confirmations.put(JSONObject().put("sim_id", mapping.simId)
+                .put("confirmed", true).put("slot_index", mapping.slotIndex))
+        }
+        setControlBusy(true, "Confirming SIM bindings with the server…")
+        Thread({
+            try {
+                val initialSnapshot = SimRegistry.snapshot(this)
+                if (chosenBySimId.values.any { chosen ->
+                        initialSnapshot.subscriptions.none {
+                            it.subscriptionId == chosen.subscriptionId && it.slotIndex == chosen.slotIndex
+                        }
+                    }) {
+                    throw ControlApiException("SIM_SUBSCRIPTION_CHANGED", "SIM subscriptions changed. Refresh and select again.")
+                }
+                val results = ControlApiClient(this, controlBase)
+                    .confirmSimBindings(proposal.operationId, confirmations)
+                val proposedById = proposal.mappings.associateBy { it.simId }
+                if (results.size != proposal.mappings.size ||
+                    results.map { it.simId }.toSet() != proposedById.keys ||
+                    results.any { it.mappingRevision != proposal.mappingRevision || proposedById[it.simId]?.slotIndex != it.slotIndex }) {
+                    throw ControlApiException("MAPPING_REVISION_MISMATCH", "服务器映射版本不一致")
+                }
+                if (results.any { it.state != "active" }) {
+                    throw ControlApiException("MAPPING_NOT_ACTIVE", "服务器未激活全部 SIM 映射")
+                }
+                val byId = results.associateBy { it.simId }
+                val currentSnapshot = SimRegistry.snapshot(this)
+                if (currentSnapshot.localRevisionBarrier != initialSnapshot.localRevisionBarrier) {
+                    throw ControlApiException("SIM_SUBSCRIPTION_CHANGED", "SIM 身份在确认过程中发生变化，请重新核对")
+                }
+                val local = proposal.mappings.map { serverMapping ->
+                    if (byId[serverMapping.simId]?.state != "active") {
+                        throw ControlApiException("MAPPING_NOT_ACTIVE", "服务器未激活所选 SIM")
+                    }
+                    val sub = chosenBySimId[serverMapping.simId]
+                        ?: throw ControlApiException("LOCAL_CONFIRMATION_MISSING", "服务器激活了未选择的本地 SIM")
+                    if (sub.slotIndex != serverMapping.slotIndex || currentSnapshot.subscriptions.none {
+                            it.subscriptionId == sub.subscriptionId && it.slotIndex == serverMapping.slotIndex
+                        }) {
+                        throw ControlApiException("SIM_SUBSCRIPTION_CHANGED", "SIM 插槽或订阅已变化，请重新核对")
+                    }
+                    SimRegistry.SimBindingConfirmation(serverMapping.simId, sub.subscriptionId)
+                }
+                SimRegistry.confirmMappings(this, local, proposal.mappingRevision)
+                GatewayDatabase.get(this).clearSimProposal(proposal.operationId)
+                runOnUiThread {
+                    pendingMappingProposal = null
+                    simProposalSubscriptions = emptyList()
+                    selectedSimBindings.clear()
+                    findViewById<LinearLayout>(R.id.llSimBindings).removeAllViews()
+                    findViewById<View>(R.id.btnSimConfirm).visibility = View.GONE
+                    setControlBusy(false, "SIM bindings confirmed. SMS can use active mapped subscriptions.")
+                    GatewayService.startControl(this)
+                }
+            } catch (e: Exception) {
+                val detail = (e as? ControlApiException)?.code ?: "SIM_CONFIRM_FAILED"
+                runOnUiThread { setControlBusy(false, "SIM confirmation failed: $detail") }
+            }
+        }, "gateway-sim-confirm").start()
     }
 
     // ── Tab Navigation ───────────────────────────────────
@@ -549,21 +885,22 @@ class MainActivity : AppCompatActivity() {
 
     private fun openConfigView() {
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-        findViewById<EditText>(R.id.etCfgServer).setText(prefs.getString("server", "callagent.pro"))
-        findViewById<EditText>(R.id.etCfgPort).setText(prefs.getInt("port", 5060).toString())
+        findViewById<EditText>(R.id.etCfgServer).setText(prefs.getString("server", ""))
+        findViewById<EditText>(R.id.etCfgPort).setText(prefs.getInt("port", 5061).toString())
         findViewById<EditText>(R.id.etCfgUser).setText(prefs.getString("user", ""))
         findViewById<EditText>(R.id.etCfgPass).setText(prefs.getString("pass", ""))
         buildOwnNumberFields(prefs)
         findViewById<CheckBox>(R.id.cbCfgAutoconnect).isChecked =
             prefs.getBoolean("autoconnect", true)
         findViewById<CheckBox>(R.id.cbCfgUseStun).isChecked =
-            prefs.getBoolean("use_stun", true)
+            prefs.getBoolean("use_stun", false)
         findViewById<CheckBox>(R.id.cbCfgTranslit).isChecked =
             prefs.getBoolean("translit_ascii", false)
         val cbTls = findViewById<CheckBox>(R.id.cbCfgTls)
         val cbSrtp = findViewById<CheckBox>(R.id.cbCfgSrtp)
-        cbTls.isChecked = prefs.getBoolean("sip_tls", false)
-        cbSrtp.isChecked = prefs.getBoolean("srtp_enabled", false)
+        cbTls.isChecked = true
+        cbSrtp.isChecked = true
+        cbTls.isEnabled = false
 
         // SRTP follows TLS in the UI as well as in the code.  The setting is
         // disabled rather than hidden so it is visible that audio encryption
@@ -572,14 +909,14 @@ class MainActivity : AppCompatActivity() {
         fun syncSrtpEnabled() {
             cbSrtp.isEnabled = cbTls.isChecked
             findViewById<TextView>(R.id.tvCfgSrtpHint).text = if (cbTls.isChecked) {
-                "SDES-keyed SRTP (RFC 3711). Audio is encrypted when the server agrees; " +
-                    "if it answers without SRTP the call continues unencrypted and the log says so."
+                "SIP signalling uses certificate-validated TLS and calls require SRTP. " +
+                    "A server that cannot negotiate SRTP will be rejected."
             } else {
-                "Requires TLS. The keys travel inside the SIP signalling, so over plain UDP " +
-                    "they would be readable by anyone on the path."
+                "TLS is required for SIP calls."
             }
         }
         syncSrtpEnabled()
+        cbSrtp.isEnabled = false
         cbTls.setOnCheckedChangeListener { _, checked ->
             syncSrtpEnabled()
             // Move the port with the transport, the way every other SIP client
@@ -657,7 +994,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun saveConfigFromView() {
         val server = findViewById<EditText>(R.id.etCfgServer).text.toString().trim()
-        val port = findViewById<EditText>(R.id.etCfgPort).text.toString().trim().toIntOrNull() ?: 5060
+        val port = findViewById<EditText>(R.id.etCfgPort).text.toString().trim().toIntOrNull() ?: 5061
         val user = findViewById<EditText>(R.id.etCfgUser).text.toString().trim()
         val pass = findViewById<EditText>(R.id.etCfgPass).text.toString().trim()
         // The lowest active SIM's number is the one everything that does not
@@ -666,10 +1003,8 @@ class MainActivity : AppCompatActivity() {
         val auto = findViewById<CheckBox>(R.id.cbCfgAutoconnect).isChecked
         val useStun = findViewById<CheckBox>(R.id.cbCfgUseStun).isChecked
         val translit = findViewById<CheckBox>(R.id.cbCfgTranslit).isChecked
-        val tls = findViewById<CheckBox>(R.id.cbCfgTls).isChecked
-        // Stored as asked for, but only ever acted on with TLS — so turning
-        // TLS off and on again does not silently lose the audio setting.
-        val srtp = findViewById<CheckBox>(R.id.cbCfgSrtp).isChecked
+        val tls = true
+        val srtp = true
         val agentVolStep = findViewById<SeekBar>(R.id.sbCfgAgentVolume).progress - 3
         val codec = when (findViewById<RadioGroup>(R.id.rgCfgCodec).checkedRadioButtonId) {
             R.id.rbCodecG711 -> "g711"
@@ -677,8 +1012,8 @@ class MainActivity : AppCompatActivity() {
             else -> "g722"
         }
 
-        if (server.isEmpty() || user.isEmpty()) {
-            Toast.makeText(this, "Server and username are required", Toast.LENGTH_LONG).show()
+        if (server.isEmpty() != user.isEmpty()) {
+            Toast.makeText(this, "Enter both SIP server and username, or leave both empty", Toast.LENGTH_LONG).show()
             return
         }
         getSharedPreferences("gateway", MODE_PRIVATE).edit()
@@ -701,7 +1036,7 @@ class MainActivity : AppCompatActivity() {
             .putInt("agent_vol_step", agentVolStep)
             .apply()
         appendLog(
-            "Config saved: $user@$server:$port (own=${own.ifEmpty { "auto" }}, " +
+            "Config saved: ${if (server.isEmpty()) "HTTPS control only" else "$user@$server:$port"} (own=${own.ifEmpty { "auto" }}, " +
                 "codec=$codec, stun=${if (useStun) "on" else "off"}, " +
                 "tls=${if (tls) "on" else "off"}, " +
                 "srtp=${if (srtp && tls) "on" else "off"}, " +
@@ -861,7 +1196,9 @@ class MainActivity : AppCompatActivity() {
                 android.telephony.TelephonyManager.NETWORK_TYPE_UNKNOWN -> "—"
                 else -> "?"
             }
-            val dbm = signalDbm(tm.signalStrength)
+            val dbm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                signalDbm(tm.signalStrength)
+            } else null
             if (dbm != null && dbm != Int.MAX_VALUE) "$type $name ${dbm}dBm"
             else "$type $name"
         } catch (e: Exception) {
@@ -1079,7 +1416,7 @@ class MainActivity : AppCompatActivity() {
                             "(${c.javaClass.simpleName.removePrefix("CellSignalStrength")})"
                     )
                 }
-            } else {
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 signalDbm(tm.signalStrength)?.let { appendLine("Signal       : $it dBm") }
             }
         } catch (e: Exception) {
@@ -1157,6 +1494,7 @@ class MainActivity : AppCompatActivity() {
      * dialog.  Int.MAX_VALUE is the API's "unknown", not a real reading, so it
      * is shown as a dash rather than a nine-digit number.
      */
+    @Suppress("DEPRECATION")
     private fun describeCell(info: android.telephony.CellInfo): String = buildString {
         fun row(name: String, value: String) = appendLine(name.padEnd(13) + ": " + value)
         fun num(x: Int) = if (x == Int.MAX_VALUE) "—" else x.toString()
@@ -1175,9 +1513,13 @@ class MainActivity : AppCompatActivity() {
                 row("PCI", num(id.pci))
                 row("TAC", num(id.tac))
                 row("EARFCN", num(id.earfcn))
-                row("MCC/MNC", "${id.mccString ?: "—"}/${id.mncString ?: "—"}")
-                id.operatorAlphaLong?.toString()?.takeIf { it.isNotBlank() }
-                    ?.let { row("Carrier", it) }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    row("MCC/MNC", "${id.mccString ?: "—"}/${id.mncString ?: "—"}")
+                    id.operatorAlphaLong?.toString()?.takeIf { it.isNotBlank() }
+                        ?.let { row("Carrier", it) }
+                } else {
+                    row("MCC/MNC", "${num(id.mcc)}/${num(id.mnc)}")
+                }
                 row("Signal", sig(info.cellSignalStrength))
             }
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
@@ -1198,7 +1540,11 @@ class MainActivity : AppCompatActivity() {
                 row("LAC", num(id.lac))
                 row("PSC", num(id.psc))
                 row("UARFCN", num(id.uarfcn))
-                row("MCC/MNC", "${id.mccString ?: "—"}/${id.mncString ?: "—"}")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    row("MCC/MNC", "${id.mccString ?: "—"}/${id.mncString ?: "—"}")
+                } else {
+                    row("MCC/MNC", "${num(id.mcc)}/${num(id.mnc)}")
+                }
                 row("Signal", sig(info.cellSignalStrength))
             }
             info is android.telephony.CellInfoGsm -> {
@@ -1208,7 +1554,11 @@ class MainActivity : AppCompatActivity() {
                 row("LAC", num(id.lac))
                 row("ARFCN", num(id.arfcn))
                 row("BSIC", num(id.bsic))
-                row("MCC/MNC", "${id.mccString ?: "—"}/${id.mncString ?: "—"}")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    row("MCC/MNC", "${id.mccString ?: "—"}/${id.mncString ?: "—"}")
+                } else {
+                    row("MCC/MNC", "${num(id.mcc)}/${num(id.mnc)}")
+                }
                 row("Signal", sig(info.cellSignalStrength))
             }
             else -> {
@@ -1316,14 +1666,15 @@ class MainActivity : AppCompatActivity() {
             row.findViewById<ImageView>(R.id.ivRowIcon).setImageResource(
                 if (incoming) R.drawable.ic_call_incoming else R.drawable.ic_call_outgoing
             )
-            row.findViewById<TextView>(R.id.tvRowNumber).text = e.number
             val sms = e.type == CallLogStore.TYPE_SMS
+            row.findViewById<TextView>(R.id.tvRowNumber).text =
+                e.number.ifEmpty { if (sms) "SMS · content cleared" else "Unknown number" }
             // The direction arrow and the card are the same as a call's — a
             // message is the same kind of traffic through the same gateway.
             // What changes is the second line, which carries the message
             // itself, and the slot where a call shows its duration.
             row.findViewById<TextView>(R.id.tvRowSub).text = when {
-                sms -> e.text.replace('\n', ' ').trim().ifEmpty { "(no text)" }
+                sms -> e.text.replace('\n', ' ').trim().ifEmpty { "SMS details cleared after server sync" }
                 e.durationSec > 0 -> if (incoming) "GSM → SIP" else "SIP → GSM"
                 else -> "Not connected"
             }
@@ -1786,7 +2137,7 @@ class MainActivity : AppCompatActivity() {
     private fun startGateway() {
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
         val server = prefs.getString("server", "") ?: ""
-        val port = prefs.getInt("port", 5060)
+        val port = prefs.getInt("port", 5061)
         val user = prefs.getString("user", "") ?: ""
         val pass = prefs.getString("pass", "") ?: ""
 

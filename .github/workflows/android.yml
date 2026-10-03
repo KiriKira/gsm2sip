@@ -1,0 +1,36 @@
+name: Gateway checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  gateway:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - run: sdkmanager 'platforms;android-34' 'build-tools;34.0.0'
+      - run: bash gradlew :app:testDebugUnitTest :app:assembleDebug :app:lintDebug --no-daemon
+      - run: bash -n build.sh tools/check-device.sh magisk/install.sh magisk/service.sh
+      - run: sh tools/test-magisk-runtime.sh
+      - run: SKIP_INSTALL=1 bash build.sh debug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gateway-development-apk
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            gateway-magisk.zip
+          if-no-files-found: error

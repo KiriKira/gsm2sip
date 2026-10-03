@@ -470,13 +470,114 @@
                             android:paddingTop="2dp"
                             android:paddingBottom="14dp" />
 
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="Control server pairing"
+                            android:textColor="@color/text_primary"
+                            android:textStyle="bold"
+                            android:textSize="16sp"
+                            android:paddingTop="8dp" />
+
+                        <TextView style="@style/CfgLabel" android:text="HTTPS control server" />
+                        <EditText
+                            android:id="@+id/etControlUrl"
+                            style="@style/CfgField"
+                            android:hint="https://your-server.example"
+                            android:inputType="textUri" />
+
+                        <TextView style="@style/CfgLabel" android:text="Device name" />
+                        <EditText
+                            android:id="@+id/etControlDeviceName"
+                            style="@style/CfgField"
+                            android:hint="Old Android phone"
+                            android:inputType="textCapWords" />
+
+                        <TextView style="@style/CfgLabel" android:text="One-time pairing code" />
+                        <EditText
+                            android:id="@+id/etControlPairingCode"
+                            style="@style/CfgField"
+                            android:hint="Paste code from server CLI"
+                            android:inputType="textPassword" />
+
+                        <Button
+                            android:id="@+id/btnControlPair"
+                            android:layout_width="match_parent"
+                            android:layout_height="48dp"
+                            android:text="PAIR GATEWAY"
+                            android:textStyle="bold"
+                            android:textColor="@color/accent_on"
+                            android:backgroundTint="@color/accent"
+                            android:layout_marginTop="8dp"
+                            android:minHeight="0dp"
+                            android:insetTop="0dp"
+                            android:insetBottom="0dp" />
+
+                        <TextView
+                            android:id="@+id/tvControlStatus"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="Not paired"
+                            android:textColor="@color/text_secondary"
+                            android:textSize="12sp"
+                            android:paddingTop="8dp" />
+
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="SIM UUIDs come from the server. Each SIM is activated only after you confirm its local slot here. ICCID and IMSI values are never uploaded."
+                            android:textSize="12sp"
+                            android:textColor="@color/text_hint"
+                            android:paddingTop="6dp" />
+
+                        <Button
+                            android:id="@+id/btnSimPropose"
+                            android:layout_width="match_parent"
+                            android:layout_height="44dp"
+                            android:text="SYNC SIM LIST"
+                            android:textAllCaps="false"
+                            android:textColor="@color/text_primary"
+                            android:backgroundTint="@color/btn_secondary"
+                            android:layout_marginTop="10dp"
+                            android:minHeight="0dp"
+                            android:insetTop="0dp"
+                            android:insetBottom="0dp" />
+
+                        <LinearLayout
+                            android:id="@+id/llSimBindings"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:orientation="vertical"
+                            android:paddingTop="4dp" />
+
+                        <Button
+                            android:id="@+id/btnSimConfirm"
+                            android:layout_width="match_parent"
+                            android:layout_height="44dp"
+                            android:text="CONFIRM SELECTED SIMS"
+                            android:textAllCaps="false"
+                            android:textColor="@color/text_primary"
+                            android:backgroundTint="@color/btn_secondary"
+                            android:layout_marginTop="4dp"
+                            android:visibility="gone"
+                            android:minHeight="0dp"
+                            android:insetTop="0dp"
+                            android:insetBottom="0dp" />
+
+                        <View
+                            android:layout_width="match_parent"
+                            android:layout_height="1dp"
+                            android:background="@color/btn_secondary"
+                            android:layout_marginTop="18dp"
+                            android:layout_marginBottom="10dp" />
+
                         <TextView style="@style/CfgLabel" android:text="SIP Server" />
                         <EditText android:id="@+id/etCfgServer" style="@style/CfgField"
-                            android:hint="callagent.pro" android:inputType="textUri" />
+                            android:hint="SIP host (optional)" android:inputType="textUri" />
 
                         <TextView style="@style/CfgLabel" android:text="SIP Port" />
                         <EditText android:id="@+id/etCfgPort" style="@style/CfgField"
-                            android:hint="5060" android:inputType="number" />
+                            android:hint="5061" android:inputType="number" />
 
                         <TextView style="@style/CfgLabel" android:text="SIP Username" />
                         <EditText android:id="@+id/etCfgUser" style="@style/CfgField"

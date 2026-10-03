@@ -8,18 +8,18 @@ import java.io.OutputStreamWriter
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.UUID
 
 /**
  * Persistent root shell — opens `su` once and reuses it for all commands.
  * Eliminates repeated Magisk superuser popups.
  *
  * Usage:
- *   RootShell.exec("appops set --uid com.callagent.gateway RECORD_AUDIO allow")
  *   val output = RootShell.execForOutput("tinymix 2>&1 | grep -i Incall")
  */
 object RootShell {
     private const val TAG = "RootShell"
-    private const val MARKER = "___ROOT_SHELL_DONE___"
+    private const val DEFAULT_MAX_OUTPUT_CHARS = 256 * 1024
 
     private var process: Process? = null
     private var writer: OutputStreamWriter? = null
@@ -29,12 +29,16 @@ object RootShell {
     private data class Command(
         val cmd: String,
         val latch: CountDownLatch,
+        val maxOutputChars: Int = DEFAULT_MAX_OUTPUT_CHARS,
+        val isRootProbe: Boolean = false,
+        val marker: String = "___ROOT_${UUID.randomUUID().toString().replace("-", "")}___",
         var output: String = "",
         var exitCode: Int = -1
     )
     private val commandQueue = LinkedBlockingQueue<Command>()
     @Volatile private var workerThread: Thread? = null
     @Volatile private var alive = false
+    @Volatile private var rootVerified = false
 
     /** Incremented every time the shell is torn down.  A worker runs only
      *  while it is the current generation: tearing the shell down clears
@@ -66,16 +70,16 @@ object RootShell {
     /** Current root state, for diagnostics: "ok", "denied" or "unavailable". */
     fun rootState(): String = when {
         denied -> "denied"
-        alive -> "ok"
+        alive && rootVerified -> "ok"
         else -> "unavailable"
     }
 
     private fun reportDenied(detail: String) {
         if (denied) return
         denied = true
-        val msg = "ROOT DENIED by the superuser manager ($detail) — mixer routing " +
-            "and appops grants are unavailable, so calls will answer with no audio. " +
-            "Grant root to this app in Magisk; it is picked up on the next call, " +
+        val msg = "ROOT DENIED by the superuser manager ($detail) — root capability " +
+            "probes and mixer routing are unavailable. " +
+            "Grant root to this app in Magisk; it is retried automatically, " +
             "with no restart needed."
         Log.e(TAG, msg)
         statusCallback?.invoke(msg)
@@ -106,6 +110,8 @@ object RootShell {
             writer = OutputStreamWriter(proc.outputStream)
             reader = BufferedReader(InputStreamReader(proc.inputStream))
             alive = true
+            rootVerified = false
+            commandQueue.put(Command("id -u", CountDownLatch(1), isRootProbe = true))
 
             // Drain stderr, or it will eventually block the shell.  su's
             // stderr is a pipe with a kernel buffer of a few dozen KB and
@@ -140,7 +146,7 @@ object RootShell {
                 while (alive && generation == myGeneration) {
                     try {
                         val cmd = commandQueue.poll(5, TimeUnit.SECONDS) ?: continue
-                        executeInternal(cmd)
+                        executeInternal(cmd, myGeneration)
                     } catch (_: InterruptedException) {
                         break
                     } catch (e: Exception) {
@@ -159,10 +165,12 @@ object RootShell {
 
     /** Run a command, wait up to [timeoutMs] for completion. Returns exit code. */
     fun exec(cmd: String, timeoutMs: Long = 5000): Int {
+        require(timeoutMs in 1..60_000)
         if (!alive) init()
+        if (!alive && denied) return -1
         if (!alive) {
             // Fallback: try one-shot su -c
-            return execFallback(cmd)
+            return execFallback(cmd, timeoutMs)
         }
         val command = Command(cmd, CountDownLatch(1))
         commandQueue.put(command)
@@ -174,10 +182,13 @@ object RootShell {
     }
 
     /** Run a command and return its stdout. */
-    fun execForOutput(cmd: String, timeoutMs: Long = 5000): String {
+    fun execForOutput(cmd: String, timeoutMs: Long = 5000, maxOutputChars: Int = DEFAULT_MAX_OUTPUT_CHARS): String {
+        require(timeoutMs in 1..60_000)
+        require(maxOutputChars in 1..DEFAULT_MAX_OUTPUT_CHARS)
         if (!alive) init()
-        if (!alive) return execFallbackOutput(cmd)
-        val command = Command(cmd, CountDownLatch(1))
+        if (!alive && denied) return ""
+        if (!alive) return execFallbackOutput(cmd, timeoutMs, maxOutputChars)
+        val command = Command(cmd, CountDownLatch(1), maxOutputChars = maxOutputChars)
         commandQueue.put(command)
         if (!command.latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
             resetShell("execForOutput timed out after ${timeoutMs}ms: ${cmd.take(80)}")
@@ -197,18 +208,20 @@ object RootShell {
      * is to discard the shell; the next call opens a fresh one.
      */
     @Synchronized
-    private fun resetShell(reason: String) {
+    private fun resetShell(reason: String, expectedGeneration: Int? = null) {
+        if (expectedGeneration != null && generation != expectedGeneration) return
         Log.w(TAG, "Resetting root shell — $reason")
         alive = false
+        rootVerified = false
         generation++
         // Interrupting ourselves would only set a flag on a thread that is
         // about to fall out of its loop anyway; the generation bump is what
         // actually stops it.
         workerThread?.takeIf { it != Thread.currentThread() }?.interrupt()
         workerThread = null
+        try { process?.destroyForcibly() } catch (_: Exception) {}
         try { writer?.close() } catch (_: Exception) {}
         try { reader?.close() } catch (_: Exception) {}
-        try { process?.destroy() } catch (_: Exception) {}
         process = null
         writer = null
         reader = null
@@ -220,29 +233,35 @@ object RootShell {
         }
     }
 
-    private fun executeInternal(command: Command) {
+    private fun executeInternal(command: Command, shellGeneration: Int) {
         var failure: String? = null
         try {
             val w = writer
             val r = reader
+            if (generation != shellGeneration || (!command.isRootProbe && !rootVerified)) {
+                failure = "root session is not verified"
+                return
+            }
             if (w == null || r == null) {
                 failure = "shell gone before: ${command.cmd.take(80)}"
                 return
             }
 
             // Write command, then echo a unique marker + exit code
-            w.write("${command.cmd}\necho \"${MARKER}\$?\"\n")
+            w.write("${command.cmd}\nprintf '\\n%s%s\\n' '${command.marker}' \"\$?\"\n")
             w.flush()
 
             val sb = StringBuilder()
             var sawMarker = false
             while (true) {
-                val line = r.readLine() ?: break
-                if (line.startsWith(MARKER)) {
-                    command.exitCode = line.removePrefix(MARKER).trim().toIntOrNull() ?: 0
+                val remaining = (command.maxOutputChars - sb.length).coerceAtLeast(0)
+                val line = readBoundedRootLine(r, maxOf(remaining, command.marker.length + 12)) ?: break
+                if (line.startsWith(command.marker)) {
+                    command.exitCode = line.removePrefix(command.marker).trim().toIntOrNull() ?: -1
                     sawMarker = true
                     break
                 }
+                if (line.length + 1 > remaining) throw java.io.IOException("Root reply exceeds output limit")
                 sb.appendLine(line)
             }
             command.output = sb.toString().trimEnd()
@@ -250,47 +269,42 @@ object RootShell {
             // marker never arrived, so the exit code is meaningless and the
             // stream is no longer in a known state.
             if (!sawMarker) failure = "shell ended during: ${command.cmd.take(80)}"
+            if (command.isRootProbe && sawMarker) {
+                rootVerified = command.exitCode == 0 && command.output.trim() == "0"
+                if (!rootVerified) {
+                    reportDenied("UID verification failed")
+                    failure = "root UID verification failed"
+                }
+            }
         } catch (e: Exception) {
             failure = "${e.message} during: ${command.cmd.take(80)}"
         } finally {
+            if (failure != null) { command.output = ""; command.exitCode = -1 }
+            if (failure != null) {
+                Log.w(TAG, "Root shell failed — $failure")
+                resetShell(failure, shellGeneration)
+            } else if (denied && rootVerified) {
+                reportRecovered()
+            }
             command.latch.countDown()
-        }
-
-        if (failure != null) {
-            // Discard the shell instead of leaving it half-dead.  Clearing
-            // `alive` on its own left the worker, the process and both streams
-            // in place, so the next command was written into a shell nobody
-            // was reading: from the first failure onwards every result came
-            // back one command out of step, silently.  When su had been denied
-            // outright it was worse — the app respawned `su` for every command
-            // and never said why, and the only visible symptom was that calls
-            // connected with no audio.
-            Log.w(TAG, "Root shell failed — $failure")
-            resetShell(failure)
-        } else if (denied) {
-            // A command got all the way through, so whatever was refusing us
-            // has stopped.  Root can be re-granted while the app runs.
-            reportRecovered()
         }
     }
 
     /** Fallback for when persistent shell fails — single su -c call */
-    private fun execFallback(cmd: String): Int {
+    private fun execFallback(cmd: String, timeoutMs: Long): Int {
         return try {
             val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
-            if (proc.waitFor(5, TimeUnit.SECONDS)) proc.exitValue() else -1
+            BoundedRootProcess.run(proc, timeoutMs, DEFAULT_MAX_OUTPUT_CHARS).exitCode
         } catch (e: Exception) {
             Log.w(TAG, "Fallback exec failed: ${e.message}")
             -1
         }
     }
 
-    private fun execFallbackOutput(cmd: String): String {
+    private fun execFallbackOutput(cmd: String, timeoutMs: Long, maxOutputChars: Int): String {
         return try {
             val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
-            val out = proc.inputStream.bufferedReader().readText().trim()
-            proc.waitFor(5, TimeUnit.SECONDS)
-            out
+            BoundedRootProcess.run(proc, timeoutMs, maxOutputChars).output
         } catch (e: Exception) {
             Log.w(TAG, "Fallback exec failed: ${e.message}")
             ""
@@ -298,16 +312,7 @@ object RootShell {
     }
 
     fun destroy() {
-        alive = false
-        generation++
-        workerThread?.takeIf { it != Thread.currentThread() }?.interrupt()
-        workerThread = null
-        try { writer?.close() } catch (_: Exception) {}
-        try { reader?.close() } catch (_: Exception) {}
-        try { process?.destroy() } catch (_: Exception) {}
-        process = null
-        writer = null
-        reader = null
+        resetShell("destroyed")
         Log.i(TAG, "Root shell destroyed")
     }
 }

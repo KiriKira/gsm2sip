@@ -8,6 +8,7 @@ import android.graphics.drawable.Icon
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
@@ -17,12 +18,17 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.BatteryManager
 import android.telephony.TelephonyManager
-import com.callagent.gateway.sms.OutboundSms
-import com.callagent.gateway.sms.PendingSms
-import com.callagent.gateway.sms.SmsOutbox
+import com.callagent.gateway.data.CredentialStore
+import com.callagent.gateway.data.GatewayDatabase
+import com.callagent.gateway.net.ControlApiClient
+import com.callagent.gateway.net.ControlApiException
+import com.callagent.gateway.net.HeartbeatSim
+import com.callagent.gateway.net.ServerCommand
+import com.callagent.gateway.sim.SimRegistry
+import com.callagent.gateway.sms.LegacySmsMigration
 import com.callagent.gateway.sms.SmsSender
-import com.callagent.gateway.sms.SmsStore
 import android.util.Log
 import com.callagent.gateway.BuildConfig
 import com.callagent.gateway.GatewayApp
@@ -36,6 +42,8 @@ import com.callagent.gateway.sip.SipClient
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 /**
@@ -53,7 +61,7 @@ class GatewayService : Service() {
 
     /** Saved config for reconnect */
     private var cfgServer = ""
-    private var cfgPort = 5060
+    private var cfgPort = 5061
     private var cfgUser = ""
     private var cfgPass = ""
     private var currentLocalIp = ""
@@ -79,6 +87,14 @@ class GatewayService : Service() {
 
     /** Prevents concurrent startGateway / reconnect threads */
     private val initializing = AtomicBoolean(false)
+    private val controlLoopActive = AtomicBoolean(false)
+    private val controlWakeSignal = Semaphore(0)
+    @Volatile private var controlStop = false
+    @Volatile private var foregroundStarted = false
+    @Volatile private var callMicrophoneForegroundActive = false
+
+    /** True only after this service successfully enters the call-media FGS mode. */
+    fun hasCallMicrophoneForeground(): Boolean = foregroundStarted && callMicrophoneForegroundActive
 
     /**
      * Bumped on every bring-up.  A SIP init is slow — Magisk `su` can take
@@ -274,9 +290,15 @@ class GatewayService : Service() {
         createNotificationChannel()
         registerNetworkCallback()
         RootShell.init()
+        LegacySmsMigration.migrate(this)
+        val recovered = GatewayDatabase.get(this).recoverUnknownDispatches()
+        if (recovered > 0) broadcastLog("SMS: marked $recovered interrupted dispatch(es) unknown; no automatic retry")
+        if (callRecoveryDone.compareAndSet(false, true)) {
+            val recoveredCalls = GatewayDatabase.get(this).recoverDispatchingCallsToUnknown()
+            if (recoveredCalls > 0) broadcastLog("CALL: marked $recoveredCalls interrupted call dispatch(es) unknown")
+        }
         thread(name = "notif-setup") {
             applyNotificationVisibility()
-            silenceDefaultSmsApp()
         }
         Log.i(TAG, "GatewayService created")
     }
@@ -317,15 +339,8 @@ class GatewayService : Service() {
      * perfectly while quietly dropping every message.
      */
     private fun checkSmsPermission() {
-        // Self-heal with root, the way RECORD_AUDIO's appop is forced.  The
-        // Magisk module's grant loop runs before PackageManager is up, so a
-        // newly added permission never takes there — and the failure is
-        // invisible: incoming SMS is simply never delivered, outgoing is
-        // refused.
-        if (!hasReceiveSms()) grantViaRoot("android.permission.RECEIVE_SMS")
-        if (!hasSendSms()) grantViaRoot("android.permission.SEND_SMS")
-
-        val queued = SmsStore.pending(this).size
+        val queued = GatewayDatabase.get(this).pendingEvents(CredentialStore.load(this)?.gatewayId.orEmpty()).size
+        val legacy = GatewayDatabase.get(this).legacyOutboxCount()
         if (hasReceiveSms()) {
             broadcastLog("SMS receive: ready${if (queued > 0) " ($queued queued)" else ""}")
         } else {
@@ -336,15 +351,7 @@ class GatewayService : Service() {
         } else {
             broadcastLog("WARNING: SEND_SMS not granted — send requests will be refused")
         }
-    }
-
-    private fun grantViaRoot(permission: String) {
-        broadcastLog("$permission not granted — granting via root")
-        try {
-            RootShell.exec("pm grant $packageName $permission", 8000)
-        } catch (e: Exception) {
-            Log.w(TAG, "pm grant $permission failed: ${e.message}")
-        }
+        if (legacy > 0) broadcastLog("SMS: $legacy pre-v1 outbound item(s) preserved for manual review")
     }
 
     private fun hasReceiveSms(): Boolean =
@@ -367,6 +374,7 @@ class GatewayService : Service() {
         clearStaleInitializing()
         when (intent?.action) {
             ACTION_START -> startGateway(intent)
+            ACTION_CONTROL_START -> startControlGateway()
             ACTION_STOP -> stopGateway()
             ACTION_RELOAD_STATS -> reloadStats()
             ACTION_STATUS -> broadcastCurrentStatus()
@@ -378,6 +386,8 @@ class GatewayService : Service() {
                 broadcastStatus("STARTING", "Retrying…")
                 if (sip != null && !stopped) {
                     sip.retryNow()
+                } else if (cfgServer.isEmpty()) {
+                    startControlGateway()
                 } else {
                     // No client — a previous reconnect nulled it and never
                     // finished.  Force a fresh one rather than letting the
@@ -389,19 +399,16 @@ class GatewayService : Service() {
             }
             ACTION_APPLY_CONFIG -> applyConfigChange()
             ACTION_SMS_SEND -> {
-                startForeground(activeNotificationId(), buildNotification(notifState))
-                dispatchOutbox()
+                startControlGateway()
+                wakeControlLoop()
             }
             ACTION_SMS_REPORT -> {
-                startForeground(activeNotificationId(), buildNotification(notifState))
-                reportOutbox(intent.getStringExtra(EXTRA_SMS_ID))
+                startControlGateway()
+                wakeControlLoop()
             }
             ACTION_SMS_FLUSH -> {
-                // Started with startForegroundService() from the SMS receiver,
-                // so the foreground promise has to be honoured — with the
-                // notification it already has, not a new one.
-                startForeground(activeNotificationId(), buildNotification(notifState))
-                flushSmsQueue("received")
+                startControlGateway()
+                wakeControlLoop()
             }
             ACTION_DIAL -> dialFromDialler(intent)
             ACTION_MUTE_AGENT -> {
@@ -427,7 +434,13 @@ class GatewayService : Service() {
                 orchestrator?.setMonitorEnabled(monitorOn)
                 updateNotification(NotifState.OK)
             }
-            else -> startGateway(intent)
+            else -> {
+                val session = CredentialStore.load(this)
+                val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
+                val sipConfigured = !prefs.getString("server", "").isNullOrBlank() &&
+                    !prefs.getString("user", "").isNullOrBlank()
+                if (session != null && !sipConfigured) startControlGateway() else startGateway(intent)
+            }
         }
         return START_STICKY
     }
@@ -453,20 +466,30 @@ class GatewayService : Service() {
         // nothing until the service happened to restart.  Measured both ways
         // -- quiet to normal and back -- and neither moved without this.
         runCatching {
-            startForeground(activeNotificationId(), buildNotification(notifState))
+            startForegroundMode(
+                callActive = orchestrator?.bridgeState?.let { it != CallOrchestrator.BridgeState.IDLE } ?: false,
+                status = notifStatusText
+            )
             cancelStaleNotification()
         }.onFailure { Log.w(TAG, "Could not re-post notification: ${it.message}") }
         thread(name = "notif-visibility") {
             applyNotificationVisibility()
-            silenceDefaultSmsApp()
         }
         cfgServer = prefs.getString("server", "") ?: ""
-        cfgPort = prefs.getInt("port", 5060)
+        cfgPort = prefs.getInt("port", 5061)
         cfgUser = prefs.getString("user", "") ?: ""
         cfgPass = prefs.getString("pass", "") ?: ""
         if (cfgServer.isEmpty() || cfgUser.isEmpty()) {
-            broadcastLog("ERROR: Missing server or username")
-            broadcastStatus("ERROR", "Missing SIP configuration")
+            orchestrator?.stop()
+            sipClient?.stop()
+            orchestrator = null
+            sipClient = null
+            if (CredentialStore.load(this) != null) {
+                startControlGateway()
+            } else {
+                broadcastLog("SIP is unconfigured; pair this gateway with the HTTPS control server")
+                broadcastStatus("PAIRING_REQUIRED", "Pair this phone with the control server")
+            }
             return
         }
         broadcastLog("Config changed — rebuilding SIP client")
@@ -478,488 +501,342 @@ class GatewayService : Service() {
         reconnect()
     }
 
-    // ── Received SMS → SIP ──────────────────────────────
+    // ── HTTPS event journal and command ledger ───────────
 
-    /** One flush at a time: arrival, registration and the retry timer can all
-     *  fire at once, and sending the same message twice is worse than late. */
-    private val smsFlushing = AtomicBoolean(false)
-    @Volatile private var smsRetryScheduled = false
-
-    /**
-     * Hand every queued SMS to the server over the registration that is
-     * already up, oldest first.
-     *
-     * A message leaves the queue only on a 2xx.  Anything else — no response,
-     * a 4xx, SIP not registered — leaves it on disk for the next attempt,
-     * because the broadcast that delivered it is not repeatable.
-     */
-    private fun flushSmsQueue(reason: String) {
-        if (!smsFlushing.compareAndSet(false, true)) return
-        thread(name = "sms-flush") {
+    /** Wake an existing poller or launch it once. Network work always stays off UI/broadcast threads. */
+    private fun startControlLoop() {
+        if (CredentialStore.load(this) == null) return
+        controlStop = false
+        if (!controlLoopActive.compareAndSet(false, true)) {
+            if (controlWakeSignal.availablePermits() == 0) controlWakeSignal.release()
+            return
+        }
+        thread(name = "gateway-control") {
+            var retryMs = CONTROL_INTERVAL_MS
             try {
-                val queue = SmsStore.pending(this)
-                if (queue.isEmpty()) return@thread
-                val sip = sipClient
-                if (sip == null || !sip.registered) {
-                    broadcastLog("SMS: ${queue.size} queued, waiting for registration")
-                    scheduleSmsRetry()
-                    return@thread
-                }
-                broadcastLog("SMS: forwarding ${queue.size} message(s) [$reason]")
-                // The default SMS app keeps its own copy and shows it unread.
-                // Nobody reads this screen, so an unread badge just
-                // accumulates for ever.  Done here rather than in the
-                // receiver: the default app writes its row when it handles
-                // SMS_DELIVER, which may not have happened yet at that point.
-                markInboxRead()
-                var failed = false
-                for (sms in queue) {
-                    val code = sendSmsOverSip(sip, sms)
-                    if (code == 200 || code == 202) {
-                        SmsStore.remove(this, sms.id)
-                        broadcastLog("SMS: ${sms.id} from ${sms.from} accepted ($code)")
-                    } else {
-                        SmsStore.markAttempt(this, sms.id)
-                        broadcastLog(
-                            "SMS: ${sms.id} from ${sms.from} not accepted " +
-                                "(${if (code == 0) "no response" else code.toString()}) — queued"
-                        )
-                        failed = true
-                        break   // keep order; a later one is no more likely to land
+                while (!controlStop && !stopped) {
+                    try {
+                        syncControlPlaneOnce()
+                        retryMs = CONTROL_INTERVAL_MS
+                    } catch (e: ControlApiException) {
+                        broadcastLog("CONTROL: ${e.code}; retry scheduled")
+                        retryMs = if (e.retryable) (retryMs * 2).coerceAtMost(CONTROL_MAX_RETRY_MS)
+                        else CONTROL_INTERVAL_MS
+                    } catch (_: Exception) {
+                        broadcastLog("CONTROL: sync failed; retry scheduled")
+                        retryMs = (retryMs * 2).coerceAtMost(CONTROL_MAX_RETRY_MS)
                     }
+                    if (!controlStop && !stopped) controlWakeSignal.tryAcquire(retryMs, TimeUnit.MILLISECONDS)
                 }
-                if (failed) scheduleSmsRetry()
-            } catch (e: Exception) {
-                Log.e(TAG, "SMS flush failed: ${e.message}", e)
-                scheduleSmsRetry()
-            } finally {
-                smsFlushing.set(false)
-            }
-        }
-    }
-
-    private fun scheduleSmsRetry() {
-        if (smsRetryScheduled) return
-        smsRetryScheduled = true
-        thread(name = "sms-retry") {
-            try {
-                Thread.sleep(SMS_RETRY_MS)
             } catch (_: InterruptedException) {
-                return@thread
+                Thread.currentThread().interrupt()
             } finally {
-                smsRetryScheduled = false
+                controlLoopActive.set(false)
             }
-            if (stopped) return@thread
-            flushSmsQueue("retry")
-            sweepOutboxReports()
         }
     }
 
-    /**
-     * The wire format, in one place so it can be read against the server's
-     * dialplan.  Request-URI addresses the SIM's own number where the SIM
-     * reports one, falling back to the configured own number and then to the
-     * SIP account — the same routing key an inbound *call* uses, so the server
-     * can map an SMS to an assistant exactly as it maps a call.
-     */
-    private fun sendSmsOverSip(sip: SipClient, sms: PendingSms): Int {
-        val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-        val configuredOwn = ownNumberForSub(sms.subId)
-        val target = sms.to.ifEmpty { configuredOwn }.ifEmpty { cfgUser }
-        val targetUri = "sip:$target@$cfgServer"
-        val headers = mutableListOf(
-            "X-SMS-Id: ${sms.id}",
-            "X-SMS-From: ${sms.from}",
-            "X-SMS-To: $target",
-            "X-SMS-Received: ${smsTimeFormat.format(java.util.Date(sms.receivedAt))}",
-            "X-SMS-Parts: ${sms.parts}"
-        )
-        if (sms.subId >= 0) headers += "X-SMS-Sim-Sub: ${sms.subId}"
-        if (sms.slot >= 0) headers += "X-SMS-Sim-Slot: ${sms.slot}"
-        if (sms.carrier.isNotEmpty()) headers += "X-SMS-Sim-Carrier: ${sms.carrier}"
-        if (sms.attempts > 0) headers += "X-SMS-Attempt: ${sms.attempts + 1}"
-        return sip.sendSipMessage(
-            targetUri = targetUri,
-            fromUser = sms.from.ifEmpty { "unknown" },
-            body = sms.text,
-            extraHeaders = headers
-        )
+    private fun wakeControlLoop() {
+        if (controlWakeSignal.availablePermits() == 0) controlWakeSignal.release()
+        startControlLoop()
     }
 
-    // ── SIP → SMS ───────────────────────────────────────
+    private fun startControlGateway() {
+        val session = CredentialStore.load(this)
+        if (session == null) {
+            broadcastStatus("PAIRING_REQUIRED", "Pair this phone with the control server")
+            if (sipClient == null) stopSelf()
+            return
+        }
+        stopped = false
+        val callActive = orchestrator?.bridgeState?.let { it != CallOrchestrator.BridgeState.IDLE } ?: false
+        try {
+            startForegroundMode(callActive = callActive, status = if (callActive) "In-Call · syncing" else "Gateway syncing")
+        } catch (e: Exception) {
+            foregroundStarted = false
+            callMicrophoneForegroundActive = false
+            broadcastLog("CONTROL: foreground service unavailable (${e.javaClass.simpleName})")
+            broadcastStatus("CONTROL_START_FAILED", "Foreground service start failed")
+            stopSelf()
+            return
+        }
+        broadcastLog("CONTROL: paired gateway session active")
+        wakeControlLoop()
+    }
 
-    /**
-     * A MESSAGE from the server asking us to send an SMS.
-     *
-     * Runs on the SIP receive thread, so it does nothing slow: the request is
-     * validated, written to the outbox and answered.  Answering 202 is a
-     * promise that the message is now ours to deliver and report on, so
-     * nothing is answered 202 until it is safely on disk.
-     */
-    fun onSmsSendRequest(msg: com.callagent.gateway.sip.SipMessage): Pair<Int, List<String>> {
-        val type = msg.contentType?.lowercase().orEmpty()
-        if (type.isNotEmpty() && !type.startsWith("text/plain")) {
-            broadcastLog("SMS send refused: unsupported Content-Type '$type'")
-            return 415 to emptyList()
+    private fun startForegroundMode(callActive: Boolean, status: String) {
+        notifStatusText = status
+        val notification = buildNotification(if (callActive) NotifState.OK else NotifState.WARN, status)
+        callMicrophoneForegroundActive = false
+        if (Build.VERSION.SDK_INT >= 34) {
+            val type = if (callActive) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            } else ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            startForeground(activeNotificationId(), notification, type)
+        } else if (Build.VERSION.SDK_INT >= 30) {
+            val type = if (callActive) ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0
+            startForeground(activeNotificationId(), notification, type)
+        } else if (Build.VERSION.SDK_INT >= 29) {
+            val type = if (callActive) ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL else 0
+            startForeground(activeNotificationId(), notification, type)
+        } else {
+            startForeground(activeNotificationId(), notification)
         }
-        val target = (msg.header("x-sms-to")
-            ?: msg.requestUri?.let { msg.extractUser(it) }
-            ?: msg.to?.let { msg.extractUser(it) })
-            ?.trim().orEmpty()
-        // Reduce to ASCII before anything measures or stores the text, so the
-        // part count, the encoding and the log all describe what actually
-        // goes out rather than what the server sent.
-        //
-        // Only where that is possible, though: text in a script the 7-bit
-        // alphabet does not have goes out as UCS-2 whatever we do, and UCS-2
-        // is not what the modem mis-decodes.  Folding it would turn a Russian,
-        // Hebrew or Arabic message that would have arrived intact into a row
-        // of '?', so it is sent through unchanged even with the setting on.
-        val rawText = msg.body
-        val foldToAscii = getSharedPreferences("gateway", MODE_PRIVATE)
-            .getBoolean("translit_ascii", false)
-        val folded =
-            if (foldToAscii) com.callagent.gateway.sms.Transliterate.toAsciiOrNull(rawText) else null
-        val text = folded ?: rawText
-        if (folded != null && folded != rawText) {
-            broadcastLog("SMS send: transliterated to ASCII (${rawText.length} -> ${text.length} chars)")
-        } else if (foldToAscii && folded == null) {
-            broadcastLog("SMS send: no ASCII spelling for this text — sending it unchanged as UCS-2")
+        foregroundStarted = true
+        callMicrophoneForegroundActive = callActive
+    }
+
+    private fun setForegroundCallMode(callActive: Boolean, status: String) {
+        if (!foregroundStarted) return
+        startForegroundMode(callActive, status)
+    }
+
+    private fun syncControlPlaneOnce() {
+        val session = CredentialStore.load(this)
+            ?: throw ControlApiException("PAIRING_REQUIRED", "Pairing required")
+        val client = ControlApiClient(this, session.controlBaseUrl)
+        val database = GatewayDatabase.get(this)
+        flushSmsRedactions(database)
+        if (database.adoptGatewayId(session.gatewayId)) SimRegistry.resetForGatewayChange(this)
+        val snapshot = SimRegistry.snapshot(this)
+        val sims = snapshot.mappings
+            .map { mapping ->
+                HeartbeatSim(mapping.simId, mapping.mappingRevision,
+                    serviceStateFor(mapping.subscriptionId),
+                    identityVerified = mapping.identityState != SimRegistry.IdentityState.UNVERIFIED)
+            }
+        val battery = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val level = battery?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = battery?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+        val batteryPercent = if (level >= 0 && scale > 0) (100 * level / scale).coerceIn(0, 100) else null
+        val status = battery?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val charging = status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
+
+        val heartbeat = database.prepareHeartbeatPayload(session.gatewayId) { sequence ->
+            client.heartbeatBody(sequence, RootShell.rootState() == "ok",
+                sipClient?.registered == true, batteryPercent, charging, sims).toString()
         }
-        if (target.isEmpty() || text.isEmpty()) {
-            broadcastLog("SMS send refused: missing recipient or body")
-            return 400 to emptyList()
+        val heartbeatResult = try {
+            client.heartbeat(org.json.JSONObject(heartbeat.second))
+        } catch (e: ControlApiException) {
+            if (e.code == "SIM_MAPPING_CHANGED") {
+                val remote = client.serverSimSnapshot()
+                SimRegistry.invalidateAllAtServerRevision(this, remote.mappingRevision)
+                database.discardHeartbeat(session.gatewayId, heartbeat.first)
+            }
+            throw e
+        }
+        SimRegistry.applyHeartbeatInvalidation(this, heartbeatResult.mappingRevision,
+            heartbeatResult.invalidatedSimIds)
+        database.completeHeartbeat(session.gatewayId, heartbeat.first)
+
+        val events = database.pendingEvents(session.gatewayId, 50)
+        if (events.isNotEmpty()) {
+            val acked = client.uploadEvents(events)
+            database.acknowledgeEvents(acked)
+            flushSmsRedactions(database)
+            broadcastLog("CONTROL: durably acknowledged ${acked.size} event(s)")
+        }
+        processCommands(client, database)
+    }
+
+    private fun flushSmsRedactions(database: GatewayDatabase) {
+        database.pendingSmsRedactions().forEach { messageId ->
+            CallLogStore.redactSms(this, messageId)
+            database.completeSmsRedaction(messageId)
+        }
+    }
+
+    private fun serviceStateFor(subscriptionId: Int): String {
+        if (checkSelfPermission(android.Manifest.permission.READ_PHONE_STATE) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED) return "unknown"
+        return try {
+            val base = getSystemService(TelephonyManager::class.java)
+            val state = base?.createForSubscriptionId(subscriptionId)?.serviceState?.state
+            when (state) {
+                0 -> "in_service"
+                1 -> "out_of_service"
+                2 -> "emergency_only"
+                3 -> "power_off"
+                else -> "unknown"
+            }
+        } catch (_: SecurityException) {
+            "unknown"
+        } catch (_: RuntimeException) {
+            "unknown"
+        }
+    }
+
+    private fun processCommands(client: ControlApiClient, database: GatewayDatabase) {
+        for (remote in client.listCommands()) {
+            if (!database.isActiveGateway(remote.gatewayId)) {
+                broadcastLog("SMS: command belongs to a previous gateway pairing; dispatch blocked")
+                continue
+            }
+            var local = database.command(remote.commandId, remote.gatewayId)
+                ?: database.commandForMessage(remote.messageId, remote.gatewayId)
+            if (local == null) {
+                if (remote.state == "dispatching") {
+                    broadcastLog("SMS: server reports dispatching but local ledger is missing; refusing resend")
+                    continue
+                }
+                try {
+                    val claimed = client.claimCommand(remote)
+                    if (claimed.state != "accepted_by_gateway") {
+                        broadcastLog("SMS: server already reports dispatching; refusing resend")
+                        continue
+                    }
+                } catch (e: ControlApiException) {
+                    if (e.code !in setOf("COMMAND_EXPIRED", "SIM_MAPPING_CHANGED", "SIM_UNAVAILABLE")) throw e
+                    val insert = database.insertClaimedCommand(remote.toLocalCommand(), remote.gatewayId)
+                    if (insert == GatewayDatabase.InsertCommandResult.CONFLICT) {
+                        broadcastLog("SMS: command identity conflict; dispatch blocked")
+                        continue
+                    }
+                    local = database.command(remote.commandId, remote.gatewayId)
+                    if (local != null) {
+                        val terminal = if (e.code == "COMMAND_EXPIRED") "expired" else "failed"
+                        database.markCommandTerminal(remote.commandId, terminal, e.code)
+                    }
+                    continue
+                }
+                val inserted = database.insertClaimedCommand(remote.toLocalCommand(), remote.gatewayId)
+                if (inserted == GatewayDatabase.InsertCommandResult.CONFLICT) {
+                    broadcastLog("SMS: command identity conflict; dispatch blocked")
+                    continue
+                }
+                local = database.command(remote.commandId)
+            }
+            val pending = local ?: continue
+            if (pending.payloadHash != remote.payloadSha256) {
+                broadcastLog("SMS: persisted command hash conflict; dispatch blocked")
+                continue
+            }
+            if (pending.state != "claimed") continue
+            dispatchCommand(pending, database)
+        }
+    }
+
+    private fun dispatchCommand(command: GatewayDatabase.Command, database: GatewayDatabase) {
+        val owner = command.ownerGatewayId
+        if (owner == null || !database.isActiveGateway(owner)) return
+        if (command.expiresAt <= System.currentTimeMillis()) {
+            database.markCommandTerminal(command.commandId, "expired", "COMMAND_EXPIRED")
+            return
         }
         if (!hasSendSms()) {
-            // 503 rather than 4xx: the server should try this one again once
-            // the permission is in place, not give up on it.
-            broadcastLog("SMS send refused: SEND_SMS not granted")
-            return 503 to emptyList()
+            database.markCommandTerminal(command.commandId, "failed", "SEND_SMS_PERMISSION_DENIED")
+            return
         }
-
-        val id = msg.header("x-sms-id")?.trim().takeUnless { it.isNullOrEmpty() }
-            ?: SmsStore.newId()
-        // What this message will actually cost, answered in the 202 rather
-        // than after the fact: one character outside GSM-7 forces the whole
-        // message to UCS-2, which halves a part from 160 characters to 70 —
-        // an 88-character reply that would have been one part becomes two.
-        // The sender can only act on that if it is told before it commits.
-        val cost = measure(text)
-
-        val existing = SmsOutbox.get(this, id)
-        if (existing != null) {
-            // The server repeated a request whose response it did not see.
-            broadcastLog("SMS send: $id already accepted — not sending twice")
-            return 202 to cost
+        val mapping = try {
+            SimRegistry.resolve(this, command.simId, command.mappingRevision)
+        } catch (e: SimRegistry.SimMappingException) {
+            database.markCommandTerminal(command.commandId, "failed", e.code.name)
+            broadcastLog("SMS: SIM mapping validation failed (${e.code.name})")
+            return
         }
-
-        val subId = resolveSubscription(
-            msg.header("x-sms-sim-sub")?.trim()?.toIntOrNull(),
-            msg.header("x-sms-sim-slot")?.trim()?.toIntOrNull()
-        )
-        val measured = measureSms(text)
-        SmsOutbox.add(
-            this,
-            OutboundSms(
-                id = id, to = target, text = text, subId = subId,
-                parts = measured?.parts ?: 0,
-                encoding = measured?.encoding ?: ""
-            )
-        )
-        CallLogStore.addEntry(
-            this,
-            CallLogEntry(
-                direction = "OUT",
-                number = target,
-                timestamp = System.currentTimeMillis(),
-                durationSec = 0,
-                type = CallLogStore.TYPE_SMS,
-                text = text,
-                smsId = id,
-                encoding = measured?.encoding ?: "",
-                parts = measured?.parts ?: 0,
-                status = "pending"
-            )
-        )
-        broadcastLog("SMS send: $id to $target accepted (${text.length} chars, sub=$subId)")
-
-        val intent = Intent(this, GatewayService::class.java).apply { action = ACTION_SMS_SEND }
-        try {
-            startForegroundService(intent)
+        val prepared = try {
+            SmsSender.prepare(this, command.text, mapping.subscriptionId)
         } catch (e: Exception) {
-            Log.w(TAG, "Could not schedule SMS dispatch: ${e.message}")
+            database.markCommandTerminal(command.commandId, "failed", "SMS_MANAGER_UNAVAILABLE")
+            broadcastLog("SMS: specified subscription could not be prepared")
+            return
         }
-        return 202 to cost
-    }
-
-    /** How the message will go out: parts it splits into, and its encoding. */
-    data class SmsMeasure(val parts: Int, val encoding: String)
-
-    /**
-     * Measure once and use it twice — the 202 headers tell the server, and
-     * the call-log entry keeps it for the detail view.  Recomputing at
-     * display time would be measuring a different thing: what the text would
-     * encode as now, not what was actually sent.
-     */
-    private fun measureSms(text: String): SmsMeasure? = try {
-        // [0] parts, [1] code units used, [2] remaining, [3] encoding
-        val m = android.telephony.SmsMessage.calculateLength(text, false)
-        // SmsMessage.ENCODING_7BIT = 1, ENCODING_8BIT = 2, ENCODING_16BIT = 3
-        SmsMeasure(
-            parts = m[0],
-            encoding = when (m[3]) {
-                1 -> "GSM7"
-                2 -> "8BIT"
-                3 -> "UCS2"
-                else -> "UNKNOWN"
+        val beforeDispatch = try {
+            SimRegistry.resolve(this, command.simId, command.mappingRevision, mapping.localRevisionBarrier)
+        } catch (e: SimRegistry.SimMappingException) {
+            database.markCommandTerminal(command.commandId, "failed", e.code.name)
+            return
+        }
+        if (beforeDispatch.subscriptionId != mapping.subscriptionId || beforeDispatch.slotIndex != mapping.slotIndex) {
+            database.markCommandTerminal(command.commandId, "failed", "SIM_MAPPING_CHANGED")
+            return
+        }
+        if (!database.prepareCommandParts(command.commandId, prepared.parts.size)) {
+            if (command.expiresAt <= System.currentTimeMillis()) {
+                database.markCommandTerminal(command.commandId, "expired", "COMMAND_EXPIRED")
+            } else {
+                database.markCommandTerminal(command.commandId, "failed", "SMS_PART_COUNT_CHANGED")
             }
-        )
-    } catch (e: Exception) {
-        Log.w(TAG, "Could not measure message: ${e.message}")
-        null
-    }
-
-    /** Parts and encoding, as headers for the 202. */
-    private fun measure(text: String): List<String> {
-        val m = measureSms(text) ?: return emptyList()
-        return listOf("X-SMS-Parts: ${m.parts}", "X-SMS-Encoding: ${m.encoding}")
-    }
-
-    /** Which SIM to send from: an explicit subscription wins, then a slot, then
-     *  whatever the platform considers default. */
-    private fun resolveSubscription(subId: Int?, slot: Int?): Int {
-        if (subId != null && subId >= 0) return subId
-        if (slot != null && slot >= 0) {
-            try {
-                val sm = getSystemService(android.telephony.SubscriptionManager::class.java)
-                @Suppress("MissingPermission")
-                val info = sm?.activeSubscriptionInfoList?.firstOrNull { it.simSlotIndex == slot }
-                if (info != null) return info.subscriptionId
-                broadcastLog("SMS send: no active SIM in slot $slot — using default")
-            } catch (e: Exception) {
-                Log.w(TAG, "Slot lookup failed: ${e.message}")
+            return
+        }
+        if (command.expiresAt <= System.currentTimeMillis()) {
+            database.markCommandTerminal(command.commandId, "expired", "COMMAND_EXPIRED")
+            return
+        }
+        when (database.beginDispatch(command.commandId)) {
+            GatewayDatabase.DispatchStartResult.RATE_LIMITED -> {
+                database.markCommandTerminal(command.commandId, "failed", "SMS_RATE_LIMITED")
+                CallLogStore.addEntry(this, CallLogEntry(
+                    direction = "OUT", number = command.to, timestamp = System.currentTimeMillis(),
+                    durationSec = 0, type = CallLogStore.TYPE_SMS, text = command.text,
+                    smsId = command.messageId, parts = prepared.parts.size,
+                    status = "failed", error = "SMS_RATE_LIMITED"
+                ))
+                return
+            }
+            GatewayDatabase.DispatchStartResult.NOT_READY -> {
+                if (command.expiresAt <= System.currentTimeMillis()) {
+                    database.markCommandTerminal(command.commandId, "expired", "COMMAND_EXPIRED")
+                } else {
+                    database.markCommandTerminal(command.commandId, "failed", "DISPATCH_LEDGER_CONFLICT")
+                }
+                return
+            }
+            GatewayDatabase.DispatchStartResult.STARTED -> Unit
+        }
+        CallLogStore.addEntry(this, CallLogEntry(
+            direction = "OUT", number = command.to, timestamp = System.currentTimeMillis(),
+            durationSec = 0, type = CallLogStore.TYPE_SMS, text = command.text,
+            smsId = command.messageId, parts = prepared.parts.size, status = "pending"
+        ))
+        val finalMapping = try {
+            SimRegistry.resolve(this, command.simId, command.mappingRevision, mapping.localRevisionBarrier)
+        } catch (e: SimRegistry.SimMappingException) {
+            for (part in prepared.parts.indices) {
+                database.recordPartState(command.commandId, part, "failed", error = e.code.name)
+            }
+            CallLogStore.updateSms(this, command.messageId) {
+                it.copy(status = "failed", error = e.code.name)
+            }
+            return
+        }
+        if (finalMapping.subscriptionId != mapping.subscriptionId || finalMapping.slotIndex != mapping.slotIndex) {
+            for (part in prepared.parts.indices) {
+                database.recordPartState(command.commandId, part, "failed", error = "SIM_MAPPING_CHANGED")
+            }
+            CallLogStore.updateSms(this, command.messageId) {
+                it.copy(status = "failed", error = "SIM_MAPPING_CHANGED")
+            }
+            return
+        }
+        if (!database.isActiveGateway(owner)) return
+        val invoked = SmsSender.dispatch(this, command.commandId, command.messageId,
+            command.to, prepared)
+        if (!invoked) {
+            for (part in prepared.parts.indices) {
+                database.recordPartState(command.commandId, part, "unknown",
+                    error = "SMS_DISPATCH_RESULT_UNKNOWN")
+            }
+            CallLogStore.updateSms(this, command.messageId) {
+                it.copy(status = "unknown", error = "SMS dispatch result unknown")
             }
         }
-        return android.telephony.SubscriptionManager.INVALID_SUBSCRIPTION_ID
     }
+
+    private fun ServerCommand.toLocalCommand() = GatewayDatabase.Command(
+        commandId = commandId, messageId = messageId, simId = simId,
+        mappingRevision = mappingRevision, to = to, text = text, partCount = 0,
+        expiresAt = expiresAt, state = "claimed", payloadHash = payloadSha256,
+        ownerGatewayId = gatewayId
+    )
 
     private fun hasSendSms(): Boolean =
         checkSelfPermission(android.Manifest.permission.SEND_SMS) ==
             android.content.pm.PackageManager.PERMISSION_GRANTED
-
-    /** One dispatch pass at a time, with a re-run for anything that arrived
-     *  while it was running — a burst of requests otherwise starts a pass per
-     *  request, all walking the same queue. */
-    private val smsDispatching = AtomicBoolean(false)
-    @Volatile private var smsDispatchAgain = false
-
-    /** Hand anything not yet given to the modem to the modem. */
-    private fun dispatchOutbox() {
-        if (!smsDispatching.compareAndSet(false, true)) {
-            smsDispatchAgain = true
-            return
-        }
-        thread(name = "sms-dispatch") {
-            try {
-                do {
-                    smsDispatchAgain = false
-                    for (sms in SmsOutbox.all(this)) {
-                        // The claim is what makes this safe, not the loop:
-                        // whoever wins it is the only one that sends.
-                        if (!SmsOutbox.claimForDispatch(this, sms.id)) continue
-                        if (!SmsSender.dispatch(this, sms)) {
-                            // Nothing will call back; say so now rather than
-                            // leaving the server waiting for a report that
-                            // cannot come.
-                            reportOutbox(sms.id)
-                        }
-                    }
-                } while (smsDispatchAgain)
-            } finally {
-                smsDispatching.set(false)
-            }
-        }
-    }
-
-    /**
-     * Tell the server what has become of a message.
-     *
-     * Two reports at most: one when the network has taken it (or refused it),
-     * and one when the delivery report arrives.  Carriers that do not return
-     * status reports simply never produce the second, which is why the first
-     * is not held back waiting for it.
-     */
-    /** Re-report anything the server has not acknowledged yet.  A report that
-     *  was refused or lost is no less true for it. */
-    private fun sweepOutboxReports() {
-        thread(name = "sms-report-sweep") {
-            for (sms in SmsOutbox.all(this)) {
-                if (sms.finalReported) continue
-                reportOutboxNow(sms.id)
-            }
-            SmsOutbox.prune(this)
-        }
-    }
-
-    private fun reportOutbox(id: String?) {
-        if (id == null) return
-        thread(name = "sms-report") { reportOutboxNow(id) }
-    }
-
-    private fun reportOutboxNow(id: String) {
-        run {
-            val sms = SmsOutbox.get(this, id) ?: return
-            val parts = maxOf(sms.parts, 1)
-            val sentDone = sms.sentOk + sms.sentFailed >= parts
-            val deliveryDone = sms.deliveredOk + sms.deliveredFailed >= parts
-
-            if (sentDone && !sms.submitReported) {
-                val failed = sms.sentFailed > 0
-                if (sendSmsReport(sms, if (failed) "failed" else "submitted")) {
-                    SmsOutbox.update(this, id) {
-                        // A failed send is terminal: no delivery report follows.
-                        it.copy(submitReported = true, finalReported = failed)
-                    }
-                } else {
-                    scheduleSmsRetry()
-                }
-            }
-            val current = SmsOutbox.get(this, id) ?: return
-            if (deliveryDone && current.submitReported && !current.finalReported) {
-                val event = if (current.deliveredFailed > 0) "undelivered" else "delivered"
-                if (sendSmsReport(current, event)) {
-                    SmsOutbox.update(this, id) { it.copy(finalReported = true) }
-                } else {
-                    scheduleSmsRetry()
-                }
-            }
-            SmsOutbox.prune(this)
-        }
-    }
-
-    /**
-     * The gateway's own number for the SIM that carried this message.
-     *
-     * With one SIM this is just own_number.  With more than one it has to be
-     * the number of the SIM the message actually arrived on or left by, or
-     * the server maps it to the wrong assistant -- both SIMs reach the same
-     * gateway, and only the number distinguishes them.  Falls back to the
-     * single legacy value whenever the SIM cannot be resolved.
-     */
-    private fun ownNumberForSub(subId: Int): String {
-        val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-        val fallback = prefs.getString("own_number", "")?.trim().orEmpty()
-        if (subId < 0) return fallback
-        val slot = runCatching {
-            getSystemService(android.telephony.SubscriptionManager::class.java)
-                ?.getActiveSubscriptionInfo(subId)?.simSlotIndex
-        }.getOrNull() ?: return fallback
-        return prefs.getString("own_number_slot_$slot", "")?.trim()
-            ?.ifEmpty { null } ?: fallback
-    }
-
-    /**
-     * Clear the unread state on the default SMS app's copy of inbound
-     * messages.
-     *
-     * The gateway is not the default SMS app -- Google Messages stays that,
-     * because its copy is a useful independent record -- and the SMS provider
-     * only accepts writes from the app that is.  So the ContentResolver
-     * attempt is expected to fail on most devices and root does the work; the
-     * direct attempt is kept first for the case where it does not.
-     */
-    private fun markInboxRead() {
-        val values = android.content.ContentValues().apply {
-            put("read", 1)
-            put("seen", 1)
-        }
-        val direct = runCatching {
-            contentResolver.update(
-                android.provider.Telephony.Sms.Inbox.CONTENT_URI,
-                values,
-                "read = 0 OR seen = 0",
-                null
-            )
-        }.getOrNull() ?: -1
-        if (direct > 0) {
-            Log.i(TAG, "Marked $direct inbox message(s) read")
-            return
-        }
-        // Straight at the database, as root.  Going through the provider does
-        // not work and does not say so: it accepts writes only from the
-        // default SMS app and silently reports success to everyone else, so
-        // `content update` returns rc=0 and changes nothing.  The path moved
-        // to /data/user_de in the device-encrypted split, so try both.
-        val out = RootShell.execForOutput(
-            "for d in /data/user_de/0 /data/data; do " +
-                "db=\$d/com.android.providers.telephony/databases/mmssms.db; " +
-                "if [ -f \"\$db\" ]; then " +
-                "sqlite3 \"\$db\" " +
-                "\"UPDATE sms SET read=1, seen=1 WHERE read=0 OR seen=0;\"; " +
-                "break; fi; done 2>&1",
-            timeoutMs = 8000
-        )
-        if (out.isNotBlank()) Log.w(TAG, "markInboxRead: $out")
-    }
-
-    /** One report, as a SIP MESSAGE with a JSON body. */
-    private fun sendSmsReport(sms: OutboundSms, event: String): Boolean {
-        val sip = sipClient
-        if (sip == null || !sip.registered) {
-            broadcastLog("SMS report $event for ${sms.id} deferred — not registered")
-            return false
-        }
-        val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-        val own = ownNumberForSub(sms.subId).ifEmpty { cfgUser }
-        val body = org.json.JSONObject().apply {
-            put("id", sms.id)
-            put("event", event)
-            put("to", sms.to)
-            put("parts", maxOf(sms.parts, 1))
-            put("sentOk", sms.sentOk)
-            put("sentFailed", sms.sentFailed)
-            put("deliveredOk", sms.deliveredOk)
-            put("deliveredFailed", sms.deliveredFailed)
-            if (sms.status.isNotEmpty()) put("status", sms.status)
-            if (sms.lastError.isNotEmpty()) put("reason", sms.lastError)
-            // The service centre and the on-air encoding are only known once
-            // the message has actually gone out, so the report is the first
-            // chance to tell the server either.
-            if (sms.smsc.isNotEmpty()) put("smsc", sms.smsc)
-            if (sms.encoding.isNotEmpty()) put("encoding", sms.encoding)
-            put("at", smsTimeFormat.format(java.util.Date()))
-        }.toString()
-
-        val headers = mutableListOf(
-            "X-SMS-Id: ${sms.id}",
-            "X-SMS-Event: $event",
-            "X-SMS-To: ${sms.to}",
-            "X-SMS-Parts: ${maxOf(sms.parts, 1)}",
-            "X-SMS-At: ${smsTimeFormat.format(java.util.Date())}"
-        )
-        if (sms.status.isNotEmpty()) headers += "X-SMS-Status: ${sms.status}"
-        if (sms.lastError.isNotEmpty()) headers += "X-SMS-Reason: ${sms.lastError}"
-        if (sms.smsc.isNotEmpty()) headers += "X-SMS-Smsc: ${sms.smsc}"
-        if (sms.encoding.isNotEmpty()) headers += "X-SMS-Encoding: ${sms.encoding}"
-
-        // text/plain, not application/json: chan_sip refuses anything else on
-        // an out-of-call MESSAGE — measured, it answered 415.  The body is
-        // still JSON for anyone who wants to parse it, but every field is in
-        // an X-SMS-* header too, so SIP_HEADER() alone is enough.
-        val code = sip.sendSipMessage(
-            targetUri = "sip:$own@$cfgServer",
-            fromUser = own,
-            body = body,
-            extraHeaders = headers,
-            contentType = "text/plain;charset=UTF-8"
-        )
-        val ok = code == 200 || code == 202
-        broadcastLog(
-            "SMS report $event for ${sms.id}: " +
-                if (ok) "acknowledged" else "not acknowledged (${if (code == 0) "no response" else code})"
-        )
-        return ok
-    }
 
     private fun dialFromDialler(intent: Intent?) {
         val number = intent?.getStringExtra(EXTRA_NUMBER) ?: return
@@ -1041,16 +918,20 @@ class GatewayService : Service() {
         currentAttemptStart = 0L
 
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-        val server = intent?.getStringExtra(EXTRA_SERVER) ?: prefs.getString("server", "callagent.pro") ?: ""
-        val port = intent?.getIntExtra(EXTRA_PORT, 5060) ?: prefs.getInt("port", 5060)
+        val server = intent?.getStringExtra(EXTRA_SERVER) ?: prefs.getString("server", "") ?: ""
+        val port = intent?.getIntExtra(EXTRA_PORT, 5061) ?: prefs.getInt("port", 5061)
         val username = intent?.getStringExtra(EXTRA_USER) ?: prefs.getString("user", "") ?: ""
         val password = intent?.getStringExtra(EXTRA_PASS) ?: prefs.getString("pass", "") ?: ""
 
         if (server.isEmpty() || username.isEmpty()) {
-            Log.e(TAG, "Missing SIP configuration")
-            broadcastLog("ERROR: Missing server or username")
-            broadcastStatus("ERROR", "Missing SIP configuration")
-            stopSelf()
+            cfgServer = ""
+            cfgUser = ""
+            cfgPass = ""
+            if (CredentialStore.load(this) != null) startControlGateway() else {
+                broadcastLog("SIP is unconfigured; pair this phone with the HTTPS control server")
+                broadcastStatus("PAIRING_REQUIRED", "Pair this phone with the control server")
+                stopSelf()
+            }
             return
         }
 
@@ -1077,21 +958,10 @@ class GatewayService : Service() {
         cfgPort = port
         cfgUser = username
         cfgPass = password
+        startControlLoop()
 
         notifStatusText = "Connecting"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                activeNotificationId(),
-                buildNotification(NotifState.WARN, "Connecting"),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            )
-        } else {
-            startForeground(
-                activeNotificationId(),
-                buildNotification(NotifState.WARN, "Connecting")
-            )
-        }
+        startForegroundMode(callActive = false, status = "Connecting")
         acquireLocks()
         initializing.set(true)
         initializingSince = System.currentTimeMillis()
@@ -1100,10 +970,6 @@ class GatewayService : Service() {
         val gen = initGeneration.incrementAndGet()
         thread(name = "gateway-init") {
             try {
-                // Force-allow RECORD_AUDIO BEFORE SIP registration.
-                // Magisk su takes 4+ seconds on first invocation (root server
-                // startup).  Must complete before any calls can arrive.
-                forceAllowRecordAudio()
                 initSipClient(gen)
             } finally {
                 initializing.set(false)
@@ -1145,7 +1011,7 @@ class GatewayService : Service() {
         // advertising one there would point the server at the far side of a
         // NAT it never has to cross.
         val useStun = getSharedPreferences("gateway", MODE_PRIVATE)
-            .getBoolean("use_stun", true)
+            .getBoolean("use_stun", false)
         val stunResult = if (!useStun) null else try {
             StunClient.discover()
         } catch (e: Exception) {
@@ -1172,7 +1038,7 @@ class GatewayService : Service() {
         // in MESSAGE.  RTP is deliberately left alone, so call audio is no
         // more or less private than it was on UDP.
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-        val useTls = prefs.getBoolean("sip_tls", false)
+        val useTls = true
         if (useTls) broadcastLog("SIP transport: TLS to $cfgServer:$cfgPort")
 
         val sip = SipClient(
@@ -1184,7 +1050,7 @@ class GatewayService : Service() {
             localPort = 5060,
             publicIp = publicIp,
             useTls = useTls,
-            srtpRequested = prefs.getBoolean("srtp_enabled", false)
+            srtpRequested = true
         )
         sipClient = sip
 
@@ -1203,8 +1069,7 @@ class GatewayService : Service() {
                     onlineSince = System.currentTimeMillis()
                     // Anything that arrived while SIP was down goes now, and
                     // any report the server never acknowledged goes again.
-                    flushSmsQueue("registered")
-                    sweepOutboxReports()
+                    wakeControlLoop()
                 } else if (!registered && state == CallOrchestrator.BridgeState.IDLE) {
                     onlineSince = 0L
                 }
@@ -1276,6 +1141,11 @@ class GatewayService : Service() {
                         NotifState.OK to "In-Call"
                 }
                 updateNotification(notifState, statusText)
+                try {
+                    setForegroundCallMode(state != CallOrchestrator.BridgeState.IDLE, statusText)
+                } catch (e: Exception) {
+                    broadcastLog("CALL: foreground service mode failed (${e.javaClass.simpleName})")
+                }
                 broadcastStatus(state.name, info)
             }
 
@@ -1293,7 +1163,8 @@ class GatewayService : Service() {
         orch.start()
 
         sip.logListener = { msg -> broadcastLog("SIP: $msg") }
-        sip.onSmsRequest = { m -> onSmsSendRequest(m) }
+        // Production SMS commands are claimed only over HTTPS. SIP MESSAGE is migration-only.
+        sip.onSmsRequest = null
         GsmCallManager.logCallback = { msg -> broadcastLog("AUDIO: $msg") }
         RootShell.statusCallback = { msg -> broadcastLog("ROOT: $msg") }
         sip.onConnectionLost = { reconnect() }
@@ -1320,6 +1191,8 @@ class GatewayService : Service() {
     @Volatile private var stopped = false
 
     private fun stopGateway() {
+        controlStop = true
+        controlWakeSignal.release()
         if (stopped) return
         stopped = true
         onlineSince = 0L
@@ -1330,6 +1203,8 @@ class GatewayService : Service() {
         sipClient = null
         releaseLocks()
         stopForeground(STOP_FOREGROUND_REMOVE)
+        foregroundStarted = false
+        callMicrophoneForegroundActive = false
         stopSelf()
         broadcastStatus("STOPPED", "Gateway stopped")
     }
@@ -1380,30 +1255,6 @@ class GatewayService : Service() {
      */
     private fun applyNotificationVisibility() {
         RootShell.exec("cmd notification unsuspend_package $packageName 2>/dev/null", 5000)
-    }
-
-    /**
-     * Stop the default SMS app announcing messages the gateway has forwarded.
-     *
-     * Done here rather than only in the Magisk module so it holds regardless
-     * of the module's state, and follows the SMS role if it changes.  The
-     * package is asked for, never assumed: hardcoding Google Messages meant
-     * this silently did nothing on a LineageOS build, which ships
-     * com.android.messaging instead.
-     */
-    private fun silenceDefaultSmsApp() {
-        val cmd = buildString {
-            append("d=\$(settings get secure sms_default_application 2>/dev/null | tr -d '\\r'); ")
-            append("case \"\$d\" in null|'') d=\"\";; esac; ")
-            append("for p in \$d com.google.android.apps.messaging com.android.messaging; do ")
-            append("[ -n \"\$p\" ] || continue; ")
-            append("pm path \"\$p\" >/dev/null 2>&1 || continue; ")
-            append("pm revoke \"\$p\" android.permission.POST_NOTIFICATIONS 2>/dev/null; ")
-            append("cmd appops set \"\$p\" POST_NOTIFICATION ignore 2>/dev/null; ")
-            append("cmd notification suspend_package \"\$p\" 2>/dev/null; ")
-            append("done")
-        }
-        RootShell.exec(cmd, 8000)
     }
 
     /** The notification id in use.  See [cancelStaleNotification]. */
@@ -1600,95 +1451,6 @@ class GatewayService : Service() {
         return "0.0.0.0"
     }
 
-    /**
-     * Force-allow RECORD_AUDIO via appops using root (Magisk).
-     *
-     * Android's AppOpsService can revoke RECORD_AUDIO (app op 27) for
-     * background apps even when runtime permission is granted.  On the
-     * second call the screen is off and the system may deny AudioRecord.
-     *
-     * Called SYNCHRONOUSLY on the gateway-init thread BEFORE initSipClient().
-     * This ensures the appops command completes before SIP registration,
-     * so no incoming calls can arrive while it's still pending.
-     *
-     * On cold boot, the appops service is NOT available for ~45-60 seconds
-     * after the kernel starts.  This method BLOCKS until the service appears,
-     * intentionally delaying SIP registration.  No calls can arrive until
-     * both appops is verified AND SIP is registered.
-     *
-     * CRITICAL: Must use --uid flag to set the UID-level mode.
-     * `appops set <pkg>` sets the package mode, but AudioFlinger checks
-     * the UID mode (set by PermissionController).  UID mode overrides
-     * package mode, so without --uid the allow is ineffective on cold boot.
-     */
-    private fun forceAllowRecordAudio() {
-        try {
-            val pkg = packageName
-
-            // Wait for appops service to become available (cold boot).
-            // Blocking here is intentional — initSipClient() must not run
-            // until appops is set, because SIP registration makes us
-            // reachable for incoming calls and AudioRecord will be denied
-            // without the permission.  Polls every 3s for up to 90s.
-            val maxWaitMs = 90_000L
-            val pollMs = 3_000L
-            val waitStart = System.currentTimeMillis()
-            while (System.currentTimeMillis() - waitStart < maxWaitMs) {
-                val uidProbe = if (Build.VERSION.SDK_INT >= 29) "--uid " else ""
-                val probe = RootShell.execForOutput(
-                    "appops get ${uidProbe}$pkg RECORD_AUDIO 2>&1"
-                )
-                if (!probe.contains("Can't find service", ignoreCase = true)) {
-                    val waited = System.currentTimeMillis() - waitStart
-                    if (waited > 100) {
-                        Log.i(TAG, "appops service ready after ${waited}ms")
-                        broadcastLog("System services ready (${waited / 1000}s)")
-                    }
-                    break
-                }
-                val elapsed = (System.currentTimeMillis() - waitStart) / 1000
-                Log.i(TAG, "appops service not ready (${elapsed}s), waiting...")
-                broadcastLog("Waiting for system services... (${elapsed}s)")
-                Thread.sleep(pollMs)
-            }
-
-            val t0 = System.currentTimeMillis()
-            val autoRevoke = if (Build.VERSION.SDK_INT >= 30)
-                "appops set $pkg AUTO_REVOKE_PERMISSIONS_IF_UNUSED ignore 2>&1; " else ""
-            val uidFlag = if (Build.VERSION.SDK_INT >= 29) "--uid " else ""
-            val result = RootShell.execForOutput(
-                "killall com.google.android.permissioncontroller 2>/dev/null; " +
-                "killall com.android.permissioncontroller 2>/dev/null; " +
-                "pm grant $pkg android.permission.RECORD_AUDIO 2>&1; " +
-                autoRevoke +
-                "appops set ${uidFlag}$pkg RECORD_AUDIO allow 2>&1; " +
-                "appops set $pkg RECORD_AUDIO allow 2>&1; " +
-                "killall com.google.android.permissioncontroller 2>/dev/null; " +
-                "killall com.android.permissioncontroller 2>/dev/null; " +
-                "appops get ${uidFlag}$pkg RECORD_AUDIO 2>&1"
-            )
-            val elapsed = System.currentTimeMillis() - t0
-            val allowed = result.contains("allow", ignoreCase = true)
-            Log.i(TAG, "appops RECORD_AUDIO: [$result] ok=$allowed (${elapsed}ms)")
-            broadcastLog("appops RECORD_AUDIO: ok=$allowed (${elapsed}ms)")
-
-            if (!allowed) {
-                val fb = RootShell.execForOutput(
-                    "cmd appops set ${uidFlag}$pkg RECORD_AUDIO allow 2>&1; " +
-                    "cmd appops set $pkg RECORD_AUDIO allow 2>&1; " +
-                    "cmd appops get ${uidFlag}$pkg RECORD_AUDIO 2>&1"
-                )
-                Log.w(TAG, "appops fallback cmd: [$fb]")
-                broadcastLog("appops fallback: [$fb]")
-            } else {
-                Log.d(TAG, "appops RECORD_AUDIO verified: allow")
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "appops force-allow failed (non-root?): ${e.message}")
-            broadcastLog("appops RECORD_AUDIO failed: ${e.message}")
-        }
-    }
-
     companion object {
         private const val TAG = "GatewayService"
         private const val LOG_BUFFER_SIZE = 200
@@ -1743,20 +1505,15 @@ class GatewayService : Service() {
         const val STATUS_ACTION = "com.callagent.gateway.STATUS"
         const val LOG_ACTION = "com.callagent.gateway.LOG"
         const val ACTION_APPLY_CONFIG = "com.callagent.gateway.APPLY_CONFIG"
+        const val ACTION_CONTROL_START = "com.callagent.gateway.CONTROL_START"
         const val ACTION_SMS_FLUSH = "com.callagent.gateway.SMS_FLUSH"
         const val ACTION_SMS_SEND = "com.callagent.gateway.SMS_SEND"
         const val ACTION_SMS_REPORT = "com.callagent.gateway.SMS_REPORT"
         const val EXTRA_SMS_ID = "sms_id"
 
-        /** How long to wait before retrying a message the server did not take. */
-        private const val SMS_RETRY_MS = 30_000L
-
-        /** X-SMS-Received: ISO 8601 UTC, so the server does not have to guess
-         *  at the gateway's local time zone. */
-        private val smsTimeFormat =
-            java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US).apply {
-                timeZone = java.util.TimeZone.getTimeZone("UTC")
-            }
+        private const val CONTROL_INTERVAL_MS = 30_000L
+        private const val CONTROL_MAX_RETRY_MS = 5 * 60_000L
+        private val callRecoveryDone = AtomicBoolean(false)
 
         /**
          * Ask the running gateway to forward whatever SMS are queued.
@@ -1775,7 +1532,7 @@ class GatewayService : Service() {
             try {
                 context.startForegroundService(intent)
             } catch (e: Exception) {
-                Log.w(TAG, "Could not wake gateway for SMS report: ${e.message}")
+                Log.w(TAG, "Could not wake control service for SMS callback")
             }
         }
 
@@ -1786,7 +1543,16 @@ class GatewayService : Service() {
             try {
                 context.startForegroundService(intent)
             } catch (e: Exception) {
-                Log.w(TAG, "Could not wake gateway for SMS: ${e.message}")
+                Log.w(TAG, "Could not wake control service for SMS event")
+            }
+        }
+
+        fun startControl(context: Context) {
+            val intent = Intent(context, GatewayService::class.java).apply { action = ACTION_CONTROL_START }
+            try {
+                context.startForegroundService(intent)
+            } catch (_: Exception) {
+                Log.w(TAG, "Could not start control service")
             }
         }
 

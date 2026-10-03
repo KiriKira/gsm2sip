@@ -38,7 +38,7 @@ class RtpPacket(
     companion object {
         /** Parse raw UDP packet into RtpPacket */
         fun decode(data: ByteArray, length: Int = data.size): RtpPacket? {
-            if (length < 12) return null
+            if (length < RTP_HEADER_LEN || length > data.size) return null
 
             val buf = ByteBuffer.wrap(data, 0, length)
             buf.order(ByteOrder.BIG_ENDIAN)
@@ -56,18 +56,45 @@ class RtpPacket(
             val ts = buf.int.toLong() and 0xFFFFFFFFL
             val ssrc = buf.int.toLong() and 0xFFFFFFFFL
 
-            val headerSize = 12 + csrcCount * 4
-            if (length < headerSize) return null
+            val headerSize = headerLength(data, length) ?: return null
+            val padding = (b0 and 0x20) != 0
+            var payloadEnd = length
+            if (padding) {
+                val paddingBytes = data[length - 1].toInt() and 0xFF
+                if (paddingBytes == 0 || paddingBytes > length - headerSize) return null
+                payloadEnd -= paddingBytes
+            }
+            if (payloadEnd < headerSize) return null
 
-            val payload = ByteArray(length - headerSize)
+            val payload = ByteArray(payloadEnd - headerSize)
             System.arraycopy(data, headerSize, payload, 0, payload.size)
 
             return RtpPacket(pt, seq, ts, ssrc, payload, marker)
+        }
+
+        /** Return the full fixed/CSRC/extension header length, or null if malformed. */
+        fun headerLength(data: ByteArray, length: Int = data.size): Int? {
+            if (length < RTP_HEADER_LEN || length > data.size) return null
+            val first = data[0].toInt() and 0xFF
+            if ((first ushr 6) != 2) return null
+            val csrcCount = first and 0x0F
+            var headerSize = RTP_HEADER_LEN + csrcCount * 4
+            if (length < headerSize) return null
+            if ((first and 0x10) != 0) {
+                if (length < headerSize + 4) return null
+                val extensionWords = (((data[headerSize + 2].toInt() and 0xFF) shl 8) or
+                    (data[headerSize + 3].toInt() and 0xFF))
+                val extensionBytes = extensionWords.toLong() * 4L
+                if (extensionBytes > length - headerSize - 4L) return null
+                headerSize += 4 + extensionBytes.toInt()
+            }
+            return headerSize
         }
 
         // Payload types
         const val PT_PCMU = 0
         const val PT_G722 = 9
         const val PT_PCMA = 8
+        const val RTP_HEADER_LEN = 12
     }
 }

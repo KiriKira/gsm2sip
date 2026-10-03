@@ -1,8 +1,9 @@
 # Build outputs
 *.apk
 gateway-magisk.zip
+magisk/tinymix-x86
+magisk/tinymix-x86_64
 magisk/system/priv-app/Gateway/
-!magisk/system/priv-app/PermissionController/
 local.properties
 .env.build
 
@@ -16,3 +17,7 @@ app/build/
 .idea/
 *.iml
 .vscode/
+
+# Local signing material
+*.keystore
+*.jks

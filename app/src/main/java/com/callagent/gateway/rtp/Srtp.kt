@@ -1,7 +1,7 @@
 package com.callagent.gateway.rtp
 
-import android.util.Base64
 import java.security.SecureRandom
+import java.util.Base64
 import javax.crypto.Cipher
 import javax.crypto.Mac
 import javax.crypto.spec.IvParameterSpec
@@ -48,6 +48,27 @@ enum class SrtpCryptoSuite(
     }
 }
 
+/** RFC 3711 §4.3.1 KDF, internal so the published key derivation vectors can be tested. */
+internal object SrtpKdf {
+    fun derive(masterKey: ByteArray, masterSalt: ByteArray, label: Byte, length: Int): ByteArray {
+        require(masterKey.size == 16) { "AES_CM_128 master key must be 16 bytes" }
+        require(masterSalt.size == 14) { "AES_CM_128 master salt must be 14 bytes" }
+        require(length >= 0)
+        val iv = ByteArray(16)
+        System.arraycopy(masterSalt, 0, iv, 0, masterSalt.size)
+        // key_id = label || (index DIV kdr), right-aligned in the 112-bit salt.
+        // With the 14-byte profile, the label is XORed into byte 7.
+        iv[7] = (iv[7].toInt() xor label.toInt()).toByte()
+        val cipher = Cipher.getInstance("AES/CTR/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(masterKey, "AES"), IvParameterSpec(iv))
+        return cipher.doFinal(ByteArray(length))
+    }
+
+    const val LABEL_RTP_ENCR: Byte = 0x00
+    const val LABEL_RTP_AUTH: Byte = 0x01
+    const val LABEL_RTP_SALT: Byte = 0x02
+}
+
 /**
  * One master key and salt for one direction, plus the suite they belong to.
  *
@@ -66,7 +87,7 @@ class SrtpKeys(
 
     /** The `inline:` value: base64 of key||salt, no line wrapping. */
     fun toInline(): String =
-        Base64.encodeToString(masterKey + masterSalt, Base64.NO_WRAP)
+        Base64.getEncoder().encodeToString(masterKey + masterSalt)
 
     companion object {
         private val random = SecureRandom()
@@ -90,13 +111,14 @@ class SrtpKeys(
          * back or fail, not a crash in the SIP receive thread.
          */
         fun fromInline(suite: SrtpCryptoSuite, inlineValue: String): SrtpKeys? {
-            val b64 = inlineValue.substringBefore('|').trim()
+            val b64 = inlineValue.trim()
+            if (b64.isEmpty() || '|' in b64) return null
             val raw = try {
-                Base64.decode(b64, Base64.DEFAULT)
+                Base64.getDecoder().decode(b64)
             } catch (_: IllegalArgumentException) {
                 return null
             }
-            if (raw.size < suite.inlineLen) return null
+            if (raw.size != suite.inlineLen) return null
             return SrtpKeys(
                 suite,
                 raw.copyOfRange(0, suite.keyLen),
@@ -121,9 +143,15 @@ class SrtpContext(private val keys: SrtpKeys) {
     // itself -- RFC 3711 §4.3 puts a KDF in between so that the key actually
     // used can be changed without renegotiating, and so the encryption and
     // authentication keys are independent of each other.
-    private val sessionKey = derive(LABEL_RTP_ENCR, suite.keyLen)
-    private val sessionSalt = derive(LABEL_RTP_SALT, suite.saltLen)
-    private val sessionAuth = derive(LABEL_RTP_AUTH, AUTH_KEY_LEN)
+    private val sessionKey = SrtpKdf.derive(
+        keys.masterKey, keys.masterSalt, SrtpKdf.LABEL_RTP_ENCR, suite.keyLen
+    )
+    private val sessionSalt = SrtpKdf.derive(
+        keys.masterKey, keys.masterSalt, SrtpKdf.LABEL_RTP_SALT, suite.saltLen
+    )
+    private val sessionAuth = SrtpKdf.derive(
+        keys.masterKey, keys.masterSalt, SrtpKdf.LABEL_RTP_AUTH, AUTH_KEY_LEN
+    )
 
     private val cipher = Cipher.getInstance("AES/CTR/NoPadding")
     private val mac = Mac.getInstance("HmacSHA1").apply {
@@ -139,29 +167,6 @@ class SrtpContext(private val keys: SrtpKeys) {
 
     /** Sliding replay window, one bit per packet, ending at [highestSeq]. */
     private var replayWindow = 0L
-
-    // ── Key derivation (RFC 3711 §4.3.1) ────────────────
-
-    /**
-     * PRF_n(master_key, x) where x is derived from the label and master salt.
-     *
-     * The counter block is `x || 0x0000`, and the keystream is AES-CTR over
-     * zeros -- which is what "encrypt the all-zero block sequence" means in the
-     * spec.  key_derivation_rate is 0 throughout, so the index term is zero and
-     * only the label distinguishes the three keys.
-     */
-    private fun derive(label: Byte, length: Int): ByteArray {
-        val iv = ByteArray(16)
-        System.arraycopy(keys.masterSalt, 0, iv, 0, keys.masterSalt.size)
-        // key_id = label || (index DIV kdr), right-aligned in the 112-bit salt.
-        // With a 14-byte salt the label lands on byte 7 and the 48-bit index
-        // on bytes 8..13, where it is zero and changes nothing.
-        iv[7] = (iv[7].toInt() xor label.toInt()).toByte()
-
-        val c = Cipher.getInstance("AES/CTR/NoPadding")
-        c.init(Cipher.ENCRYPT_MODE, SecretKeySpec(keys.masterKey, "AES"), IvParameterSpec(iv))
-        return c.doFinal(ByteArray(length))
-    }
 
     // ── Per-packet IV (RFC 3711 §4.1.1) ─────────────────
 
@@ -221,7 +226,7 @@ class SrtpContext(private val keys: SrtpKeys) {
      * altered undetected.
      */
     fun protect(rtp: ByteArray): ByteArray? {
-        if (rtp.size < RTP_HEADER_LEN) return null
+        val headerLength = RtpPacket.headerLength(rtp) ?: return null
         val ssrc = readSsrc(rtp)
         val seq = readSeq(rtp)
 
@@ -232,7 +237,7 @@ class SrtpContext(private val keys: SrtpKeys) {
         val index = (roc shl 16) or seq.toLong()
 
         val out = rtp.copyOf(rtp.size + suite.authTagLen)
-        keystreamXor(ssrc, index, out, RTP_HEADER_LEN, rtp.size - RTP_HEADER_LEN)
+        keystreamXor(ssrc, index, out, headerLength, rtp.size - headerLength)
         val tag = authTag(out, rtp.size, roc)
         System.arraycopy(tag, 0, out, rtp.size, tag.size)
         return out
@@ -250,11 +255,12 @@ class SrtpContext(private val keys: SrtpKeys) {
      */
     fun unprotect(srtp: ByteArray, length: Int = srtp.size): ByteArray? {
         val tagLen = suite.authTagLen
-        if (length < RTP_HEADER_LEN + tagLen) return null
+        if (length < RTP_HEADER_LEN + tagLen || length > srtp.size) return null
 
         val ssrc = readSsrc(srtp)
         val seq = readSeq(srtp)
         val payloadEnd = length - tagLen
+        val headerLength = RtpPacket.headerLength(srtp, payloadEnd) ?: return null
 
         // Guess which rollover this packet belongs to before authenticating,
         // because the ROC is an input to the tag.  A wrong guess fails the
@@ -274,7 +280,7 @@ class SrtpContext(private val keys: SrtpKeys) {
 
         val index = (guessedRoc shl 16) or seq.toLong()
         val out = srtp.copyOfRange(0, payloadEnd)
-        keystreamXor(ssrc, index, out, RTP_HEADER_LEN, out.size - RTP_HEADER_LEN)
+        keystreamXor(ssrc, index, out, headerLength, out.size - headerLength)
 
         replayUpdate(seq, guessedRoc)
         return out
@@ -329,9 +335,5 @@ class SrtpContext(private val keys: SrtpKeys) {
         const val RTP_HEADER_LEN = 12
         private const val AUTH_KEY_LEN = 20
         private const val REPLAY_WINDOW = 64
-
-        private const val LABEL_RTP_ENCR: Byte = 0x00
-        private const val LABEL_RTP_AUTH: Byte = 0x01
-        private const val LABEL_RTP_SALT: Byte = 0x02
     }
 }

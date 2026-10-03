@@ -28,10 +28,12 @@ class SipClient(
     val localPort: Int = 5060,
     /** Public IP discovered via STUN — used in Contact headers and SDP for NAT traversal */
     var publicIp: String = localIp,
-    /** SIP over TLS instead of UDP.  Signalling only — RTP is unaffected. */
+    /** SIP signalling over TLS instead of UDP; production media also requires SRTP. */
     val useTls: Boolean = false,
-    /** Offer and accept SDES-keyed SRTP.  Only honoured when [useTls] is on. */
-    private val srtpRequested: Boolean = false
+    /** Legacy preference input. TLS calls always require SRTP in v1. */
+    @Suppress("unused") private val srtpRequested: Boolean = true,
+    /** Explicit development-only escape hatch. Production callers leave this false. */
+    private val allowInsecureSignalling: Boolean = false
 ) {
     /**
      * Whether this call leg may use SRTP at all.
@@ -42,10 +44,12 @@ class SipClient(
      * worse than being plainly unencrypted -- so the transport decides, not
      * the checkbox alone.
      */
-    val srtpEnabled: Boolean get() = srtpRequested && useTls
+    /** A TLS production call always negotiates SRTP; it cannot be disabled per call. */
+    val srtpEnabled: Boolean get() = useTls
     val serverAddress: Pair<String, Int> get() = Pair(serverDomain, serverPort)
 
     private var transport: SipTransport? = null
+    private val digestState = SipAuth.DigestState()
 
     /**
      * Port to put in Via and Contact.  UDP binds the configured port; TLS is
@@ -59,6 +63,8 @@ class SipClient(
     private val running = AtomicBoolean(false)
     @Volatile var registered = false; private set
     @Volatile private var lastRegisterTime = 0L
+    @Volatile private var grantedRegistrationExpiresSeconds = DEFAULT_REGISTER_EXPIRES_SECONDS
+    @Volatile private var registrationRefreshAfterMs = DEFAULT_REGISTER_REFRESH_MS
     /** Tracks last time we got ANY response from server (REGISTER, OPTIONS, etc.) */
     @Volatile private var lastServerResponseTime = 0L
     @Volatile private var registrationLatch: CountDownLatch? = null
@@ -106,6 +112,12 @@ class SipClient(
     @Synchronized
     fun start() {
         if (running.get()) return
+        check(useTls || allowInsecureSignalling) {
+            "SIP/TLS is required; insecure UDP is available only with explicit development opt-in"
+        }
+        if (useTls && !srtpRequested) {
+            uiLog("SRTP preference is disabled; enforcing mandatory SDES for TLS calls")
+        }
         running.set(true)
         // Identify the handset, not the server: with several gateways
         // registered to the same PBX the server domain is the one thing every
@@ -249,6 +261,10 @@ class SipClient(
     }
 
     private fun handlePacket(data: String, address: Pair<String, Int>) {
+        if (useTls && !isTrustedTlsServerPeer(address)) {
+            Log.w(TAG, "Dropping SIP packet outside verified TLS server session")
+            return
+        }
         val msg = SipMessage.parse(data) ?: return
 
         // OPTIONS keepalive from server
@@ -288,7 +304,9 @@ class SipClient(
                 }
                 val handled = call.handleMessage(msg)
                 if (!handled) {
-                    Log.w(TAG, "Unhandled SIP message for call $callId: ${msg.startLine}")
+                    // A request line contains the dialed SIP URI, so do not
+                    // include it in logs where it can expose phone numbers.
+                    Log.w(TAG, "Unhandled SIP ${msg.method ?: "response"} for call $callId")
                 }
                 if (call.state == SipCall.State.TERMINATED) {
                     activeCalls.remove(callId)
@@ -296,6 +314,13 @@ class SipClient(
                 }
                 return
             }
+        }
+
+        // CANCEL has a separate transaction response even when its INVITE
+        // has already been removed or its Call-ID was never known here.
+        if (msg.isRequest && msg.method == "CANCEL") {
+            sendTo(SipBuilder.statusResponse(msg, 481, "Call/Transaction Does Not Exist"), address)
+            return
         }
 
         // Page-mode MESSAGE from the server — an SMS to send.
@@ -351,6 +376,10 @@ class SipClient(
             return
         }
     }
+
+    /** True only for bytes read from the TLS socket that completed CA and hostname validation. */
+    private fun isTrustedTlsServerPeer(address: Pair<String, Int>): Boolean =
+        useTls && transport is TlsSipTransport && transport?.isOpen == true && address == serverAddress
 
     // ── Registration ────────────────────────────────────
 
@@ -421,7 +450,8 @@ class SipClient(
             username, serverDomain, serverPort,
             publicIp, advertisedPort,
             callIdBase, cseq.getAndIncrement(),
-            auth
+            auth,
+            grantedRegistrationExpiresSeconds
         )
         sendTo(msg, serverAddress)
     }
@@ -430,10 +460,21 @@ class SipClient(
     private fun handleRegisterResponse(msg: SipMessage): Boolean {
         return when (msg.statusCode) {
             200 -> {
+                val granted = SipRegistrationExpiry.grantedSeconds(msg, grantedRegistrationExpiresSeconds)
+                val refreshAfter = granted?.let(SipRegistrationExpiry::refreshAfterMillis)
+                if (granted == null || granted <= 0 || refreshAfter == null) {
+                    registered = false
+                    uiLog("REGISTER 200 had invalid or zero granted expiry; refusing registration")
+                    registrationLatch?.countDown()
+                    listener?.onRegistrationFailed()
+                    return true
+                }
+                grantedRegistrationExpiresSeconds = granted
+                registrationRefreshAfterMs = refreshAfter
                 registered = true
                 lastRegisterTime = System.currentTimeMillis()
                 lastServerResponseTime = lastRegisterTime
-                uiLog("Registered with $serverDomain")
+                uiLog("Registered with $serverDomain (granted ${granted}s; refresh in ${refreshAfter / 1000}s)")
                 registrationLatch?.countDown()
                 listener?.onRegistered()
                 true
@@ -443,7 +484,7 @@ class SipClient(
                 val authParams = SipAuth.parseChallenge(msg)
                 if (authParams != null) {
                     val uri = "sip:$serverDomain:$serverPort"
-                    val auth = SipAuth.buildAuthHeader("REGISTER", uri, username, password, authParams)
+                    val auth = digestState.authorization("REGISTER", uri, username, password, authParams)
                     sendRegister(auth)
                 } else {
                     uiLog("Failed to parse auth challenge")
@@ -463,7 +504,7 @@ class SipClient(
 
     private fun handleIncomingInvite(msg: SipMessage, address: Pair<String, Int>) {
         val callId = msg.callId ?: return
-        Log.i(TAG, "Incoming INVITE call-id=$callId from=${msg.callerNumber}")
+        Log.i(TAG, "Incoming INVITE call-id=$callId")
 
         // Send 100 Trying
         sendTo(SipBuilder.trying100(msg), address)
@@ -478,6 +519,9 @@ class SipClient(
         call.fromHeader = msg.from
         call.toHeader = msg.to
         call.remoteTag = msg.fromTag
+        if (isTrustedTlsServerPeer(address)) {
+            call.trustedGsmMetadata = msg.gsmCallMetadata()
+        }
 
         // Parse SDP
         msg.sdpRtpPort?.let { call.remoteRtpPort = it }
@@ -491,19 +535,18 @@ class SipClient(
             val suite = call.remoteSrtpKeys?.suite ?: SrtpCryptoSuite.offered
             call.localSrtpKeys = SrtpKeys.generate(suite)
             uiLog("SRTP offered by server (${suite.sdpName}) — answering SAVP")
-        } else if (msg.sdpIsSavp) {
-            // They require encryption and we cannot give it.  Better to say so
-            // than to answer AVP and have the call rejected for a reason that
-            // never reaches this log.
-            uiLog(
-                if (!useTls) "Server offered SRTP but signalling is UDP — not accepting keys over cleartext"
-                else "Server offered SRTP but it is switched off here"
-            )
+        } else if (srtpEnabled || msg.sdpIsSavp) {
+            // Do not answer a secure call with AVP or silently decline a bad
+            // suite/key. SDES keys are accepted only over verified TLS.
+            uiLog("Rejecting INVITE: mandatory AES_CM_128_HMAC_SHA1_80 SRTP offer missing or invalid")
+            call.reject(488, "SRTP Required")
+            return
         }
+        call.negotiatedTelephoneEventPayloadType = msg.sdpTelephoneEventPayloadType
         call.negotiatedPayloadType = msg.sdpPreferredPayloadType
         Log.i(TAG, "Incoming INVITE codec: pt=${call.negotiatedPayloadType} codecs=${msg.sdpCodecs}")
 
-        // Check for GSM-forward header
+        // Legacy migration header remains readable but is not marked trusted.
         call.gsmForwardNumber = msg.gsmForwardNumber
 
         activeCalls[callId] = call
@@ -517,10 +560,13 @@ class SipClient(
         targetExtension: String,
         localRtpPort: Int,
         callerIdNumber: String? = null,
-        callerIdName: String? = null
+        callerIdName: String? = null,
+        gsmMetadata: GsmCallMetadata? = null
     ): SipCall {
+        check(useTls || allowInsecureSignalling) { "SIP/TLS is required for production calls" }
         val callId = "${System.currentTimeMillis()}call@$publicIp"
         val call = SipCall(callId, SipCall.Direction.OUTBOUND, this)
+        call.trustedGsmMetadata = gsmMetadata
         call.localRtpPort = localRtpPort
         call.outboundCallerIdNumber = callerIdNumber
         call.outboundCallerIdName = callerIdName
@@ -533,6 +579,7 @@ class SipClient(
         // this call: rekeying mid-dialog is not something chan_sip handles
         // predictably, and there is no reason to.
         if (srtpEnabled) call.localSrtpKeys = SrtpKeys.generate(SrtpCryptoSuite.offered)
+        call.negotiatedTelephoneEventPayloadType = null
 
         val targetUri = "sip:$targetExtension@$serverDomain"
         val invite = SipBuilder.invite(
@@ -543,6 +590,7 @@ class SipClient(
             fromTag = call.localTag,
             callerIdNumber = callerIdNumber,
             callerIdName = callerIdName,
+            extraHeaders = gsmMetadata?.sipHeaders() ?: emptyList(),
             srtp = call.localSrtpKeys
         )
 
@@ -550,7 +598,7 @@ class SipClient(
         sendTo(invite, serverAddress)
         // Log both halves the server routes on: the Request-URI it turns into
         // EXTEN, and the From user it turns into caller ID.
-        Log.i(TAG, "Sent INVITE RURI=$targetUri From=<sip:$fromUser@$serverDomain> (call-id=$callId)")
+        Log.i(TAG, "Sent INVITE to server (call-id=$callId)")
 
         // RFC 3261 Timer A: retransmit INVITE over UDP until any response is received.
         // Intervals: 500ms, 1s, 2s, 4s (capped at T2=4s). Stops immediately when
@@ -614,6 +662,10 @@ class SipClient(
         extraHeaders: List<String> = emptyList(),
         contentType: String = "text/plain;charset=UTF-8"
     ): Int {
+        if (!useTls && !allowInsecureSignalling) {
+            uiLog("SIP MESSAGE refused: SIP/TLS is required")
+            return 0
+        }
         if (!running.get()) return 0
         val callId = "${System.currentTimeMillis()}msg@$publicIp"
         val fromTag = "gw${(100000000..999999999).random()}"
@@ -637,9 +689,7 @@ class SipClient(
                 val retry = MessageTxn()
                 pendingMessages[callId] = retry
                 cseq++
-                val auth = SipAuth.buildAuthHeader(
-                    "MESSAGE", targetUri, username, password, challenge
-                )
+                val auth = digestState.authorization("MESSAGE", targetUri, username, password, challenge)
                 sendTo(
                     SipBuilder.message(
                         targetUri, fromUser, serverDomain, publicIp, advertisedPort,
@@ -680,7 +730,7 @@ class SipClient(
         val uriEnd = toHeader.indexOf('>', uriStart).let { if (it < 0) toHeader.length else it }
         val targetUri = if (uriStart >= 0) toHeader.substring(uriStart, uriEnd) else return
 
-        val auth = SipAuth.buildInviteAuthHeader(targetUri, username, password, authParams)
+        val auth = digestState.authorization("INVITE", targetUri, username, password, authParams)
         val invite = SipBuilder.invite(
             targetUri, username, serverDomain,
             publicIp, advertisedPort,
@@ -690,6 +740,7 @@ class SipClient(
             callerIdNumber = call.outboundCallerIdNumber,
             callerIdName = call.outboundCallerIdName,
             auth = auth,
+            extraHeaders = call.trustedGsmMetadata?.sipHeaders() ?: emptyList(),
             srtp = call.localSrtpKeys
         )
         sendTo(invite, serverAddress)
@@ -786,7 +837,7 @@ class SipClient(
                     // unauthenticated requests an hour, each answered 401 and
                     // recorded as an auth failure, which is the pattern
                     // fail2ban counts; it banned this gateway's IP repeatedly.
-                    if (System.currentTimeMillis() - lastRegisterTime > REREGISTER_INTERVAL_MS) {
+                    if (System.currentTimeMillis() - lastRegisterTime >= registrationRefreshAfterMs) {
                         uiLog("Refreshing registration")
                         registered = false
                         if (!register()) {
@@ -844,21 +895,8 @@ class SipClient(
         /** Consecutive failures before asking GatewayService for a new socket. */
         private const val MAX_REGISTER_FAILURES = 3
 
-        /**
-         * How often to refresh the registration.
-         *
-         * The REGISTER advertises `expires=3600` and the server grants it --
-         * verified against callagent.pro, whose 200 OK carries `Expires: 3600`
-         * (chan_sip's default).  Half the granted lifetime is the conventional
-         * refresh point: it leaves a full 30 minutes to notice a failure and
-         * retry before the binding actually lapses.
-         *
-         * The previous ten minutes was not derived from anything the server
-         * said -- nothing here reads the granted expiry -- and refreshed six
-         * times an hour where twice will do.  Each refresh is challenged, so
-         * it also put six 401s an hour in the registrar's auth log per device.
-         */
-        private const val REREGISTER_INTERVAL_MS = 30 * 60 * 1000L
+        private const val DEFAULT_REGISTER_EXPIRES_SECONDS = 3600L
+        private const val DEFAULT_REGISTER_REFRESH_MS = 30 * 60 * 1000L
 
         /**
          * How often to refresh the NAT binding.

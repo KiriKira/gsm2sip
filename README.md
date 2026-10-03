@@ -1,3 +1,5 @@
+> **本 fork 的三端项目计划（2026-10-03）**：请先阅读 [双 SIM 网关实施计划](PLAN-selfhosted-gateway.md)、[代码审查](docs/REVIEW-2026-10-03.md) 和 [server 联合实施顺序](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/roadmap.md)。本页下方保留上游说明，其 Callagent/chan_sip 示例不是本项目推荐部署方案；三端功能尚未按新计划实现。
+
 <p align="center">
   <img src="icon.png" width="128" alt="gsm2sip">
 </p>

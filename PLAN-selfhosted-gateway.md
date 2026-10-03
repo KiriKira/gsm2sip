@@ -1,936 +1,129 @@
-# PLAN — Self-hosted GSM/SIP Gateway
-
-## Goal
-
-Turn this fork into the **gateway component** of a private, self-hosted phone-number relay system:
-
-```text
-China Unicom SIM
-      │
-      │ VoLTE / SMS
-      ▼
-Rooted Android gateway
-(this repository)
-      │
-      │ SIP over TLS + mandatory SRTP
-      ▼
-Dedicated public server
-(Asterisk/PJSIP + control/SMS API)
-      │
-      ├── SIP/TLS + SRTP ──> primary phone call client
-      └── HTTPS/WSS ───────> primary phone companion app
-```
+# PLAN — gsm2sip 双 SIM 网关 v1
 
-Primary use case:
+更新：2026-10-03。基于 [main 提交 477b7e3](https://github.com/KiriKira/gsm2sip/tree/477b7e349891928dda7b87a9b55b72c52e7eab87) 审查；以下功能均为待实现。此计划取代旧版，旧版保留在 Git 历史。\n\n协议以 [三端协议 v1](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/protocol-v1.md) 为唯一权威，联合次序见 [roadmap](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/roadmap.md)，源码差距见 [审查报告](docs/REVIEW-2026-10-03.md)。实现开始时在依赖记录锁定server协议提交；此仓库不复制wire protocol。
 
-- A dedicated rooted Android phone stays powered and connected at a fixed location with the China Unicom SIM inserted.
-- A public server is the stable rendezvous/media relay point.
-- The primary phone (for example a Galaxy Z Fold) does **not** need root.
-- Incoming and outgoing calls use the original cellular number.
-- SMS is received and sent remotely, including Chinese text and OTP messages.
-- The system must be suitable for unattended 24/7 operation.
+## 目标边界
 
-This repository should remain focused on the **rooted Android gateway**. Server and primary-phone client are separate projects; see [Repository split](#repository-split).
+把本仓库保留为旧手机端 rooted Android gateway：两张实体 SIM 留在该机，完成蜂窝短信收发、呼入/呼出与 RTP 媒体桥接。server 与未 root 主机 app 各有独立仓库。旧手机不提供任何公网 root/ADB/HTTP 控制入口。
 
----
+| 功能 | v1 通道 |
+|---|---|
+| 旧手机 ↔ VPS 通话信令 | SIP/TLS，验证证书链与主机名 |
+| 旧手机 ↔ VPS 通话媒体 | 仅 SDES-SRTP AES_CM_128_HMAC_SHA1_80，VPS 锚定 RTP |
+| 网关短信、SIM 绑定、状态、事件和命令 | HTTPS JSON；WSS 仅作通知，断线后从 HTTPS 补齐 |
+| 旧 SIP MESSAGE 代码 | 保留为迁移/基线测试；v1 生产命令处理器禁用，不得与 HTTPS 同时执行 |
 
-## Non-goals
-
-- Reimplement carrier IMS/VoWiFi authentication.
-- Move the physical SIM away from the gateway.
-- Expose Android root or ADB directly to the public Internet.
-- Depend on callagent.pro or any third-party relay service.
-- Make the primary phone rooted.
-- Support multiple simultaneous cellular calls in the first release.
-- Preserve upstream behavior that weakens the whole Android permission/security model unless strictly required.
-
----
-
-## Current upstream capabilities to preserve
-
-The current code already implements substantial functionality that should be kept rather than rewritten:
-
-### Calls
-
-- GSM/VoLTE incoming call -> outbound SIP INVITE.
-- SIP answer -> answer the GSM leg.
-- SIP -> GSM outgoing calls.
-- Bidirectional RTP audio bridge.
-- Call-state mapping and SIP failure responses.
-- RTP jitter buffer and media timeout.
-- Device-specific Android Audio HAL / mixer routing.
-- Root shell lifecycle and mixer control.
-- G.722 / PCMA support.
-- Optional SDES-SRTP.
+明确限制：每个 gateway 最多一条桥接通话；两张 SIM 都可收短信；DSDS 第二卡在另一张卡通话期间是否可接电话由基带、ROM、运营商决定，先实测后描述。
 
-### SMS
+## SIM 绑定与 fail-closed 规则
 
-- Incoming SMS -> RFC 3428 SIP MESSAGE.
-- SIP MESSAGE -> outgoing cellular SMS.
-- Multipart SMS handling.
-- Dual-SIM metadata for SMS.
-- Durable incoming queue.
-- Durable outgoing queue.
-- Idempotency via `X-SMS-Id`.
-- Submit and delivery reports.
+服务端分配稳定 UUID sim_id；gateway 保存本地映射：
 
-### Runtime resilience
+sim_id -> 当前 subscriptionId、slotIndex、PhoneAccountHandle、身份核验状态
 
-- Foreground service.
-- Boot receiver.
-- Wake lock / Wi-Fi lock.
-- SIP re-registration.
-- UDP NAT keepalive.
-- TLS reconnect with backoff.
-- Network-change reconnect.
-- Root-shell recovery.
-- Stale call-state recovery.
+mapping_revision 是 gateway 级递增配置版本。subscriptionId 在同一设备、同一张卡通常可跨重启稳定，但不能作为跨设备或永远有效的 SIM 身份；slot 也不能作为身份。重启时重新读取并校验当前映射，校验有效则保留；换卡、移槽更新或恢复出厂后按规则增加 revision/重新确认。特权 ICCID 如可用只在本机保存加盐指纹，绝不上传明文 ICCID/IMSI；无法可靠核验时提示旧机本地确认。
 
-These are the high-value parts of upstream and should remain the foundation of the gateway.
+执行任何 SIM 定向任务前，校验 sim_id、mapping_revision、当前 active subscription 和身份核验状态。未知卡、SIM 缺失、旧 revision、PhoneAccountHandle 不匹配、SMS Manager 创建失败均返回 SIM_MAPPING_CHANGED 或 SIM_UNAVAILABLE，并生成状态事件；绝不能使用系统默认 SIM。
 
----
+入站电话用 Telecom Call.Details.accountHandle 反查 sim_id；出站电话把映射到的 PhoneAccountHandle 显式传入 TelecomManager.placeCall。不得依赖默认语音线路，也不得在线路解析失败后走不带 account 的 ACTION_CALL。
 
-# Repository split
+入站 SMS 使用 SMS_RECEIVED 提供的当前 subscription 元数据映射到 sim_id。若 Android/OEM 广播无法核验线路，仍保存原文和事件，但记录 sim_id=null、sim_resolution=unknown；主机不提供原卡回复/回拨快捷操作。
 
-## 1. This repository: `gsm2sip`
+## 呼叫通路任务
 
-**Purpose:** rooted Android cellular gateway only.
+呼出：主机先向服务端创建短时 call-intent；主机 SIP SDK 发起消费该 intent 的 SIP INVITE；服务端验证 client 身份与 intent 后，剥除客户端自带的 X-* 路由字段，由服务端生成可信 X-GSM-Protocol-Version、X-GSM-Call-Id、X-GSM-Sim-Id、X-GSM-Mapping-Revision。gateway 只接受已认证 VPS SIP endpoint 上的可信字段，校验号码、SIM 映射、并发与业务 call_id 幂等账本后（intent/TTL由server消费验证，不要求gateway读取server私有token）用指定 PhoneAccountHandle 拨号。
 
-Contains:
+呼入：gateway 按 PhoneAccountHandle 判定 sim_id，在本地持久化业务 call_id 后发送 SIP INVITE，附带 sim_id、mapping_revision 和服务器规定的关联标识。gateway 先让蜂窝侧继续振铃；仅服务端将路由交给在线主机并且 SIP 主机侧真正接听后，才应答蜂窝腿。CANCEL、主叫挂机、过期 push、第二通话忙线与本地拒接要收敛到同一通话状态。
 
-- Android Telephony / InCallService integration.
-- GSM/VoLTE <-> SIP bridge.
-- RTP/SRTP media.
-- SMS <-> gateway protocol.
-- Device/Audio HAL compatibility profiles.
-- Root/Magisk support.
-- Health/status reporting from the gateway.
+DTMF 是 v1 呼叫验收项。当前 SDP 声明 telephone-event/8000，但 RTP 接收与解码路径未处理 payload 101。实现 RFC4733 事件解析/转发，并将远端蜂窝方向的数字通过当前 Call.playDtmfTone()/stopDtmfTone() 发送；同时处理事件结束位、持续时间、重复包、结束后停音。分别使用两张 SIM 实测 IVR/语音信箱；SIP 日志里出现事件不能代替远端电话确实收到按键。
 
-Does **not** contain:
+## 短信、事件与命令实现
 
-- Public server deployment.
-- Asterisk configuration as production source of truth.
-- User-facing remote Android application.
+入站：SMS_RECEIVED -> 事务性持久化 inbox 项和单调 sequence event -> HTTPS 批量上传 -> 等待服务端将 inbox 与 event outbox 同一数据库事务提交 -> 收到逐 event_id durable ACK 后才将 event 标成可清理。WSS 断线、手机重启或 HTTP 超时均复用原 event_id；不按正文/发送者时间窗口猜测重复。容量达上限时停止清理旧事件、告警并保留可恢复数据。
 
-Keeping this repository gateway-only makes upstream synchronization much easier.
+出站：主机创建短信任务；gateway 通过 HTTPS claim 得到 message_id、sim_id、mapping_revision、号码、原文、TTL 和幂等字段；先在 SQLite/Room 持久化 command ledger，再解析并确认指定 SIM，然后持久化 dispatching，最后调用绑定 validatedSubId 的 SmsManager。Android 31+ 使用 createForSubscriptionId；较旧 API 用对应的 subscription-bound 方法；异常不得 catch 后回退默认实例。
 
----
+逐短信分片按 message_id+part_index 幂等 upsert SENT 与 DELIVERED 回执，重复 PendingIntent callback 不累加分片成功数。若 app 在持久化 dispatching 前崩溃，可在核验后再试；若重启时 ledger 已处于 dispatching，则 modem 是否接到 binder 调用未知，标 unknown 并上报，禁止自动重领/重发整条短信。终态与事件由 HTTPS 上报；服务端提交后回 durable ACK。超过 TTL 的未发送命令标 expired。
 
-## 2. New repository: server
+现有 SmsStore / SmsOutbox 是 SharedPreferences JSON 队列，入站队列超 200 会静默删旧消息；SmsOutbox.add() 只留最后 200 条，remove()/prune() 又会删除 message_id。GatewayService.onSmsSendRequest() 仅用当前 outbox 做重复检查，所以行被清理后重放同一个 ID 有再次发出的风险。迁移时把正文/回执清理和幂等 tombstone 分开；未完成项绝不因容量限制淘汰，已接受 ID 至少保留到服务器不再重放。以上旧存储不满足 journal/ledger 语义。避免在进程同时使用旧 SIP MESSAGE 与新 API command 触发双发送。
 
-Recommended name:
-
-```text
-gsm2sip-server
-```
-
-Purpose:
-
-- Dockerized public-server deployment.
-- Asterisk using **PJSIP**, not legacy `chan_sip`.
-- TLS certificates and SIP/TLS configuration.
-- SRTP media anchoring.
-- Call routing.
-- SMS transport/API.
-- Gateway status/heartbeat ingestion.
-- Authentication and authorization.
-- Rate limiting.
-- Monitoring/metrics.
-- Backups and deployment documentation.
-
-Suggested stack:
-
-```text
-Docker Compose
-├── Asterisk (PJSIP)
-├── small control/API service
-├── reverse proxy (Caddy/Nginx/Traefik)
-└── optional Prometheus/Grafana later
-```
-
-The server should have a stable public IP/domain and should be the **only public endpoint** required by gateway and primary phone.
-
----
-
-## 3. New repository: primary-phone app
-
-Recommended name:
-
-```text
-gsm2sip-client-android
-```
+## 音频和 Android 权限
 
-Purpose:
+当前媒体实现依赖硬件 Audio HAL：VOICE_CALL/VOICE_DOWNLINK/VOICE_RECOGNITION AudioRecord、AudioTrack playback usage 与 tinymix profile。CAPTURE_AUDIO_OUTPUT、Telecom 控制和 appops 需要特权安装/root 配置。Root 本身不保证 Audio HAL 有 Telephony Tx/Rx 路由。
 
-- Non-root Android companion app.
-- Remote SMS inbox/outbox.
-- OTP notification/copy UX.
-- Call history.
-- Gateway online/offline state.
-- SIM/carrier/signal/battery/temperature state.
-- Server-authenticated device pairing.
-- Optional integrated SIP calling later.
+目标机型先跑 tools/check-device.sh，并登记型号、SoC、ROM、Android、内核、两张卡运营商/制式、自动识别的 profile、RTP 音频 capture/playback。先单卡验证再分别在 SIM1/SIM2 上测试入站与出站、双向音质、静音/回声、网络抖动与长通话；任一方向不通即阻止该机型标记双 SIM 可用。
 
-### Phase 1 client strategy
+仓库 README 当前记录的音频证据是 Poco X3 NFC（SM6150/SM7150）及 Galaxy S4 Mini（MSM8960）实机通话可用，Exynos S10e 不可用；这些记录不是本项目目标旧手机的验证结果。对尚未记录的设备，只能报告未知，不能按“已 root”或“Qualcomm”推定通过。
 
-Do **not** write a SIP phone immediately.
+保留旧计划里移除 PermissionController 全局隐藏、不要覆盖用户手动 Magisk deny、不要全局取消 SMS 发送限额和不要改默认短信应用已读状态等要求。所有发送速率限制由 server 和 gateway 独立执行，默认按 sim_id 限制，并提供明确审计记录。
 
-Use an existing SIP client such as Linphone for calls and build our app only for:
+## 实施阶段与验收
 
-- SMS.
-- Gateway state.
-- History.
-- Configuration/diagnostics.
+### G0 — 对齐三端协议与设备门槛
 
-This reduces risk while the GSM/audio bridge is still being validated.
+- 移除新装界面的 callagent.pro 与非必要第三方 STUN 默认值。
+- 生产默认 SIP/TLS + 强制 SRTP；缺证书验证或 SDES 协商就拒绝呼叫，不得静默回明文 RTP。
+- 固定协议版本引用；把本仓库之外的 server/client 工作留在各自仓库。
+- 锁定目标旧手机及 ROM；完成 check-device.sh 和音频路由预检。
 
-### Phase 2 client strategy
+验收：新安装不会连接未配置的第三方服务；候选手机身份与设备检查结果可复现。未知硬件继续标记未验证。
 
-After the gateway/server are stable, decide whether to:
+### G1 — 稳定 SIM 映射与定线
 
-1. keep an external SIP client and deep-link/integrate with it, or
-2. embed a mature SIP library into the companion app.
+- 建立本地 sim_id/mapping_revision 存储与变更监听、确认流程。
+- 入站 Call 使用 PhoneAccountHandle 归属卡；入站 SMS 解析订阅来源或明确标 unknown。
+- 出站 Call 与 SMS 都只按经校验 sim_id 指定线路；移除对 slot、subId、系统默认线路的静默 fallback。
+- 全设备最多一个 call ledger 活动项，并与 Telecom Call、SIP dialog 的挂断/失败/超时状态一致。
 
-The primary phone must never require root.
+验收：两张 SIM 分别进行入站/出站拨号、收发短信；故意移卡、换卡、禁用订阅、发送旧 mapping_revision 时必须拒绝错线而非回退。目标机重启后映射有效时仍可继续，不要求无理由轮换 UUID。
 
----
+### G2 — 安全可靠的数据面
 
-# Target architecture
+- 新建 Room/SQLite gateway store：event journal、sequence、message inbox、command ledger、每分片 SENT/DELIVERED 状态，以及与正文保留分离的幂等 tombstone。
+- 实现 HTTPS 批量 event ingest、逐事件 durable ACK、HTTPS command claim/幂等和 WSS wakeup；不把 Asterisk SIP response 当 DB ACK。
+- 定义容量、回压、恢复和隐私保留；SMS 正文/凭据不写普通日志，Android backup 关闭并保护本机凭据。
+- 旧 SIP MESSAGE 仅由迁移选项显式开启，生产模式不能消费它。
 
-```text
-                     Cellular network
-                           │
-                           ▼
-                ┌────────────────────┐
-                │ Root Android       │
-                │ Unicom SIM         │
-                │                    │
-                │ gsm2sip gateway    │
-                └─────────┬──────────┘
-                          │
-                    SIP over TLS
-                    mandatory SRTP
-                          │
-                          ▼
-              ┌────────────────────────┐
-              │ Public VPS             │
-              │                        │
-              │ Asterisk / PJSIP       │
-              │ direct_media = no      │
-              │ rtp_symmetric = yes    │
-              │ force_rport = yes      │
-              │ rewrite_contact = yes  │
-              │                        │
-              │ SMS / control API      │
-              └─────────┬──────────────┘
-                        │
-              ┌─────────┴──────────┐
-              │                    │
-        SIP/TLS + SRTP        HTTPS / WSS
-              │                    │
-              ▼                    ▼
-       SIP call client      Companion app
-       on primary phone     on primary phone
-       no root              no root
-```
+验收：服务端提交前后分别杀进程/断网/重启，重试保持 event_id 和 message_id；同一个已完成或已过期 ID 重放也不能二次发短信；重复分片 callback 不会虚增成功计数；modem 状态未知时不自动重发；队列满会告警而不淘汰验证码或未完成命令。
 
-The VPS anchors media. Do not use direct media between the gateway and roaming primary phone.
+### G3 — SIP/TLS/SRTP 与协议正确性
 
----
+- 保留证书链、主机名、SNI 校验；生产强制 TLS 和 SRTP，禁止 RTP fallback。
+- 修复 SipTransport 按字节处理 Content-Length；覆盖分段 TCP header/body、中文多字节跨 read、多个消息合并及 SDP。
+- 解析服务器授予的 registration Expires/Contact expires。
+- 校验 PJSIP 实际互通、可靠 NAT anchoring、SIP call intent 与 gateway call ledger 的重传/取消/挂断一致性。
+- 添加 RFC4733 telephone-event 处理及 Telecom DTMF API 转接。
 
-# Phase 0 — Establish a safe fork baseline
+验收：目标 Asterisk/PJSIP 与 SIP SDK 完成正确 TLS、SDES、SDP、挂断、DTMF；错证书、缺 SRTP、任意未授权 SIM 或过期 intent 均拒绝。中文短信由 HTTPS 原样收发，不再依赖 SIP TLS SMS framing。
 
-Before adding features, remove assumptions specific to the upstream author's deployment.
+### G4 — 双 SIM 实机端到端
 
-## P0.1 Remove third-party defaults
-
-- Remove `callagent.pro` as the default SIP server.
-- Default server must be blank.
-- Remove branding that implies dependency on Callagent.
-- Keep generic SIP compatibility.
-- Public STUN servers should be disabled by default or fully configurable.
-
-Acceptance:
-
-- Fresh install makes **no runtime connection to a third-party host** until the user configures a server.
-- DNS/network capture confirms only configured destinations are contacted.
-
-## P0.2 Replace release signing
-
-Current release builds use the standard Android debug key.
-
-Change to:
-
-- Dedicated project release key.
-- GitHub Actions secret or secure local signing workflow.
-- Never commit the private keystore/password.
-- Debug and release packages may no longer be freely interchangeable.
-
-Acceptance:
-
-- Release APK is not signed by `androiddebugkey`.
-- Upgrade from one official release to the next works.
-
-## P0.3 Eliminate unauditable bundled binaries
-
-Current repository includes a prebuilt ARM64 `tinycap` without its source in this tree.
-
-Change to:
-
-- Build `tinycap` from a pinned, auditable tinyalsa/AOSP source revision, or
-- use a ROM-provided compatible binary when explicitly detected.
-- Produce hashes in CI.
-
-Also ensure `tinymix` is reproducibly built from source.
-
-Acceptance:
-
-- Release artifacts contain no unexplained executable binary.
-- CI records source revision and SHA-256 of native tools.
-
-## P0.4 Licensing check
-
-Upstream currently has no repository-level LICENSE file.
-
-Before publishing derived release binaries or broadly distributing modified source:
-
-- Ask upstream author to clarify/add a license.
-- Keep server and primary-phone app as original, independently licensed projects.
-- Do not copy gateway source into those projects.
-
----
-
-# Phase 1 — Correctness fixes before Internet deployment
-
-## P1.1 Fix TLS stream framing for UTF-8 bodies — critical
-
-Current TLS transport converts each TCP read to a Kotlin `String` before applying SIP `Content-Length`.
-
-That is incorrect because SIP `Content-Length` is measured in **bytes**, while Kotlin `String.length` measures characters/code units.
-
-This can break Chinese SMS and any UTF-8 body, and UTF-8 code points may also be split across TCP reads.
-
-Replace TLS receive buffering with a byte buffer:
-
-```text
-TLS bytes
-   ↓
-find CRLF CRLF in bytes
-   ↓
-decode headers only
-   ↓
-parse Content-Length = N bytes
-   ↓
-wait until N body bytes are present
-   ↓
-decode body as UTF-8
-```
-
-Tests required:
-
-- ASCII MESSAGE in one TLS read.
-- Chinese MESSAGE in one TLS read.
-- Chinese UTF-8 code point split across reads.
-- headers split across reads.
-- body split across reads.
-- multiple SIP messages in one read.
-- SDP body.
-- zero-length body.
-
-This is a release blocker for public deployment.
-
-## P1.2 Add SIP/parser unit tests
-
-Add JVM tests for:
-
-- request/response parsing.
-- TLS stream framing.
-- Content-Length.
-- REGISTER challenge/response.
-- INVITE state handling.
-- MESSAGE idempotency.
-- Unicode SMS.
-- SRTP SDP parsing.
-- malformed packets.
-
-The current project has effectively no automated test suite; this must change before protocol refactoring.
-
-## P1.3 Respect server-granted registration expiry
-
-Current logic assumes a 3600-second registration and refreshes at 30 minutes.
-
-Implement:
-
-- parse `Expires` and Contact `expires=`.
-- store granted expiry.
-- refresh around 50–70% of granted lifetime.
-- use sane min/max bounds.
-
-Acceptance:
-
-- Works correctly with 300 s, 600 s, 1800 s and 3600 s registrar expiry.
-
----
-
-# Phase 2 — Secure public-server operation
-
-## P2.1 TLS must be the production default
-
-Production profile:
-
-- SIP over TLS only.
-- Certificate chain validation enabled.
-- hostname verification enabled.
-- SNI preserved.
-- plaintext SIP allowed only behind an explicit developer option.
-
-## P2.2 Make SRTP mandatory in production
-
-Current behavior can continue a call as plain RTP if SRTP negotiation fails.
-
-Add:
-
-```text
-require_srtp = true
-```
-
-When enabled:
-
-- no valid compatible SRTP negotiation -> reject/fail the call.
-- never silently downgrade to RTP.
-- surface a clear error in logs/UI.
-
-Initial supported profile can remain SDES:
-
-```text
-AES_CM_128_HMAC_SHA1_80
-```
-
-Later evaluate DTLS-SRTP only if needed.
-
-## P2.3 Harden RTP endpoint validation
-
-With SRTP enabled, only authenticated RTP may establish symmetric-RTP latching.
-
-For non-production plaintext mode:
-
-- restrict accepted RTP source to negotiated server IP/range where possible.
-- never let arbitrary Internet packets permanently latch the stream.
-
-## P2.4 Modernize SIP authentication
-
-Current Digest support is minimal/legacy.
-
-Implement at least:
-
-- `qop=auth`.
-- `cnonce`.
-- `nc`.
-- correct nonce lifecycle.
-- proxy authentication.
-- SHA-256 Digest if supported by server stack.
-
-TLS remains required even with stronger Digest.
-
-## P2.5 Remove global SMS rate-limit bypass
-
-Do not set Android global SMS allowance to effectively unlimited.
-
-Instead implement gateway-local policy:
-
-Suggested initial defaults:
-
-- maximum 5 outbound SMS/minute.
-- maximum 30/hour.
-- configurable destination allow/deny rules.
-- temporary lockout after repeated unauthorized MESSAGE attempts.
-- explicit audit log.
-
-Limits must be adjustable but never default to unlimited.
-
----
-
-# Phase 3 — Reduce invasive Android modifications
-
-## P3.1 Stop hiding the whole PermissionController
-
-Current Magisk module hides Android PermissionController globally.
-
-That is too invasive for a long-lived appliance.
-
-Investigate alternatives in this order:
-
-1. Privileged-app permissions + correct foreground/microphone lifecycle.
-2. Targeted AppOps handling for this UID only.
-3. Audio-policy/vendor configuration specific to gateway package.
-4. SELinux policy/module additions if required.
-5. Only as a last resort consider platform-wide modification.
-
-The target is:
-
-- Android permission UI remains installed and functional.
-- Only this gateway receives exceptional audio privileges.
-
-## P3.2 Do not override a manual Magisk root denial
-
-Current boot script can rewrite Magisk's DB to grant root automatically.
-
-Replace with:
-
-- health check detecting root denial.
-- persistent visible error state.
-- optional notification.
-- no silent rewrite of user root policy.
-
-For a headless appliance, installation documentation can require the user to grant permanent root once.
-
-## P3.3 Do not mutate normal SMS-app state by default
-
-Remove default behavior that:
-
-- suppresses notifications from the user's SMS app.
-- marks SMS as read/seen using direct DB modifications.
-
-Provide explicit settings if these behaviors are desired on a dedicated appliance.
-
-Default behavior must be non-destructive.
-
----
-
-# Phase 4 — Gateway protocol for our server
-
-Calls can remain standards-based SIP/RTP.
-
-SMS/status should evolve into a clearly versioned contract.
-
-## Calls
-
-Gateway <-> Asterisk:
-
-- SIP/TLS.
-- mandatory SRTP.
-- PJSIP-compatible routing.
-- GSM caller -> SIP Caller-ID.
-- SIM MSISDN -> destination/DID.
-- outbound number -> Request-URI or explicit header.
-
-Keep `X-GSM-Forward` for compatibility, but prefer standard Request-URI behavior where possible.
-
-## SMS
-
-Keep SIP MESSAGE for gateway <-> server initially because it is already implemented and durable.
-
-Formalize headers:
-
-```text
-X-GSM-Gateway-Version
-X-SMS-Id
-X-SMS-From
-X-SMS-To
-X-SMS-Received
-X-SMS-Parts
-X-SMS-Sim-Sub
-X-SMS-Sim-Slot
-X-SMS-Sim-Carrier
-X-SMS-Event
-```
-
-Define a versioned protocol document under:
-
-```text
-docs/protocol.md
-```
-
-Server must use `X-SMS-Id` for idempotency.
-
-## Gateway health/status
-
-Do not overload SIP MESSAGE with all future management data.
-
-Add a small authenticated HTTPS status channel later, for example:
-
-```json
-{
-  "gateway_id": "...",
-  "version": "...",
-  "online": true,
-  "sip_registered": true,
-  "sim": {
-    "carrier": "China Unicom",
-    "slot": 0,
-    "service": "IN_SERVICE"
-  },
-  "battery": 78,
-  "charging": true,
-  "temperature_c": 31.2,
-  "network": "wifi"
-}
-```
-
-This is outbound from the gateway to the server; never expose a root-control HTTP server on the Android device.
-
----
-
-# Phase 5 — Public server project
-
-Implement in the separate `gsm2sip-server` repository.
-
-## Asterisk
-
-Use current Asterisk with `res_pjsip`, not `chan_sip`.
-
-Gateway endpoint baseline:
-
-```ini
-direct_media=no
-rtp_symmetric=yes
-force_rport=yes
-rewrite_contact=yes
-```
-
-Requirements:
-
-- TLS-only production listener.
-- SRTP required for gateway/client endpoints.
-- strong random endpoint passwords.
-- separate gateway and human-client accounts.
-- ACL/fail2ban/firewall.
-- sane registration expiry.
-- media port range explicitly firewalled.
-- no anonymous calls.
-
-## Routing
-
-Incoming GSM call:
-
-```text
-gateway INVITE
- -> identify gateway account
- -> read SIM DID / caller ID
- -> route to primary-phone SIP endpoint(s)
- -> optionally ring multiple authorized clients later
-```
-
-Outgoing:
-
-```text
-primary phone SIP INVITE
- -> authorize number and account
- -> choose gateway/SIM
- -> relay to gateway
- -> gateway places cellular call
-```
-
-Never permit arbitrary unauthenticated callers to use the gateway as a PSTN/GSM termination service.
-
-## SMS API
-
-Server receives SIP MESSAGE from gateway and stores normalized SMS.
-
-Expose authenticated API to companion app:
-
-```text
-GET  /v1/messages
-POST /v1/messages
-GET  /v1/messages/{id}
-GET  /v1/gateways
-GET  /v1/calls
-WS   /v1/events
-```
-
-Use push notifications only for event notification; sensitive SMS content should be fetched from our server after authentication rather than included in third-party push payloads.
-
-## Rate limits
-
-Enforce independently at both server and Android gateway.
-
-Examples:
-
-- outbound SMS.
-- outbound calls/minute.
-- maximum call duration if desired.
-- authentication failures.
-- SMS API writes.
-
----
-
-# Phase 6 — Primary-phone client project
-
-Implement in separate `gsm2sip-client-android`.
-
-No root.
-
-## V1
-
-Features:
-
-### SMS
-- inbox.
-- conversation grouping.
-- sender/number.
-- Chinese SMS.
-- copy OTP action.
-- reply/send.
-- sent/submitted/delivered/failed states.
-- search.
-- optional notification redaction.
-
-### Gateway
-- online/offline.
-- last heartbeat.
-- SIP registration.
-- carrier.
-- signal/service state where available from gateway.
-- battery/charging.
-- app/gateway version.
-
-### Calls
-Initially:
-
-- display synchronized call history.
-- launch/configure external SIP client.
-- do not implement our own SIP stack yet.
-
-## V2
-
-Evaluate integrated SIP calling only after V1 is stable.
-
-Requirements if integrated:
-
-- Android Telecom/ConnectionService integration.
-- foreground call notification.
-- Bluetooth/headset support.
-- audio focus.
-- lock-screen incoming-call UI.
-- reliable push/wakeup for incoming calls.
-- SIP/TLS + SRTP.
-- network handover handling.
-
----
-
-# Phase 7 — Unattended operation / reliability
-
-The gateway is intended to run continuously.
-
-## Gateway watchdog
-
-Add health dimensions:
-
-- foreground service alive.
-- root available.
-- SIP registered.
-- cellular service available.
-- SIM present.
-- audio route/profile valid.
-- last successful SMS relay.
-- last successful call.
-- device temperature.
-- charger state.
-- free storage.
-
-Do not reboot aggressively on a single failure.
-
-Suggested escalation:
-
-```text
-failure
- -> retry component
- -> rebuild SIP transport
- -> restart GatewayService
- -> only then optional app/process restart
- -> device reboot only after repeated confirmed unrecoverable failures
-```
-
-## Server-side offline alert
-
-If gateway misses heartbeats for a configured interval:
-
-- companion-app notification.
-- optional email/other alert later.
-
-## Network transitions
-
-Test:
-
-- Wi-Fi AP reboot.
-- DHCP address change.
-- loss/recovery of Internet.
-- DNS failure.
-- SIP server restart.
-- TLS certificate renewal.
-- gateway reboot.
-- gateway process kill.
-- Android screen-off for 24h+.
-
----
-
-# Phase 8 — Device compatibility
-
-Audio routing is the largest hardware-specific risk.
-
-Before committing a gateway handset:
-
-1. run the repository device-check tooling.
-2. identify SoC/vendor Audio HAL.
-3. verify digital caller capture.
-4. verify agent -> modem uplink injection.
-5. test with local mic/speaker physically muted where possible.
-6. make at least several long calls.
-7. reboot and repeat.
-
-Prefer a Qualcomm device with a known-compatible route/profile.
-
-Device support should be recorded in:
-
-```text
-docs/devices.md
-```
-
-with:
-
-- device.
-- SoC.
-- ROM/version.
-- kernel.
-- working capture source.
-- working injection path.
-- known issues.
-
----
-
-# Phase 9 — CI / release engineering
-
-Gateway repository CI should:
-
-1. compile Android app.
-2. run JVM unit tests.
-3. build native audio tools from pinned source.
-4. verify no unexpected executables were added.
-5. generate checksums.
-6. build Magisk package.
-7. sign APK with controlled release key on release workflow.
-8. publish arm64-first artifact unless a tested 32-bit target is intentionally supported.
-
-Do not commit signing secrets.
-
-Add a dependency/reproducibility record for every release.
-
----
-
-# Security acceptance criteria before real SIM use
-
-Do not leave the project connected to the real phone number over the public Internet until all of these are true:
-
-- [ ] No default/hidden connection to third-party SIP or STUN services.
-- [ ] TLS UTF-8 stream framing fixed and tested.
-- [ ] SIP TLS works with hostname/certificate verification.
-- [ ] SRTP can be configured as mandatory and cannot silently downgrade.
-- [ ] Server only allows authenticated gateway/client endpoints.
-- [ ] Server has outbound-call authorization.
-- [ ] Server and gateway both rate-limit outbound SMS.
-- [ ] Release APK uses our own signing key.
-- [ ] Bundled native executables are reproducible/auditable.
-- [ ] SIP credentials are not logged.
-- [ ] PermissionController is not globally removed/disabled.
-- [ ] App does not silently re-enable root after a manual deny.
-- [ ] Reboot/network/server-restart recovery has been tested.
-- [ ] Chinese SMS over TLS passes automated and real-device tests.
-
----
-
-# MVP milestones
-
-## M0 — clean fork
-
-- remove third-party defaults.
-- introduce tests.
-- own signing process.
-- reproducible native tools.
-
-## M1 — safe gateway
-
-- TLS framing fix.
-- registration-expiry fix.
-- less-invasive permission handling.
-- production TLS + mandatory SRTP mode.
-- call/SMS rate limits.
-
-## M2 — self-hosted server
-
-- PJSIP Asterisk.
-- public TLS endpoint.
-- SRTP.
-- authenticated routing.
-- SMS service/API.
-- basic gateway health.
-
-## M3 — end-to-end test
-
-From a primary Android phone outside the gateway network:
-
-- incoming Unicom call rings remotely.
-- answer with two-way audio.
-- outgoing call uses Unicom number.
-- incoming Chinese SMS appears remotely.
-- outgoing Chinese SMS sends and reports status.
-- gateway/server/client reboot independently and recover.
-
-## M4 — companion app
-
-- SMS UI.
-- OTP UX.
-- call history.
-- gateway health.
-- notifications.
-
-## M5 — integrated calling (optional)
-
-Only after the rest is stable:
-
-- evaluate replacing external SIP client with integrated SIP/Android Telecom.
-
----
-
-# Immediate next work in this repository
-
-Recommended implementation order:
-
-1. Add protocol/TLS tests.
-2. Fix `TlsSipTransport` byte framing.
-3. Remove `callagent.pro` and public STUN defaults.
-4. Implement server-granted REGISTER expiry.
-5. Add mandatory-SRTP production switch.
-6. Replace debug release signing workflow.
-7. Replace unauditable `tinycap`.
-8. Remove global PermissionController hiding.
-9. Remove automatic Magisk DB root re-grant.
-10. Replace global SMS-limit override with app-level rate limits.
-11. Stop mutating/silencing the normal SMS app by default.
-12. Add gateway health/status protocol.
-13. Build the separate server project.
-14. Validate end-to-end with an external SIP client.
-15. Build the companion Android app.
-
----
-
-## Design principle
-
-Keep the difficult, hardware-specific code in this gateway fork:
-
-```text
-Android Telephony + Audio HAL + modem audio + SMS
-```
-
-Keep Internet-facing logic on the server:
-
-```text
-authentication + routing + API + policy + monitoring
-```
-
-Keep user experience on the non-root primary-phone app:
-
-```text
-SMS + status + history + notifications + eventually calls
-```
-
-This separation lets the gateway remain small and appliance-like, reduces the attack surface of the rooted phone, and makes it possible to update server/client functionality without touching the fragile vendor audio path.
+- 卡 A、卡 B 分别测试真实蜂窝呼入/呼出、中文/emoji/多段 SMS、原卡回复、按键菜单与语音双向。
+- 一卡通话时测另一卡 SMS 与来电，记录基带/运营商 DSDS 结果。
+- 测槽位互换、换卡、恢复出厂后重配、subId 保持与变化、SMS 广播订阅 extra 缺失。
+- 测长通话、热机、锁屏、Doze、Wi-Fi/AP 重启、服务端证书更新、设备重启，以及双端事件重放竞态。
+
+验收：所有任务能显示明确 SIM 与业务状态；旧 revision、未知身份、SIM unavailable 都可解释地失败；audio profile 和双卡限制写入 docs/devices.md。只有两卡均通过才声明该设备完整支持双 SIM 语音/短信。
+
+## G5 — 保留旧计划的协议、系统权限与发布工程任务
+
+- `sip/SipTransport.kt`：byte buffer + Content-Length有界解析；拒绝重复冲突/负数/过大长度和无界积累，测试ASCII、中文/emoji跨read、SDP、流水多帧、CRLF keepalive、异常帧。
+- `sip/SipAuth.kt`、`SipClient.kt`：补qop=auth、cnonce/nc、401/407、nonce生命周期及支持时SHA-256；REGISTER按服务端 granted Expires/Contact expires刷新（覆盖300/600/1800/3600秒）。与server配置共同验收，不能单独开启不支持的digest。
+- `sip/SipCall.kt`、`rtp/Srtp.kt/RtpSession.kt`：生产strict SDES拒绝缺crypto/错误suite，鉴别成功后才更新symmetric RTP来源，增加SRTP密钥派生/重放/rollover测试；RTCP若启用必须补齐SRTCP并与Asterisk核对。G.722/PCMA与telephone-event payload按SDP协商而非硬编码。
+- `gsm/GsmCallManager.kt`、`bridge/CallOrchestrator.kt`：显式PhoneAccountHandle、call ledger在placeCall前持久dispatching；重启无法确认未拨出的call_id→unknown，不自动重拨。控制SIP重传和第二卡来电不得覆盖另一Call对象。
+- `sms/SmsSender.kt/SmsSendReceiver.kt`：API31+用createForSubscriptionId，API26–30用相应subscription-specific旧API；不catch异常后回默认。PendingIntent以message_id/part_index/type建立稳定唯一身份（如显式data URI），不用可能碰撞的hash requestCode作为唯一标识；callback逐分片upsert幂等。
+- `sms/SmsStore.kt/SmsOutbox.kt`与新store：SharedPreferences迁入Room/SQLite事务，迁移失败保留旧数据；正文清理与幂等tombstone分离，不能takeLast(200)或24h prune让已执行ID重新可执行。盘满需告警/回压、记录无法落库的状态，不能宣称无条件不丢短信。
+- `magisk/install.sh,service.sh,system/priv-app/PermissionController/.replace`：移除全局隐藏PermissionController、自动改Magisk deny为allow、全局短信无限额和默认修改其它SMS App通知/已读的行为。采用gateway UID定向权限/AppOps/必要SELinux与audio profile；先做profile前后对照，不用全面权限削弱代替适配。
+- `app/build.gradle.kts,build.sh,magisk/`与新CI：专用且持久的release key、固定applicationId，连续release升级签名校验；APK与Magisk中的APK签名一致，迁移原debug签名有一次安装/备份恢复说明。私钥/密码只放受控secret，不进git。
+- `magisk/tinycap,tinymix,tinymix32,tools/tinymix/`：保留可审计tinymix源码，tinycap由固定AOSP/tinyalsa源构建；记录所有native源码pin/hash/ABI，不发布来源不明预编译文件。arm64先行，32bit仅目标旧机需要且验证后支持。
+- `service/GatewayService.kt/BootReceiver.kt/RootShell.kt`：心跳、独立root/SIP/SIM/audio/温度/空间健康，网络退避重连和分组件watchdog；不因单次失败反复重启。用户撤销root明确显示不可用，不自动改权限。
+- `docs/devices.md`、README：记录实际旧机型号/ROM/两卡/数字音频与DTMF测试、DSDS和SRTCP能力；将本fork推荐部署入口改为server仓库PJSIP计划，不再推荐旧chan_sip/callagent默认。
+- 发布前确认原网关与引入依赖的许可证/分发权限；server和client保持独立原创工程。现有无repo级LICENSE不等于可以自行给上游代码重新授权。
+
+验收：CI可编译/JVM协议与ledger测试/native重建/校验APK签名与Magisk包；目标机重启、断网、TLS证书轮换及24h熄屏+72h持续运行通过。测试前后权限变化可审阅、连续release可升级、两卡调用都不默认回落。
+
+## 建议新增代码位置与依赖
+
+新增`sim/SimRegistry.kt`、`data/GatewayDatabase.kt`（journal/ledger/parts/tombstones）、`net/ControlApiClient.kt`、`net/ControlEventsClient.kt`、`service/HealthReporter.kt`，保留现有Telecom/media实现并小步改造。优先执行联合M0设备探针与G0/G1/G3基础修复，之后按联合M2–M5对接；G5中的安全发布项是生产门槛，不能等正式上线后再处理。
+
+SIM account映射优先使用目标Android版本支持的Telephony/Telecom关联API；API26–30与API31+分支分别验证，不把PhoneAccountHandle.id字符串解析成subId的猜测作为可靠映射。通话中能否发送SMS按两卡各自实测能力声明，未验证时留原任务/原卡/原TTL等待，不自动切卡。

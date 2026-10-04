@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
+      - 'app/**'
       - '.github/workflows/android-ui-smoke.yml'
       - 'scripts/android-ui-smoke.py'
 

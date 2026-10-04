@@ -30,15 +30,14 @@
         <item name="colorSurfaceContainerHighest">@color/m3_surface_container_highest</item>
         <item name="android:colorBackground">?attr/colorSurface</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">?attr/isLightTheme</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowActionModeOverlay">true</item>
         <item name="alertDialogTheme">@style/ThemeOverlay.Material3Expressive.Dialog.Alert</item>
         <item name="materialAlertDialogTheme">@style/ThemeOverlay.Material3Expressive.MaterialAlertDialog</item>
     </style>
 
-    <style name="Theme.SipGsmGateway" parent="Theme.SipGsmGateway.Base">
-        <item name="android:windowLightStatusBar">true</item>
-    </style>
+    <style name="Theme.SipGsmGateway" parent="Theme.SipGsmGateway.Base" />
 
     <style name="DialButton">
         <item name="android:layout_height">64dp</item>

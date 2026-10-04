@@ -536,7 +536,10 @@ class MainActivity : AppCompatActivity() {
         btnInCallMonitor = findViewById(R.id.btnInCallMonitor)
         btnInCallMonitor.setOnClickListener { toggleMonitor() }
 
-        requestSmsPermissions()
+        // Only prompt on a fresh launch. The system permission sheet can
+        // recreate this Activity on rotation; asking again would cover a
+        // settings form the user is already editing.
+        if (savedInstanceState == null) requestSmsPermissions()
 
         // Rebuild the settings controls before restoring their non-secret
         // state. The password field is restored from encrypted storage only.

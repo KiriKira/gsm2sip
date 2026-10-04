@@ -10,6 +10,8 @@
 先读 [网关计划](PLAN-selfhosted-gateway.md)、[实施审查](https://github.com/KiriKira/gsm2sip-server/blob/b93fc9c8036108e36b2652673c1dd8ceee8d197f/docs/IMPLEMENTATION-REVIEW-2026-10-03.md) 与 [设备验收状态](docs/devices.md)。
 [本批实施状态与固定协议](docs/implementation-state.md)。
 按用户要求，本批后续增加 [Magisk 通用适配](docs/magisk-runtime.md)：模块探测、受限账户 broker 和本地数字音频配置，不再按机型自动选 preset 或以 API 31 作为整体语音门槛。
+
+Magisk 模块的模拟器选择与启动阶段验证见 [验证环境比较](docs/magisk-validation-options.md)。推荐使用 KVM AVD 验证模块挂载和启动脚本；Waydroid 的第三方 Magisk 集成仍需单独验收。
 两端已增加 [Material 3 Expressive 与后台运行设置](docs/android-ui-and-background.md)，WSS 唤醒配合 HTTPS 补齐；ARI、主机内置 SIP SDK 和 Telecom 已落代码；FCM、完整切网续话及真机持续运行仍待完成。
 短信不再以 SIP MESSAGE 作为生产执行通道。不确定发送保留 `unknown`，不能自动重发或回落默认 SIM。
 

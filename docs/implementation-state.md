@@ -1,9 +1,9 @@
 # 三端实施状态
 
-权威服务端协议固定为 `77a79f95961d3a8aba0645bbd0c8062ed158a653`：
-[wire addendum](https://github.com/KiriKira/gsm2sip-server/blob/77a79f95961d3a8aba0645bbd0c8062ed158a653/docs/server-wire-addendum.md)、
-[OpenAPI](https://github.com/KiriKira/gsm2sip-server/blob/77a79f95961d3a8aba0645bbd0c8062ed158a653/openapi/openapi.yaml) 与
-[fixture](https://github.com/KiriKira/gsm2sip-server/tree/77a79f95961d3a8aba0645bbd0c8062ed158a653/fixtures/api)。
+权威服务端协议固定为 `8b83ae8f613fd7f27ea8e4f3aa1b2148f22c1606`：
+[wire addendum](https://github.com/KiriKira/gsm2sip-server/blob/8b83ae8f613fd7f27ea8e4f3aa1b2148f22c1606/docs/server-wire-addendum.md)、
+[OpenAPI](https://github.com/KiriKira/gsm2sip-server/blob/8b83ae8f613fd7f27ea8e4f3aa1b2148f22c1606/openapi/openapi.yaml) 与
+[fixture](https://github.com/KiriKira/gsm2sip-server/tree/8b83ae8f613fd7f27ea8e4f3aa1b2148f22c1606/fixtures/api)。
 原计划仍是三个仓库的完整验收目标；首批完成 M1/M2 短信基础，后续按
 用户要求增加 [Magisk 通用能力适配](magisk-runtime.md)，继续推进通话基础。
 

@@ -22,3 +22,8 @@ app/build/
 # Local signing material
 *.keystore
 *.jks
+
+# Android runtime verification artifacts
+/artifacts/
+__pycache__/
+*.pyc

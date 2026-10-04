@@ -10,6 +10,9 @@ STATE_DIR=/data/adb/magisk-validation-smoke
 PROBE_DIR=/data/adb/modules/$PROBE_ID
 GATEWAY_DIR=/data/adb/modules/$GATEWAY_ID
 CTL=$GATEWAY_DIR/bin/gsm2sipctl
+OFFICIAL_APK=/data/local/tmp/magisk-v30.7.apk
+ENV_FIX_DIR=/data/local/tmp/magisk-avd-official-env-fix
+ENV_INSTALL_DIR=$ENV_FIX_DIR/install
 
 fail() {
     echo "smoke_error=$1" >&2
@@ -45,6 +48,82 @@ verify_shell_policy_is_not_persistent() {
     echo "su_policy_persisted=false"
 }
 
+load_official_app_functions() {
+    [ -f "$OFFICIAL_APK" ] || fail official_magisk_apk_missing
+    mkdir -p "$ENV_FIX_DIR"
+    unzip -o -j "$OFFICIAL_APK" assets/app_functions.sh -d "$ENV_FIX_DIR" >/dev/null 2>&1 || fail official_app_functions_extract_failed
+    [ -f "$ENV_FIX_DIR/app_functions.sh" ] || fail official_app_functions_missing
+    . "$ENV_FIX_DIR/app_functions.sh"
+    MAGISKBIN=/data/adb/magisk
+    MAGISKTMP=$("$MAGISK_PATH" --path 2>/dev/null | sed -n '1p')
+    [ -n "$MAGISKTMP" ] || fail magisk_tmp_path_missing
+    export MAGISKBIN MAGISKTMP
+}
+
+verify_magisk_environment() {
+    verify_magisk
+    load_official_app_functions
+    if env_check "$MAGISK_VERSION" "$MAGISK_VERSION_CODE"; then
+        echo "magisk_environment=complete"
+        echo "magisk_environment_path=$MAGISKBIN"
+        echo "magisk_runtime_path=$MAGISKTMP"
+    else
+        ENV_CHECK_RC=$?
+        fail "magisk_environment_incomplete_$ENV_CHECK_RC"
+    fi
+}
+
+fix_magisk_environment() {
+    verify_magisk
+    [ -f "$OFFICIAL_APK" ] || fail official_magisk_apk_missing
+    ABI=$(getprop ro.product.cpu.abi)
+    [ "$ABI" = x86_64 ] || fail "unexpected_abi_for_official_env_fix_$ABI"
+    rm -rf "$ENV_INSTALL_DIR"
+    mkdir -p "$ENV_INSTALL_DIR/chromeos"
+
+    unzip -o -j "$OFFICIAL_APK" \
+        assets/util_functions.sh assets/boot_patch.sh assets/addon.d.sh assets/stub.apk \
+        -d "$ENV_INSTALL_DIR" >/dev/null 2>&1 || fail official_magisk_scripts_extract_failed
+    unzip -o -j "$OFFICIAL_APK" \
+        assets/chromeos/futility assets/chromeos/kernel_data_key.vbprivk assets/chromeos/kernel.keyblock \
+        -d "$ENV_INSTALL_DIR/chromeos" >/dev/null 2>&1 || fail official_magisk_chromeos_assets_extract_failed
+    unzip -o -j "$OFFICIAL_APK" "lib/$ABI/*.so" \
+        -d "$ENV_INSTALL_DIR" >/dev/null 2>&1 || fail official_magisk_x86_64_libraries_extract_failed
+
+    grep -qx "MAGISK_VER='$MAGISK_VERSION'" "$ENV_INSTALL_DIR/util_functions.sh" || fail official_magisk_version_asset_mismatch
+    grep -qx "MAGISK_VER_CODE=$MAGISK_VERSION_CODE" "$ENV_INSTALL_DIR/util_functions.sh" || fail official_magisk_version_code_asset_mismatch
+
+    for LIB_FILE in "$ENV_INSTALL_DIR"/lib*.so; do
+        [ -f "$LIB_FILE" ] || continue
+        LIB_NAME=${LIB_FILE##*/}
+        LIB_NAME=${LIB_NAME#lib}
+        LIB_NAME=${LIB_NAME%.so}
+        mv "$LIB_FILE" "$ENV_INSTALL_DIR/$LIB_NAME"
+    done
+
+    ABI32=$(getprop ro.product.cpu.abilist32 | sed 's/,.*//')
+    if [ -n "$ABI32" ]; then
+        mkdir -p "$ENV_FIX_DIR/abi32"
+        unzip -o -j "$OFFICIAL_APK" "lib/$ABI32/libmagisk.so" \
+            -d "$ENV_FIX_DIR/abi32" >/dev/null 2>&1 || fail official_magisk_32bit_library_extract_failed
+        [ -f "$ENV_FIX_DIR/abi32/libmagisk.so" ] || fail official_magisk_32bit_library_missing
+        cp "$ENV_FIX_DIR/abi32/libmagisk.so" "$ENV_INSTALL_DIR/magisk32"
+    fi
+
+    for REQUIRED in busybox magisk magiskboot magiskinit magiskpolicy init-ld util_functions.sh boot_patch.sh addon.d.sh stub.apk; do
+        [ -f "$ENV_INSTALL_DIR/$REQUIRED" ] || fail "official_magisk_env_file_missing_$REQUIRED"
+    done
+    for REQUIRED in futility kernel_data_key.vbprivk kernel.keyblock; do
+        [ -f "$ENV_INSTALL_DIR/chromeos/$REQUIRED" ] || fail "official_magisk_chromeos_file_missing_$REQUIRED"
+    done
+
+    load_official_app_functions
+    echo "magisk_environment_before_fix_util_functions=$([ -f "$MAGISKBIN/util_functions.sh" ] && echo present || echo missing)"
+    fix_env "$ENV_INSTALL_DIR"
+    verify_magisk_environment
+    echo "magisk_environment_fix=official_app_functions_fix_env"
+}
+
 verify_probe_module() {
     [ -d "$PROBE_DIR" ] || fail probe_module_missing
     [ -f "$PROBE_DIR/module.prop" ] || fail probe_module_prop_missing
@@ -69,14 +148,14 @@ verify_probe_module() {
 }
 
 install_probe() {
-    verify_magisk
+    verify_magisk_environment
     "$MAGISK_PATH" --install-module /data/local/tmp/magisk-validation-smoke.zip
     echo "probe_module_install=accepted"
     verify_shell_policy_is_not_persistent
 }
 
 install_gateway() {
-    verify_magisk
+    verify_magisk_environment
     verify_probe_module
     [ ! -e /data/adb/gsm2sip ] || fail project_post_fs_data_path_preexisted
     "$MAGISK_PATH" --install-module /data/local/tmp/gateway-magisk.zip
@@ -85,7 +164,7 @@ install_gateway() {
 }
 
 probe_gateway() {
-    verify_magisk
+    verify_magisk_environment
     verify_probe_module
     verify_shell_policy_is_not_persistent
     [ -d "$GATEWAY_DIR" ] || fail gateway_module_missing
@@ -133,6 +212,8 @@ probe_gateway() {
 }
 
 case "${1:-}" in
+    fix_environment) fix_magisk_environment ;;
+    verify_environment) verify_magisk_environment ;;
     install_probe) install_probe ;;
     install_gateway) install_gateway ;;
     probe_gateway) probe_gateway ;;

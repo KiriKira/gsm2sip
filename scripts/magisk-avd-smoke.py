@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,22 @@ MAGISK_VERSION_CODE = "30700"
 MAGISK_APK_SHA256 = "e0d32d2123532860f97123d927b1bb86c4e08e6fd8a48bfc6b5bee0afae9ebd5"
 SYSTEM_IMAGE = "system-images/android-34/google_apis/x86_64"
 AVD_NAME = "Gsm2SipMagiskApi34"
+MAGISK_ENV_APK_FILES = {
+    "assets/app_functions.sh",
+    "assets/util_functions.sh",
+    "assets/boot_patch.sh",
+    "assets/addon.d.sh",
+    "assets/stub.apk",
+    "assets/chromeos/futility",
+    "assets/chromeos/kernel_data_key.vbprivk",
+    "assets/chromeos/kernel.keyblock",
+    "lib/x86_64/libbusybox.so",
+    "lib/x86_64/libinit-ld.so",
+    "lib/x86_64/libmagisk.so",
+    "lib/x86_64/libmagiskboot.so",
+    "lib/x86_64/libmagiskinit.so",
+    "lib/x86_64/libmagiskpolicy.so",
+}
 
 
 class SmokeFailure(RuntimeError):
@@ -147,6 +164,19 @@ class MagiskAvdSmoke:
         apk_hash = hashlib.sha256(archive_apk.read_bytes()).hexdigest()
         if apk_hash != MAGISK_APK_SHA256:
             raise SmokeFailure(f"Magisk APK SHA-256 mismatch: {apk_hash}")
+        with zipfile.ZipFile(archive_apk) as apk:
+            apk_files = set(apk.namelist())
+            missing = MAGISK_ENV_APK_FILES - apk_files
+            if missing:
+                raise SmokeFailure(f"official Magisk APK is missing env-fix files: {sorted(missing)}")
+            util_functions = apk.read("assets/util_functions.sh").decode("utf-8", errors="replace")
+            app_functions = apk.read("assets/app_functions.sh").decode("utf-8", errors="replace")
+            if f"MAGISK_VER='{MAGISK_VERSION}'" not in util_functions:
+                raise SmokeFailure("official Magisk APK util_functions.sh version does not match the pinned release")
+            if f"MAGISK_VER_CODE={MAGISK_VERSION_CODE}" not in util_functions:
+                raise SmokeFailure("official Magisk APK util_functions.sh version code does not match the pinned release")
+            if not re.search(r"(?m)^fix_env\(\) \{", app_functions):
+                raise SmokeFailure("official Magisk APK is missing its fix_env function")
 
         original = root.read_text(encoding="utf-8")
         patched = original
@@ -218,6 +248,8 @@ class MagiskAvdSmoke:
         root.write_text(patched, encoding="utf-8")
         self.record("pinned_sources", "pass",
                     f"rootAVD={git_head}; Magisk={MAGISK_VERSION}; sha256={apk_hash}")
+        self.record("official_magisk_env_fix_sources", "pass",
+                    f"validated {len(MAGISK_ENV_APK_FILES)} APK entries and official fix_env/app_functions version")
         self.record("rootavd_network_guards", "pass", "; ".join(changes[1:]))
 
     def prepare_avd(self) -> None:
@@ -540,6 +572,27 @@ class MagiskAvdSmoke:
         self.start_emulator()
         self.push(Path(__file__).resolve().parent / "magisk-avd-smoke-root.sh",
                   "/data/local/tmp/magisk-avd-smoke-root.sh", "push-root-probe")
+        official_apk = self.rootavd / "Magisk.zip"
+        env_fix_apk_hash = hashlib.sha256(official_apk.read_bytes()).hexdigest()
+        if env_fix_apk_hash != MAGISK_APK_SHA256:
+            raise SmokeFailure(f"Magisk APK changed during rootAVD patching: {env_fix_apk_hash}")
+        self.record("official_magisk_apk_revalidated", "pass", f"sha256={env_fix_apk_hash}")
+        self.push(official_apk, "/data/local/tmp/magisk-v30.7.apk",
+                  "push-official-magisk-apk-for-env-fix")
+        result = self.perform_root_action("fix_environment", "official-magisk-environment-fix", timeout=180)
+        if "magisk_environment=complete" not in result or "magisk_environment_fix=official_app_functions_fix_env" not in result:
+            raise SmokeFailure("official Magisk environment fix did not report complete")
+        self.record("official_magisk_environment_fix", "pass", result.replace("\n", "; "))
+
+        self.stop_emulator()
+        self.start_emulator()
+        self.push(Path(__file__).resolve().parent / "magisk-avd-smoke-root.sh",
+                  "/data/local/tmp/magisk-avd-smoke-root.sh", "refresh-root-probe-after-env-fix")
+        result = self.perform_root_action("verify_environment", "verify-magisk-environment-after-cold-boot", timeout=120)
+        if "magisk_environment=complete" not in result:
+            raise SmokeFailure("Magisk environment fix did not persist across a cold boot")
+        self.record("official_magisk_environment_persisted", "pass", result.replace("\n", "; "))
+
         self.push(probe_zip, "/data/local/tmp/magisk-validation-smoke.zip", "push-probe-zip")
         result = self.perform_root_action("install_probe", "install-lifecycle-probe", timeout=180)
         self.record("probe_module_installed", "pass", result.replace("\n", "; "))
@@ -587,8 +640,20 @@ class MagiskAvdSmoke:
         else:
             return_code = 0
         finally:
-            self.stop_emulator()
-            self.write_summary()
+            try:
+                self.stop_emulator()
+            except Exception as exc:
+                self.summary["cleanup_failure"] = str(exc)
+                if self.summary.get("status") == "passed":
+                    self.summary["status"] = "failed"
+                    self.summary["failure"] = f"emulator cleanup failed: {exc}"
+                self.record("emulator_cleanup", "fail", str(exc))
+                return_code = 1
+            try:
+                self.write_summary()
+            except Exception as exc:
+                print(f"Unable to write smoke summary: {exc}", file=sys.stderr, flush=True)
+                return_code = 1
         return return_code
 
 

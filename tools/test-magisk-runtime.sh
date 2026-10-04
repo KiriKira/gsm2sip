@@ -125,7 +125,7 @@ case "${FAKE_BROKER_MODE:-ok}" in
         exec /usr/bin/head -c 1048576 /dev/zero | /usr/bin/tr '\000' x
         ;;
     wrong_version)
-        printf '%s\n' protocol=1 broker_version=99 app_version=427 broker_uid=1000 source=magisk-system-telephony status=ok user_id=0 count=0
+        printf '%s\n' protocol=1 broker_version=99 app_version=428 broker_uid=1000 source=magisk-system-telephony status=ok user_id=0 count=0
         exit 0
         ;;
 esac

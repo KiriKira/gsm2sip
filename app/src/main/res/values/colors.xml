@@ -1,42 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Brand -->
-    <!-- The teal green used by the logo, the online pill, the filter chips
-         and the settings controls.  One value so they cannot drift apart. -->
-    <color name="accent">#34D399</color>
-    <color name="accent_on">#052E16</color>
-
-    <color name="primary">#2563EB</color>
-    <color name="primary_dark">#1D4ED8</color>
-
-    <!-- Backgrounds -->
-    <color name="background">#F9FAFB</color>
-    <color name="surface">#FFFFFF</color>
-
-    <!-- Text -->
-    <color name="text_primary">#111827</color>
-    <color name="text_label">#374151</color>
-    <color name="text_secondary">#6B7280</color>
-    <color name="text_log">#4B5563</color>
-    <color name="text_hint">#9CA3AF</color>
-
-    <!-- Buttons -->
-    <color name="btn_secondary">#374151</color>
-
-    <!-- Borders -->
-    <color name="border_input">#D1D5DB</color>
-    <color name="border_card">#E5E7EB</color>
-
-    <!-- TLS badge.  Amber rather than the accent green: the green pill means
-         "registered", and TLS is a different fact about the same connection,
-         so it must not read as a second copy of the same status. -->
-    <color name="tls_badge">#CA8A04</color>
-
-    <!-- SRTP badge.  Blue, distinct from the TLS yellow: the two protect
-         different things (signalling vs audio) and can be on independently,
-         so they must not read as one status in two shades. -->
-    <color name="srtp_badge">#2563EB</color>
-
-    <!-- Status bar -->
-    <color name="status_bar">#FFFFFF</color>
+    <!-- Material 3 role fallbacks for devices that do not provide wallpaper colors. -->
+    <color name="m3_primary">#3659A2</color>
+    <color name="m3_on_primary">#FFFFFF</color>
+    <color name="m3_primary_container">#D9E2FF</color>
+    <color name="m3_on_primary_container">#001A41</color>
+    <color name="m3_secondary">#575E71</color>
+    <color name="m3_on_secondary">#FFFFFF</color>
+    <color name="m3_secondary_container">#DBE2F9</color>
+    <color name="m3_on_secondary_container">#141B2C</color>
+    <color name="m3_tertiary">#725475</color>
+    <color name="m3_on_tertiary">#FFFFFF</color>
+    <color name="m3_tertiary_container">#FBD7FA</color>
+    <color name="m3_on_tertiary_container">#2B1230</color>
+    <color name="m3_error">#BA1A1A</color>
+    <color name="m3_on_error">#FFFFFF</color>
+    <color name="m3_error_container">#FFDAD6</color>
+    <color name="m3_on_error_container">#410002</color>
+    <color name="m3_surface">#FAF8FF</color>
+    <color name="m3_on_surface">#1A1B20</color>
+    <color name="m3_surface_variant">#E2E2EB</color>
+    <color name="m3_on_surface_variant">#44464F</color>
+    <color name="m3_outline">#747780</color>
+    <color name="m3_outline_variant">#C4C6D0</color>
+    <color name="m3_surface_container_lowest">#FFFFFF</color>
+    <color name="m3_surface_container_low">#F4F3FA</color>
+    <color name="m3_surface_container">#EEEFF6</color>
+    <color name="m3_surface_container_high">#E8E9F0</color>
+    <color name="m3_surface_container_highest">#E2E3EA</color>
 </resources>

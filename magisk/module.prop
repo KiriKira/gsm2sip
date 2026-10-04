@@ -1,6 +1,6 @@
 id=sip-gsm-gateway
 name=SIP-GSM Gateway Runtime
-version=v1.3.1
-versionCode=427
+version=v1.3.2
+versionCode=428
 author=callagent
 description=Generic root telephony broker and read-only audio capability probe for SIP-GSM Gateway

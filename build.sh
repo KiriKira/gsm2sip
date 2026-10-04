@@ -73,7 +73,7 @@ check_gradle_wrapper() {
         echo "Downloading Gradle wrapper..."
         mkdir -p "$SCRIPT_DIR/gradle/wrapper"
 
-        local GRADLE_VER="8.5"
+        local GRADLE_VER="8.9"
         local GRADLE_URL="https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip"
 
         curl -fsSL "$GRADLE_URL" -o /tmp/gradle-dist.zip

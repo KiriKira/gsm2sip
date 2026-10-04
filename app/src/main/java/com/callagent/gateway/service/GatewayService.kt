@@ -22,10 +22,15 @@ import android.os.BatteryManager
 import android.telephony.TelephonyManager
 import com.callagent.gateway.data.CredentialStore
 import com.callagent.gateway.data.GatewayDatabase
+import com.callagent.gateway.background.GatewayBackgroundPolicy
+import com.callagent.gateway.background.GatewayBackgroundRuntime
 import com.callagent.gateway.net.ControlApiClient
 import com.callagent.gateway.net.ControlApiException
 import com.callagent.gateway.net.HeartbeatSim
 import com.callagent.gateway.net.ServerCommand
+import com.callagent.gateway.net.WakeConnection
+import com.callagent.gateway.net.WakeConnectionPolicy
+import com.callagent.gateway.net.WakeSessionIdentity
 import com.callagent.gateway.sim.SimRegistry
 import com.callagent.gateway.sms.LegacySmsMigration
 import com.callagent.gateway.sms.SmsSender
@@ -44,20 +49,45 @@ import java.net.NetworkInterface
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ThreadLocalRandom
 import kotlin.concurrent.thread
 
 /**
- * Foreground service: keeps the SIP client registered 24/7.
- *
- * Holds a WiFi lock and wake lock to prevent the device from
- * sleeping and dropping the SIP registration.
+ * User-enabled control service with an optional, explicitly started SIP voice runtime.
+ * Control-only operation does not hold continuous CPU or Wi-Fi locks.
  */
 class GatewayService : Service() {
 
     private var sipClient: SipClient? = null
     private var orchestrator: CallOrchestrator? = null
-    private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
+    private var voiceWakeLock: PowerManager.WakeLock? = null
+    private var voiceWifiLock: WifiManager.WifiLock? = null
+    private val powerLeaseScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "gateway-power-leases").apply { isDaemon = true }
+    }
+    private val wakeRetryScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "gateway-wake-retry").apply { isDaemon = true }
+    }
+    private val powerLeaseGuard = Any()
+    private var voiceLeaseFuture: ScheduledFuture<*>? = null
+    private var wifiLeaseFuture: ScheduledFuture<*>? = null
+    @Volatile private var voiceRuntimeStarted = false
+    @Volatile private var voiceLeaseWanted = false
+    @Volatile private var voiceLeaseGeneration = 0L
+
+    private val wakeConnectionGuard = Any()
+    private var wakeConnection: WakeConnection? = null
+    private var wakeIdentity: WakeSessionIdentity? = null
+    private var wakeRetryFuture: ScheduledFuture<*>? = null
+    private var wakeGeneration = 0L
+    private var wakeRetryMs = WAKE_RETRY_INITIAL_MS
+    @Volatile private var wakeAuthBlocked = false
+    private var wakeAuthorizationTokenToRefresh: String? = null
+    private val syncWakeLockGuard = Any()
+    private var syncWakeLock: PowerManager.WakeLock? = null
 
     /** Saved config for reconnect */
     private var cfgServer = ""
@@ -187,9 +217,11 @@ class GatewayService : Service() {
                 Log.i(TAG, "Network available")
                 logTransportIfChanged()
                 checkNetworkChanged()
+                refreshVoicePowerLease()
             }
             override fun onLost(network: Network) {
                 Log.i(TAG, "Network lost")
+                refreshVoicePowerLease()
                 // During an active GSM call, cellular data goes SUSPENDED which
                 // fires onLost.  This is normal Android behavior — do NOT tear
                 // down the bridge.  WiFi still carries SIP/RTP traffic.
@@ -214,6 +246,7 @@ class GatewayService : Service() {
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
                 logTransportIfChanged()
                 checkNetworkChanged()
+                refreshVoicePowerLease()
             }
         }
         val request = NetworkRequest.Builder()
@@ -372,43 +405,67 @@ class GatewayService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         clearStaleInitializing()
+        if (intent == null) {
+            val sessionPresent = CredentialStore.load(this) != null
+            val mayRestore = GatewayBackgroundPolicy.mayRestoreControl(
+                sessionPresent,
+                GatewayBackgroundRuntime.allowedRecovery(this),
+                GatewayBackgroundRuntime.userStopped(this)
+            )
+            if (mayRestore) {
+                if (startControlGateway()) return START_STICKY
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
+            if (!sessionPresent && GatewayBackgroundRuntime.allowedRecovery(this)) {
+                GatewayBackgroundRuntime.recordIssue(this, "Pair this device with the control server before background sync can resume")
+            }
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         when (intent?.action) {
             ACTION_START -> startGateway(intent)
             ACTION_CONTROL_START -> startControlGateway()
-            ACTION_STOP -> stopGateway()
+            ACTION_STOP -> stopGateway(userInitiated = true)
             ACTION_RELOAD_STATS -> reloadStats()
             ACTION_STATUS -> broadcastCurrentStatus()
             ACTION_RECONNECT -> {
+                if (!GatewayBackgroundRuntime.allowedRecovery(this)) {
+                    broadcastStatus("STOPPED", "Gateway stopped by user")
+                    if (sipClient == null) stopSelf(startId)
+                    return START_NOT_STICKY
+                }
                 // Tapping the offline pill should act immediately.  If there is
                 // a client, ask it to register now; if there is not, the
                 // gateway is down and needs bringing up.
                 val sip = sipClient
                 broadcastStatus("STARTING", "Retrying…")
-                if (sip != null && !stopped) {
+                if (sip != null && !stopped && voiceRuntimeStarted) {
                     sip.retryNow()
-                } else if (cfgServer.isEmpty()) {
-                    startControlGateway()
-                } else {
-                    // No client — a previous reconnect nulled it and never
-                    // finished.  Force a fresh one rather than letting the
-                    // init guard swallow the request.
+                } else if (voiceRuntimeStarted && !stopped) {
+                    // Retry only a voice runtime already started by the visible diagnostics flow.
                     initializing.set(false)
-                    stopped = false
                     reconnect()
+                } else {
+                    // The status pill retries control synchronization, never starts an idle microphone.
+                    startControlGateway()
                 }
             }
             ACTION_APPLY_CONFIG -> applyConfigChange()
             ACTION_SMS_SEND -> {
-                startControlGateway()
-                wakeControlLoop()
+                if (GatewayBackgroundRuntime.allowedRecovery(this)) {
+                    startControlGateway()
+                }
             }
             ACTION_SMS_REPORT -> {
-                startControlGateway()
-                wakeControlLoop()
+                if (GatewayBackgroundRuntime.allowedRecovery(this)) {
+                    startControlGateway()
+                }
             }
             ACTION_SMS_FLUSH -> {
-                startControlGateway()
-                wakeControlLoop()
+                if (GatewayBackgroundRuntime.allowedRecovery(this)) {
+                    startControlGateway()
+                }
             }
             ACTION_DIAL -> dialFromDialler(intent)
             ACTION_MUTE_AGENT -> {
@@ -435,14 +492,15 @@ class GatewayService : Service() {
                 updateNotification(NotifState.OK)
             }
             else -> {
-                val session = CredentialStore.load(this)
-                val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-                val sipConfigured = !prefs.getString("server", "").isNullOrBlank() &&
-                    !prefs.getString("user", "").isNullOrBlank()
-                if (session != null && !sipConfigured) startControlGateway() else startGateway(intent)
+                Log.w(TAG, "Ignoring unknown service action")
             }
         }
-        return START_STICKY
+        val mayRestoreControl = GatewayBackgroundPolicy.mayRestoreControl(
+            CredentialStore.load(this) != null,
+            GatewayBackgroundRuntime.allowedRecovery(this),
+            GatewayBackgroundRuntime.userStopped(this)
+        )
+        return if (foregroundStarted && mayRestoreControl) START_STICKY else START_NOT_STICKY
     }
 
     /**
@@ -455,6 +513,24 @@ class GatewayService : Service() {
      * nothing until the next restart.
      */
     private fun applyConfigChange() {
+        if (!GatewayBackgroundRuntime.allowedRecovery(this)) {
+            // A queued settings action must not undo an explicit stop or a
+            // Task Manager stop by rebuilding the SIP runtime.
+            stopGateway(userInitiated = false)
+            return
+        }
+        if (!voiceRuntimeStarted) {
+            // Saving SIP credentials configures the next visible voice start;
+            // it does not itself grant permission to start microphone mode.
+            if (CredentialStore.load(this) != null) {
+                startControlGateway()
+            } else {
+                broadcastLog("SIP config saved; voice mode remains off until started from the app")
+                broadcastStatus("PAIRING_REQUIRED", "Pair this phone with the control server")
+            }
+            return
+        }
+
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
         // Re-post first, so toggling the status bar setting takes effect now
         // rather than at the next restart -- the channel is chosen when the
@@ -505,7 +581,7 @@ class GatewayService : Service() {
 
     /** Wake an existing poller or launch it once. Network work always stays off UI/broadcast threads. */
     private fun startControlLoop() {
-        if (CredentialStore.load(this) == null) return
+        if (!GatewayBackgroundRuntime.allowedRecovery(this) || CredentialStore.load(this) == null) return
         controlStop = false
         if (!controlLoopActive.compareAndSet(false, true)) {
             if (controlWakeSignal.availablePermits() == 0) controlWakeSignal.release()
@@ -515,18 +591,46 @@ class GatewayService : Service() {
             var retryMs = CONTROL_INTERVAL_MS
             try {
                 while (!controlStop && !stopped) {
+                    if (!GatewayBackgroundRuntime.allowedRecovery(this@GatewayService)) break
+                    if (CredentialStore.load(this@GatewayService) == null) {
+                        GatewayBackgroundRuntime.updateConnection(this@GatewayService, "Not paired",
+                            "Pair this device with the control server before background sync can resume")
+                        break
+                    }
+                    var nextRetryMs = retryMs
                     try {
-                        syncControlPlaneOnce()
+                        if (!withNetworkSyncWakeLock { syncControlPlaneOnce() }) break
+                        GatewayBackgroundRuntime.markSyncSucceeded(this@GatewayService)
                         retryMs = CONTROL_INTERVAL_MS
                     } catch (e: ControlApiException) {
-                        broadcastLog("CONTROL: ${e.code}; retry scheduled")
                         retryMs = if (e.retryable) (retryMs * 2).coerceAtMost(CONTROL_MAX_RETRY_MS)
                         else CONTROL_INTERVAL_MS
+                        nextRetryMs = retryMs
+                        val delaySeconds = (nextRetryMs / 1000).coerceAtLeast(1)
+                        broadcastLog("CONTROL: ${e.code}; HTTPS retry in ${delaySeconds}s")
+                        GatewayBackgroundRuntime.recordIssue(this@GatewayService,
+                            if (e.code == "PAIRING_REQUIRED" || e.code == "SESSION_REVOKED")
+                                "Pair this device again to resume background sync"
+                            else "Control sync failed (${e.code}); retrying in ${delaySeconds}s")
+                        updateNotification(NotifState.WARN, "Gateway · retrying")
+                        if (e.code == "PAIRING_REQUIRED" || e.code == "SESSION_REVOKED") {
+                            GatewayBackgroundRuntime.updateConnection(this@GatewayService, "Not paired",
+                                "Pair this device again to resume background sync")
+                            if (sipClient == null) stopSelf()
+                            break
+                        }
                     } catch (_: Exception) {
-                        broadcastLog("CONTROL: sync failed; retry scheduled")
                         retryMs = (retryMs * 2).coerceAtMost(CONTROL_MAX_RETRY_MS)
+                        nextRetryMs = retryMs
+                        val delaySeconds = (nextRetryMs / 1000).coerceAtLeast(1)
+                        broadcastLog("CONTROL: HTTPS sync failed; retry in ${delaySeconds}s")
+                        GatewayBackgroundRuntime.recordIssue(this@GatewayService,
+                            "Control sync failed; retrying in ${delaySeconds}s")
+                        updateNotification(NotifState.WARN, "Gateway · retrying")
                     }
-                    if (!controlStop && !stopped) controlWakeSignal.tryAcquire(retryMs, TimeUnit.MILLISECONDS)
+                    if (!controlStop && !stopped && GatewayBackgroundRuntime.allowedRecovery(this@GatewayService)) {
+                        controlWakeSignal.tryAcquire(nextRetryMs, TimeUnit.MILLISECONDS)
+                    }
                 }
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
@@ -537,31 +641,234 @@ class GatewayService : Service() {
     }
 
     private fun wakeControlLoop() {
-        if (controlWakeSignal.availablePermits() == 0) controlWakeSignal.release()
+        if (!GatewayBackgroundRuntime.allowedRecovery(this)) return
+        if (controlLoopActive.get() && controlWakeSignal.availablePermits() == 0) controlWakeSignal.release()
         startControlLoop()
     }
 
-    private fun startControlGateway() {
+    private fun reconcileWakeConnection(session: CredentialStore.Session) {
+        if (!wakeRuntimeAllowed()) {
+            closeWakeConnection()
+            return
+        }
+        connectWakeSession(session)
+    }
+
+    private fun connectWakeSession(session: CredentialStore.Session) {
+        val identity = WakeSessionIdentity.from(session)
+        synchronized(wakeConnectionGuard) {
+            if (!wakeRuntimeAllowed()) return
+            val currentIdentity = wakeIdentity
+            if (wakeAuthBlocked && wakeAuthorizationTokenToRefresh == identity.tokenGeneration) {
+                GatewayBackgroundRuntime.updateConnection(this, "HTTPS polling · wake auth pending",
+                    "Wake authorization failed; HTTPS polling is waiting for token refresh")
+                return
+            }
+            if (currentIdentity == identity && wakeConnection != null) return
+
+            val tokenChanged = currentIdentity != identity
+            if (tokenChanged) {
+                wakeGeneration++
+                wakeIdentity = identity
+                wakeRetryMs = WAKE_RETRY_INITIAL_MS
+            }
+            wakeRetryFuture?.cancel(false)
+            wakeRetryFuture = null
+            wakeAuthBlocked = false
+            wakeAuthorizationTokenToRefresh = null
+            wakeConnection?.close()
+            wakeConnection = null
+            startWakeConnectionLocked(session, identity, wakeGeneration)
+        }
+    }
+
+    private fun startWakeConnectionLocked(
+        session: CredentialStore.Session,
+        identity: WakeSessionIdentity,
+        generation: Long
+    ) {
+        try {
+            wakeConnection = WakeConnection(session,
+                isCurrent = { isCurrentWake(generation, identity) },
+                listener = object : WakeConnection.Listener {
+                    override fun onOpen() {
+                        if (!isCurrentWake(generation, identity)) return
+                        synchronized(wakeConnectionGuard) {
+                            if (generation != wakeGeneration || identity != wakeIdentity) return
+                            wakeRetryMs = WAKE_RETRY_INITIAL_MS
+                            wakeRetryFuture?.cancel(false)
+                            wakeRetryFuture = null
+                        }
+                        GatewayBackgroundRuntime.updateConnection(this@GatewayService, "WSS connected · HTTPS polling")
+                        broadcastLog("CONTROL: WSS wake channel connected; HTTPS polling remains enabled")
+                        updateNotification(NotifState.OK, "Gateway · WSS connected")
+                    }
+
+                    override fun onSyncRequired() {
+                        if (isCurrentWake(generation, identity)) wakeControlLoop()
+                    }
+
+                    override fun onClosed(code: Int) {
+                        handleWakeDisconnect(generation, identity, closeCode = code)
+                    }
+
+                    override fun onFailure(httpStatus: Int?) {
+                        handleWakeDisconnect(generation, identity, httpStatus = httpStatus)
+                    }
+
+                    override fun onInvalidFrame() {
+                        handleWakeDisconnect(generation, identity, invalidFrame = true)
+                    }
+                })
+            GatewayBackgroundRuntime.updateConnection(this, "WSS connecting · HTTPS polling")
+            updateNotification(NotifState.WARN, "Gateway · connecting")
+        } catch (_: Exception) {
+            wakeConnection = null
+            GatewayBackgroundRuntime.recordIssue(this, "Wake channel could not be opened; HTTPS polling will continue")
+            scheduleWakeRetryLocked(generation, identity)
+        }
+    }
+
+    private fun isCurrentWake(generation: Long, identity: WakeSessionIdentity): Boolean {
+        val fenced = synchronized(wakeConnectionGuard) {
+            WakeConnectionPolicy.callbackIsCurrent(generation, wakeGeneration, identity, wakeIdentity)
+        }
+        if (!fenced || !wakeRuntimeAllowed()) return false
+        val currentSession = CredentialStore.load(this) ?: return false
+        return WakeSessionIdentity.from(currentSession) == identity
+    }
+
+    private fun handleWakeDisconnect(
+        generation: Long,
+        identity: WakeSessionIdentity,
+        httpStatus: Int? = null,
+        closeCode: Int? = null,
+        invalidFrame: Boolean = false
+    ) {
+        if (!isCurrentWake(generation, identity)) return
+        val authorizationFailure = WakeConnectionPolicy.requiresHttpsRefresh(httpStatus, closeCode)
+        val (oldConnection, retryGeneration) = synchronized(wakeConnectionGuard) {
+            if (generation != wakeGeneration || wakeIdentity != identity) return
+            val old = wakeConnection
+            wakeConnection = null
+            wakeGeneration++
+            if (authorizationFailure) {
+                wakeAuthBlocked = true
+                wakeAuthorizationTokenToRefresh = identity.tokenGeneration
+                wakeRetryFuture?.cancel(false)
+                wakeRetryFuture = null
+            }
+            old to wakeGeneration
+        }
+        oldConnection?.close()
+
+        if (authorizationFailure) {
+            GatewayBackgroundRuntime.updateConnection(this, "HTTPS reauth pending",
+                "Wake channel authorization expired; refreshing through HTTPS")
+            broadcastLog("CONTROL: WSS authorization expired; checking the session over HTTPS")
+            updateNotification(NotifState.WARN, "Gateway · HTTPS fallback")
+            wakeControlLoop()
+            return
+        }
+
+        val detail = when {
+            invalidFrame -> "Wake server sent an unsupported frame; HTTPS polling remains active"
+            httpStatus == 403 -> "Wake server rejected the connection; HTTPS polling remains active"
+            else -> "Wake channel disconnected; HTTPS polling remains active"
+        }
+        GatewayBackgroundRuntime.updateConnection(this, "HTTPS polling · WSS retrying", detail)
+        broadcastLog("CONTROL: WSS disconnected; HTTPS polling continues")
+        updateNotification(NotifState.WARN, "Gateway · retrying")
+        scheduleWakeRetry(retryGeneration, identity)
+    }
+
+    private fun scheduleWakeRetry(generation: Long, identity: WakeSessionIdentity) {
+        synchronized(wakeConnectionGuard) { scheduleWakeRetryLocked(generation, identity) }
+    }
+
+    private fun scheduleWakeRetryLocked(generation: Long, identity: WakeSessionIdentity) {
+        if (generation != wakeGeneration || identity != wakeIdentity || wakeAuthBlocked ||
+            wakeRetryFuture != null || !wakeRuntimeAllowed()
+        ) return
+        val baseDelay = wakeRetryMs
+        wakeRetryMs = (wakeRetryMs * 2).coerceAtMost(WAKE_RETRY_MAX_MS)
+        val jitteredDelay = (baseDelay * ThreadLocalRandom.current().nextDouble(0.8, 1.2)).toLong()
+            .coerceAtLeast(1_000L)
+        GatewayBackgroundRuntime.updateConnection(this, "HTTPS polling · WSS retrying")
+        broadcastLog("CONTROL: WSS retry scheduled in ${jitteredDelay / 1000}s")
+        wakeRetryFuture = try {
+            wakeRetryScheduler.schedule({
+                synchronized(wakeConnectionGuard) {
+                    if (generation != wakeGeneration || identity != wakeIdentity) return@schedule
+                    wakeRetryFuture = null
+                }
+                if (!wakeRuntimeAllowed()) return@schedule
+                val session = CredentialStore.load(this) ?: return@schedule
+                connectWakeSession(session)
+            }, jitteredDelay, TimeUnit.MILLISECONDS)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun closeWakeConnection() {
+        synchronized(wakeConnectionGuard) {
+            wakeGeneration++
+            wakeRetryFuture?.cancel(false)
+            wakeRetryFuture = null
+            wakeAuthBlocked = false
+            wakeAuthorizationTokenToRefresh = null
+            wakeIdentity = null
+            wakeConnection?.close()
+            wakeConnection = null
+        }
+        GatewayBackgroundRuntime.updateConnection(this, "Stopped")
+    }
+
+    private fun wakeRuntimeAllowed(): Boolean =
+        !controlStop && !stopped && foregroundStarted && GatewayBackgroundRuntime.allowedRecovery(this)
+
+    private fun startControlGateway(): Boolean {
+        if (!GatewayBackgroundRuntime.allowedRecovery(this)) {
+            broadcastStatus("STOPPED", "Gateway stopped by user")
+            if (sipClient == null) stopSelf()
+            return false
+        }
         val session = CredentialStore.load(this)
         if (session == null) {
+            GatewayBackgroundRuntime.updateConnection(this, "Not paired",
+                "Pair this device with the control server before background sync can resume")
             broadcastStatus("PAIRING_REQUIRED", "Pair this phone with the control server")
             if (sipClient == null) stopSelf()
-            return
+            return false
         }
         stopped = false
+        val wasForegroundStarted = foregroundStarted
         val callActive = orchestrator?.bridgeState?.let { it != CallOrchestrator.BridgeState.IDLE } ?: false
         try {
-            startForegroundMode(callActive = callActive, status = if (callActive) "In-Call · syncing" else "Gateway syncing")
+            val mediaModeAllowed = callActive && voiceRuntimeStarted
+            val status = if (mediaModeAllowed) "In-Call · syncing" else "Gateway syncing"
+            if (mediaModeAllowed && foregroundStarted) setForegroundCallMode(true, status)
+            else startForegroundMode(callActive = false, status = status)
+            GatewayBackgroundRuntime.markServiceStarted(this, "HTTPS polling · WSS connecting")
         } catch (e: Exception) {
-            foregroundStarted = false
-            callMicrophoneForegroundActive = false
+            if (!wasForegroundStarted) {
+                foregroundStarted = false
+                callMicrophoneForegroundActive = false
+            }
             broadcastLog("CONTROL: foreground service unavailable (${e.javaClass.simpleName})")
+            GatewayBackgroundRuntime.recordIssue(this,
+                "Android refused the foreground service start; open the app and retry")
             broadcastStatus("CONTROL_START_FAILED", "Foreground service start failed")
-            stopSelf()
-            return
+            if (sipClient == null) {
+                stopSelf()
+                GatewayBackgroundRuntime.markServiceStopped(this)
+            }
+            return false
         }
         broadcastLog("CONTROL: paired gateway session active")
-        wakeControlLoop()
+        startControlLoop()
+        return true
     }
 
     private fun startForegroundMode(callActive: Boolean, status: String) {
@@ -591,7 +898,26 @@ class GatewayService : Service() {
 
     private fun setForegroundCallMode(callActive: Boolean, status: String) {
         if (!foregroundStarted) return
-        startForegroundMode(callActive, status)
+        if (!callActive) {
+            startForegroundMode(false, status)
+            return
+        }
+        val audioPermissionGranted = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        val ownsCallRole = checkSelfPermission(android.Manifest.permission.MANAGE_OWN_CALLS) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (!voiceRuntimeStarted || !audioPermissionGranted || !ownsCallRole) {
+            startForegroundMode(false, status)
+            val reason = when {
+                !voiceRuntimeStarted -> "Open the app and start voice mode before calls can use the microphone"
+                !audioPermissionGranted -> "Grant microphone permission in the app before voice calls"
+                else -> "Restore the phone-call role or permission before voice calls"
+            }
+            GatewayBackgroundRuntime.recordIssue(this, reason)
+            broadcastLog("CALL: microphone foreground mode is not permitted yet")
+            return
+        }
+        startForegroundMode(true, status)
     }
 
     private fun syncControlPlaneOnce() {
@@ -641,6 +967,8 @@ class GatewayService : Service() {
             broadcastLog("CONTROL: durably acknowledged ${acked.size} event(s)")
         }
         processCommands(client, database)
+        val latest = CredentialStore.load(this)
+        if (latest != null) reconcileWakeConnection(latest)
     }
 
     private fun flushSmsRedactions(database: GatewayDatabase) {
@@ -874,6 +1202,13 @@ class GatewayService : Service() {
     }
 
     private fun startGateway(intent: Intent?) {
+        if (!GatewayBackgroundPolicy.mayRestoreVoice(intent?.action, sipConfigured = true, explicitStartAction = ACTION_START) ||
+            !GatewayBackgroundRuntime.allowedRecovery(this)
+        ) {
+            Log.w(TAG, "Ignoring voice startup without a current visible start opt-in")
+            startControlGateway()
+            return
+        }
         // Guard: if the gateway is already running (SIP client exists and
         // we're not in stopped state), don't tear it down and restart.
         // This prevents redundant ACTION_START intents (e.g. from the
@@ -924,6 +1259,8 @@ class GatewayService : Service() {
         val password = intent?.getStringExtra(EXTRA_PASS) ?: prefs.getString("pass", "") ?: ""
 
         if (server.isEmpty() || username.isEmpty()) {
+            voiceRuntimeStarted = false
+            refreshVoicePowerLease()
             cfgServer = ""
             cfgUser = ""
             cfgPass = ""
@@ -958,11 +1295,23 @@ class GatewayService : Service() {
         cfgPort = port
         cfgUser = username
         cfgPass = password
-        startControlLoop()
+        voiceRuntimeStarted = true
 
         notifStatusText = "Connecting"
-        startForegroundMode(callActive = false, status = "Connecting")
-        acquireLocks()
+        try {
+            startForegroundMode(callActive = false, status = "Connecting")
+            GatewayBackgroundRuntime.markServiceStarted(this, "SIP connecting · HTTPS polling")
+        } catch (e: Exception) {
+            voiceRuntimeStarted = false
+            releaseVoicePowerLeases()
+            GatewayBackgroundRuntime.recordIssue(this,
+                "Android refused the foreground service start; open the app and retry")
+            broadcastStatus("VOICE_START_FAILED", "Foreground service start failed")
+            stopGateway(userInitiated = false)
+            return
+        }
+        refreshVoicePowerLease()
+        startControlLoop()
         initializing.set(true)
         initializingSince = System.currentTimeMillis()
 
@@ -980,7 +1329,8 @@ class GatewayService : Service() {
     /** Shared SIP init — called from both startGateway and reconnect threads. */
     private fun initSipClient(gen: Int) {
         /** True while this thread is still the newest bring-up. */
-        fun current() = gen == initGeneration.get()
+        fun current() = gen == initGeneration.get() && !stopped &&
+            GatewayBackgroundRuntime.allowedRecovery(this)
 
         if (!current()) {
             Log.w(TAG, "initSipClient: superseded before start (gen $gen)")
@@ -1142,10 +1492,14 @@ class GatewayService : Service() {
                 }
                 updateNotification(notifState, statusText)
                 try {
-                    setForegroundCallMode(state != CallOrchestrator.BridgeState.IDLE, statusText)
+                    val callActive = state != CallOrchestrator.BridgeState.IDLE && voiceRuntimeStarted
+                    setForegroundCallMode(callActive, statusText)
                 } catch (e: Exception) {
                     broadcastLog("CALL: foreground service mode failed (${e.javaClass.simpleName})")
+                    GatewayBackgroundRuntime.recordIssue(this@GatewayService,
+                        "Android did not allow microphone foreground access; reopen the app to start voice calls")
                 }
+                refreshVoicePowerLease()
                 broadcastStatus(state.name, info)
             }
 
@@ -1190,28 +1544,45 @@ class GatewayService : Service() {
 
     @Volatile private var stopped = false
 
-    private fun stopGateway() {
+    private fun stopGateway(userInitiated: Boolean = false) {
+        if (userInitiated) GatewayBackgroundRuntime.persistUserStop(this)
+        val wasAlreadyStopped = stopped
+        stopped = true
+        // Fence a SIP init/reconnect that is still doing blocking setup. A
+        // later explicit start receives a new generation from startGateway.
+        initGeneration.incrementAndGet()
+        initializing.set(false)
         controlStop = true
         controlWakeSignal.release()
-        if (stopped) return
-        stopped = true
+        releaseNetworkSyncWakeLock()
+        closeWakeConnection()
+        voiceRuntimeStarted = false
+        releaseVoicePowerLeases()
+        if (wasAlreadyStopped) {
+            GatewayBackgroundRuntime.markServiceStopped(this,
+                userInitiated = GatewayBackgroundRuntime.userStopped(this))
+            return
+        }
         onlineSince = 0L
         Log.i(TAG, "Stopping gateway")
         orchestrator?.stop()
         sipClient?.stop()
         orchestrator = null
         sipClient = null
-        releaseLocks()
         stopForeground(STOP_FOREGROUND_REMOVE)
         foregroundStarted = false
         callMicrophoneForegroundActive = false
+        GatewayBackgroundRuntime.markServiceStopped(this,
+            userInitiated = GatewayBackgroundRuntime.userStopped(this))
         stopSelf()
-        broadcastStatus("STOPPED", "Gateway stopped")
+        broadcastStatus("STOPPED", if (GatewayBackgroundRuntime.userStopped(this)) "Gateway stopped by user" else "Gateway service stopped")
     }
 
     override fun onDestroy() {
         unregisterNetworkCallback()
-        stopGateway()
+        stopGateway(userInitiated = false)
+        powerLeaseScheduler.shutdownNow()
+        wakeRetryScheduler.shutdownNow()
         super.onDestroy()
     }
 
@@ -1339,24 +1710,159 @@ class GatewayService : Service() {
 
     // ── Wake / WiFi locks ───────────────────────────────
 
-    private fun acquireLocks() {
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "gateway:sip").apply {
-            acquire()
+    /** A short, timed CPU lease around one blocking HTTPS synchronization. */
+    private fun withNetworkSyncWakeLock(block: () -> Unit): Boolean {
+        val lock = try {
+            (getSystemService(Context.POWER_SERVICE) as PowerManager)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "gateway:control-sync")
+                .apply { setReferenceCounted(false) }
+        } catch (_: Exception) {
+            null
         }
-
-        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "gateway:wifi").apply {
-            acquire()
+        var acquired = false
+        var mayRun = false
+        try {
+            synchronized(syncWakeLockGuard) {
+                if (!controlStop && !stopped && GatewayBackgroundRuntime.allowedRecovery(this)) {
+                    mayRun = true
+                    if (lock != null) {
+                        try {
+                            lock.acquire(GatewayBackgroundPolicy.SYNC_WAKE_TIMEOUT_MS)
+                            syncWakeLock = lock
+                            acquired = true
+                        } catch (_: Exception) {
+                            Log.w(TAG, "Could not acquire a short control-sync wake lease")
+                        }
+                    }
+                }
+            }
+            if (mayRun) block()
+        } finally {
+            if (acquired) synchronized(syncWakeLockGuard) {
+                if (syncWakeLock === lock) syncWakeLock = null
+                if (lock?.isHeld == true) runCatching { lock.release() }
+            }
         }
-        Log.i(TAG, "Wake + WiFi locks acquired")
+        return mayRun
     }
 
-    private fun releaseLocks() {
-        wakeLock?.let { if (it.isHeld) it.release() }
-        wifiLock?.let { if (it.isHeld) it.release() }
-        wakeLock = null
-        wifiLock = null
+    private fun releaseNetworkSyncWakeLock() {
+        synchronized(syncWakeLockGuard) {
+            syncWakeLock?.let { if (it.isHeld) runCatching { it.release() } }
+            syncWakeLock = null
+        }
+    }
+
+    /** Control-only polling takes no lease; active calls renew bounded leases. */
+    private fun refreshVoicePowerLease() {
+        val callActive = orchestrator?.bridgeState?.let { it != CallOrchestrator.BridgeState.IDLE } ?: false
+        val wanted = GatewayBackgroundPolicy.holdVoiceLease(voiceRuntimeStarted, callActive)
+        synchronized(powerLeaseGuard) {
+            if (!wanted) {
+                if (!voiceLeaseWanted && voiceWakeLock == null && voiceWifiLock == null) return
+                voiceLeaseWanted = false
+                voiceLeaseGeneration++
+                voiceLeaseFuture?.cancel(false)
+                voiceLeaseFuture = null
+                wifiLeaseFuture?.cancel(false)
+                wifiLeaseFuture = null
+                releaseVoiceLocksLocked()
+                return
+            }
+            val wifiWanted = isWifiTransportActive()
+            val hasWifiLock = voiceWifiLock?.isHeld == true
+            if (voiceLeaseFuture != null && voiceWakeLock?.isHeld == true && wifiWanted == hasWifiLock) return
+            voiceLeaseWanted = true
+            renewVoicePowerLeaseLocked()
+        }
+    }
+
+    private fun renewVoicePowerLeaseLocked() {
+        voiceLeaseGeneration++
+        val generation = voiceLeaseGeneration
+        voiceLeaseFuture?.cancel(false)
+        wifiLeaseFuture?.cancel(false)
+        releaseVoiceLocksLocked()
+        if (!voiceLeaseWanted) return
+
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            voiceWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "gateway:voice-lease").apply {
+                setReferenceCounted(false)
+                acquire(GatewayBackgroundPolicy.VOICE_WAKE_LEASE_TIMEOUT_MS)
+            }
+        } catch (_: Exception) {
+            voiceWakeLock = null
+            GatewayBackgroundRuntime.recordIssue(this, "Android could not grant a temporary voice CPU lease")
+        }
+
+        if (isWifiTransportActive()) {
+            var acquiredWifiLock: WifiManager.WifiLock? = null
+            try {
+                val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                acquiredWifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "gateway:voice-wifi").apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+                voiceWifiLock = acquiredWifiLock
+                // WifiLock has no timed acquire overload, so every acquisition
+                // gets an explicit bounded release task immediately.
+                wifiLeaseFuture = powerLeaseScheduler.schedule({
+                    synchronized(powerLeaseGuard) {
+                        if (generation == voiceLeaseGeneration) {
+                            releaseWifiLockLocked()
+                            wifiLeaseFuture = null
+                        }
+                    }
+                }, GatewayBackgroundPolicy.WIFI_LOCK_MAX_LEASE_MS, TimeUnit.MILLISECONDS)
+            } catch (_: Exception) {
+                acquiredWifiLock?.let { if (it.isHeld) runCatching { it.release() } }
+                voiceWifiLock = null
+                wifiLeaseFuture = null
+            }
+        }
+
+        voiceLeaseFuture = try {
+            powerLeaseScheduler.schedule({
+                synchronized(powerLeaseGuard) {
+                    if (generation == voiceLeaseGeneration && voiceLeaseWanted) renewVoicePowerLeaseLocked()
+                }
+            }, GatewayBackgroundPolicy.VOICE_WAKE_RENEW_MS, TimeUnit.MILLISECONDS)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun releaseVoicePowerLeases() {
+        synchronized(powerLeaseGuard) {
+            voiceLeaseWanted = false
+            voiceLeaseGeneration++
+            voiceLeaseFuture?.cancel(false)
+            voiceLeaseFuture = null
+            wifiLeaseFuture?.cancel(false)
+            wifiLeaseFuture = null
+            releaseVoiceLocksLocked()
+        }
+    }
+
+    private fun releaseVoiceLocksLocked() {
+        voiceWakeLock?.let { if (it.isHeld) runCatching { it.release() } }
+        voiceWifiLock?.let { if (it.isHeld) runCatching { it.release() } }
+        voiceWakeLock = null
+        voiceWifiLock = null
+    }
+
+    private fun releaseWifiLockLocked() {
+        voiceWifiLock?.let { if (it.isHeld) runCatching { it.release() } }
+        voiceWifiLock = null
+    }
+
+    private fun isWifiTransportActive(): Boolean = try {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val network = cm.activeNetwork
+        cm.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+    } catch (_: Exception) {
+        false
     }
 
     // ── Broadcast to MainActivity ────────────────────────
@@ -1513,6 +2019,8 @@ class GatewayService : Service() {
 
         private const val CONTROL_INTERVAL_MS = 30_000L
         private const val CONTROL_MAX_RETRY_MS = 5 * 60_000L
+        private const val WAKE_RETRY_INITIAL_MS = 2_000L
+        private const val WAKE_RETRY_MAX_MS = 5 * 60_000L
         private val callRecoveryDone = AtomicBoolean(false)
 
         /**
@@ -1525,6 +2033,7 @@ class GatewayService : Service() {
         /** A send result or delivery report landed — let the service tell the
          *  server about it. */
         fun reportSmsProgress(context: Context, id: String) {
+            if (!GatewayBackgroundRuntime.allowedRecovery(context) || CredentialStore.load(context) == null) return
             val intent = Intent(context, GatewayService::class.java).apply {
                 action = ACTION_SMS_REPORT
                 putExtra(EXTRA_SMS_ID, id)
@@ -1537,6 +2046,7 @@ class GatewayService : Service() {
         }
 
         fun deliverQueuedSms(context: Context) {
+            if (!GatewayBackgroundRuntime.allowedRecovery(context) || CredentialStore.load(context) == null) return
             val intent = Intent(context, GatewayService::class.java).apply {
                 action = ACTION_SMS_FLUSH
             }
@@ -1547,16 +2057,22 @@ class GatewayService : Service() {
             }
         }
 
-        fun startControl(context: Context) {
+        fun startControl(context: Context): Boolean {
+            if (!GatewayBackgroundRuntime.allowedRecovery(context) || CredentialStore.load(context) == null) return false
             val intent = Intent(context, GatewayService::class.java).apply { action = ACTION_CONTROL_START }
             try {
                 context.startForegroundService(intent)
+                return true
             } catch (_: Exception) {
                 Log.w(TAG, "Could not start control service")
+                GatewayBackgroundRuntime.recordIssue(context,
+                    "Android did not allow the foreground service to start; open the app and retry")
+                return false
             }
         }
 
-        fun start(context: Context, server: String, port: Int, user: String, pass: String) {
+        fun start(context: Context, server: String, port: Int, user: String, pass: String): Boolean {
+            if (!GatewayBackgroundRuntime.recordExplicitEnable(context)) return false
             val intent = Intent(context, GatewayService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_SERVER, server)
@@ -1564,14 +2080,20 @@ class GatewayService : Service() {
                 putExtra(EXTRA_USER, user)
                 putExtra(EXTRA_PASS, pass)
             }
-            context.startForegroundService(intent)
+            return try {
+                context.startForegroundService(intent)
+                true
+            } catch (_: Exception) {
+                GatewayBackgroundRuntime.recordIssue(context,
+                    "Android did not allow the voice foreground service to start; open the app and retry")
+                false
+            }
         }
 
-        fun stop(context: Context) {
-            val intent = Intent(context, GatewayService::class.java).apply {
-                action = ACTION_STOP
-            }
-            context.startService(intent)
+        fun stop(context: Context): Boolean {
+            if (!GatewayBackgroundRuntime.persistUserStop(context)) return false
+            return context.stopService(Intent(context, GatewayService::class.java))
         }
+
     }
 }

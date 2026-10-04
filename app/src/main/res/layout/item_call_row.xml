@@ -31,7 +31,7 @@
             android:layout_height="wrap_content"
             android:textSize="16sp"
             android:textStyle="bold"
-            android:textColor="@color/text_primary"
+            android:textColor="?attr/colorOnSurface"
             android:singleLine="true"
             android:ellipsize="end" />
 
@@ -40,7 +40,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:textSize="13sp"
-            android:textColor="@color/text_secondary"
+            android:textColor="?attr/colorOnSurfaceVariant"
             android:singleLine="true"
             android:ellipsize="end" />
     </LinearLayout>
@@ -57,13 +57,13 @@
             android:layout_height="wrap_content"
             android:textSize="14sp"
             android:textStyle="bold"
-            android:textColor="#34D399" />
+            android:textColor="?attr/colorPrimary" />
 
         <TextView
             android:id="@+id/tvRowTime"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:textSize="12sp"
-            android:textColor="@color/text_secondary" />
+            android:textColor="?attr/colorOnSurfaceVariant" />
     </LinearLayout>
 </LinearLayout>

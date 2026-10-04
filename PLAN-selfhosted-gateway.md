@@ -137,3 +137,7 @@ SIM account映射优先使用目标Android版本支持的Telephony/Telecom关联
 PhoneAccountHandle.id、不使用默认卡、不把探测当成实际通话验收。
 设备记录是后续验证证据，音频默认按实际 Rx/Tx 端点配置，历史机型 preset
 只允许显式本地选择。具体接口见 [Magisk runtime](docs/magisk-runtime.md)。
+
+## 当前 UI 与后台同步实施
+
+两端已采用 Material 3 Expressive Views；网关 WSS 唤醒进入现有 HTTPS 控制循环，空闲 specialUse FGS 与用户停止/恢复规则见 [Android UI 与后台运行](docs/android-ui-and-background.md)。主机新增用户开启的后台短信同步和隐私通知。FCM、真实休眠来电和完整三端通话仍按原里程碑验证。

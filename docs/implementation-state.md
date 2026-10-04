@@ -1,9 +1,9 @@
 # 首批三端实施状态
 
-权威服务端协议固定为 `56f55f77a4840f0e6797a1765165db601f7c08b4`：
-[wire addendum](https://github.com/KiriKira/gsm2sip-server/blob/56f55f77a4840f0e6797a1765165db601f7c08b4/docs/server-wire-addendum.md)、
-[OpenAPI](https://github.com/KiriKira/gsm2sip-server/blob/56f55f77a4840f0e6797a1765165db601f7c08b4/openapi/openapi.yaml) 与
-[fixture](https://github.com/KiriKira/gsm2sip-server/tree/56f55f77a4840f0e6797a1765165db601f7c08b4/fixtures/api)。
+权威服务端协议固定为 `42f1b3c2c26a9eda018e7baa9d365f97f5bfcfec`：
+[wire addendum](https://github.com/KiriKira/gsm2sip-server/blob/42f1b3c2c26a9eda018e7baa9d365f97f5bfcfec/docs/server-wire-addendum.md)、
+[OpenAPI](https://github.com/KiriKira/gsm2sip-server/blob/42f1b3c2c26a9eda018e7baa9d365f97f5bfcfec/openapi/openapi.yaml) 与
+[fixture](https://github.com/KiriKira/gsm2sip-server/tree/42f1b3c2c26a9eda018e7baa9d365f97f5bfcfec/fixtures/api)。
 原计划仍是三个仓库的完整验收目标；首批完成 M1/M2 短信基础，后续按
 用户要求增加 [Magisk 通用能力适配](magisk-runtime.md)，继续推进通话基础。
 
@@ -41,6 +41,8 @@ SIP 子集不支持 auth-int、Digest sess、DTLS-SRTP、SRTCP 或 rekey；
 RFC 4733 桥接目前是接收 RTP 事件后向 Telecom 发送 DTMF。完整通话
 必须按计划做取消/超时/重连、两卡音频及主机打断等联调。
 
-WSS/FCM、通知、完整背压与长期留存尚待后续实施。旧机的隔离事件/
-未知任务不会删除或重发，需后续管理界面和保留策略；主机本批仅前台
-HTTPS 同步。当前 debug APK 和本地 Compose 都不是公网生产部署。
+两端现采用 [Material 3 Expressive 与后台运行设置](android-ui-and-background.md)。
+WSS 唤醒、HTTPS 补齐、用户停止/开机恢复与主机后台短信通知已落代码；
+FCM、完整背压与长期留存尚待实施。旧机隔离事件/未知任务不会删除或
+重发，需后续管理界面和保留策略。当前 debug APK 和本地 Docker Compose
+均待真机验收，也没有部署公网生产服务。

@@ -7,7 +7,7 @@
     android:layout_height="wrap_content"
     android:orientation="vertical">
 
-    <EditText
+    <com.google.android.material.textfield.TextInputEditText
         android:id="@+id/etSimNumber"
         style="@style/CfgField"
         android:hint="international, e.g. +4915112345678"
@@ -18,7 +18,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:textSize="11sp"
-        android:textColor="@color/text_hint"
+        android:textColor="?attr/colorOutline"
         android:paddingTop="2dp"
         android:paddingBottom="4dp" />
 

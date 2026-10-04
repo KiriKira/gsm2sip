@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content">
 
@@ -18,7 +19,7 @@
             android:text="GSM"
             android:textSize="13sp"
             android:textStyle="bold"
-            android:textColor="@color/primary" />
+            android:textColor="?attr/colorPrimary" />
 
         <!-- Network -->
         <LinearLayout
@@ -31,7 +32,7 @@
                 android:layout_height="wrap_content"
                 android:text="Network"
                 android:textSize="13sp"
-                android:textColor="@color/text_label" />
+                android:textColor="?attr/colorOnSurfaceVariant" />
             <TextView
                 android:id="@+id/tvGsmNetwork"
                 android:layout_width="0dp"
@@ -39,7 +40,7 @@
                 android:layout_weight="1"
                 android:text="—"
                 android:textSize="13sp"
-                android:textColor="@color/text_primary" />
+                android:textColor="?attr/colorOnSurface" />
         </LinearLayout>
 
         <!-- Network Type -->
@@ -53,7 +54,7 @@
                 android:layout_height="wrap_content"
                 android:text="Type"
                 android:textSize="13sp"
-                android:textColor="@color/text_label" />
+                android:textColor="?attr/colorOnSurfaceVariant" />
             <TextView
                 android:id="@+id/tvNetworkType"
                 android:layout_width="0dp"
@@ -61,7 +62,7 @@
                 android:layout_weight="1"
                 android:text="—"
                 android:textSize="13sp"
-                android:textColor="@color/text_primary" />
+                android:textColor="?attr/colorOnSurface" />
         </LinearLayout>
 
         <!-- Signal -->
@@ -75,7 +76,7 @@
                 android:layout_height="wrap_content"
                 android:text="Signal"
                 android:textSize="13sp"
-                android:textColor="@color/text_label" />
+                android:textColor="?attr/colorOnSurfaceVariant" />
             <TextView
                 android:id="@+id/tvGsmSignal"
                 android:layout_width="0dp"
@@ -83,7 +84,7 @@
                 android:layout_weight="1"
                 android:text="—"
                 android:textSize="13sp"
-                android:textColor="@color/text_primary" />
+                android:textColor="?attr/colorOnSurface" />
         </LinearLayout>
 
         <!-- Cell ID -->
@@ -97,7 +98,7 @@
                 android:layout_height="wrap_content"
                 android:text="Cell ID"
                 android:textSize="13sp"
-                android:textColor="@color/text_label" />
+                android:textColor="?attr/colorOnSurfaceVariant" />
             <TextView
                 android:id="@+id/tvCellId"
                 android:layout_width="0dp"
@@ -105,7 +106,7 @@
                 android:layout_weight="1"
                 android:text="—"
                 android:textSize="13sp"
-                android:textColor="@color/text_primary" />
+                android:textColor="?attr/colorOnSurface" />
         </LinearLayout>
 
         <!-- IMEI -->
@@ -119,7 +120,7 @@
                 android:layout_height="wrap_content"
                 android:text="IMEI"
                 android:textSize="13sp"
-                android:textColor="@color/text_label" />
+                android:textColor="?attr/colorOnSurfaceVariant" />
             <TextView
                 android:id="@+id/tvImei"
                 android:layout_width="0dp"
@@ -127,7 +128,7 @@
                 android:layout_weight="1"
                 android:text="—"
                 android:textSize="13sp"
-                android:textColor="@color/text_primary" />
+                android:textColor="?attr/colorOnSurface" />
         </LinearLayout>
 
         <!-- Phone Number -->
@@ -141,7 +142,7 @@
                 android:layout_height="wrap_content"
                 android:text="Phone"
                 android:textSize="13sp"
-                android:textColor="@color/text_label" />
+                android:textColor="?attr/colorOnSurfaceVariant" />
             <TextView
                 android:id="@+id/tvPhoneNumber"
                 android:layout_width="0dp"
@@ -149,14 +150,14 @@
                 android:layout_weight="1"
                 android:text="—"
                 android:textSize="13sp"
-                android:textColor="@color/text_primary" />
+                android:textColor="?attr/colorOnSurface" />
         </LinearLayout>
 
         <!-- Divider -->
         <View
             android:layout_width="match_parent"
             android:layout_height="1dp"
-            android:background="@color/border_card"
+            android:background="?attr/colorOutlineVariant"
             android:layout_marginVertical="8dp" />
 
         <!-- WiFi Section -->
@@ -166,7 +167,7 @@
             android:text="WiFi"
             android:textSize="13sp"
             android:textStyle="bold"
-            android:textColor="@color/primary" />
+            android:textColor="?attr/colorPrimary" />
 
         <!-- WiFi Network -->
         <LinearLayout
@@ -179,7 +180,7 @@
                 android:layout_height="wrap_content"
                 android:text="Network"
                 android:textSize="13sp"
-                android:textColor="@color/text_label" />
+                android:textColor="?attr/colorOnSurfaceVariant" />
             <TextView
                 android:id="@+id/tvWifiNetwork"
                 android:layout_width="0dp"
@@ -187,7 +188,7 @@
                 android:layout_weight="1"
                 android:text="—"
                 android:textSize="13sp"
-                android:textColor="@color/text_primary" />
+                android:textColor="?attr/colorOnSurface" />
         </LinearLayout>
 
         <!-- WiFi Band -->
@@ -201,7 +202,7 @@
                 android:layout_height="wrap_content"
                 android:text="Band"
                 android:textSize="13sp"
-                android:textColor="@color/text_label" />
+                android:textColor="?attr/colorOnSurfaceVariant" />
             <TextView
                 android:id="@+id/tvWifiType"
                 android:layout_width="0dp"
@@ -209,7 +210,7 @@
                 android:layout_weight="1"
                 android:text="—"
                 android:textSize="13sp"
-                android:textColor="@color/text_primary" />
+                android:textColor="?attr/colorOnSurface" />
         </LinearLayout>
 
         <!-- WiFi Signal -->
@@ -223,7 +224,7 @@
                 android:layout_height="wrap_content"
                 android:text="Signal"
                 android:textSize="13sp"
-                android:textColor="@color/text_label" />
+                android:textColor="?attr/colorOnSurfaceVariant" />
             <TextView
                 android:id="@+id/tvWifiSignal"
                 android:layout_width="0dp"
@@ -231,7 +232,7 @@
                 android:layout_weight="1"
                 android:text="—"
                 android:textSize="13sp"
-                android:textColor="@color/text_primary" />
+                android:textColor="?attr/colorOnSurface" />
         </LinearLayout>
 
         <!-- WiFi IP -->
@@ -245,7 +246,7 @@
                 android:layout_height="wrap_content"
                 android:text="Local IP"
                 android:textSize="13sp"
-                android:textColor="@color/text_label" />
+                android:textColor="?attr/colorOnSurfaceVariant" />
             <TextView
                 android:id="@+id/tvWifiIp"
                 android:layout_width="0dp"
@@ -253,14 +254,14 @@
                 android:layout_weight="1"
                 android:text="—"
                 android:textSize="13sp"
-                android:textColor="@color/text_primary" />
+                android:textColor="?attr/colorOnSurface" />
         </LinearLayout>
 
         <!-- Divider -->
         <View
             android:layout_width="match_parent"
             android:layout_height="1dp"
-            android:background="@color/border_card"
+            android:background="?attr/colorOutlineVariant"
             android:layout_marginVertical="8dp" />
 
         <!-- IP Section -->
@@ -270,7 +271,7 @@
             android:text="Internet"
             android:textSize="13sp"
             android:textStyle="bold"
-            android:textColor="@color/primary" />
+            android:textColor="?attr/colorPrimary" />
 
         <!-- Public IP -->
         <LinearLayout
@@ -283,7 +284,7 @@
                 android:layout_height="wrap_content"
                 android:text="Public IP"
                 android:textSize="13sp"
-                android:textColor="@color/text_label" />
+                android:textColor="?attr/colorOnSurfaceVariant" />
             <TextView
                 android:id="@+id/tvPublicIp"
                 android:layout_width="0dp"
@@ -291,25 +292,25 @@
                 android:layout_weight="1"
                 android:text="detecting…"
                 android:textSize="13sp"
-                android:textColor="@color/text_primary" />
+                android:textColor="?attr/colorOnSurface" />
         </LinearLayout>
 
         <!-- Divider -->
         <View
             android:layout_width="match_parent"
             android:layout_height="1dp"
-            android:background="@color/border_card"
+            android:background="?attr/colorOutlineVariant"
             android:layout_marginVertical="8dp" />
 
         <!-- Check Support Button -->
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnCheckSupport"
             android:layout_width="match_parent"
-            android:layout_height="40dp"
+            android:layout_height="48dp"
             android:text="Check Gateway Support"
             android:textSize="13sp"
-            android:textColor="#FFFFFF"
-            android:backgroundTint="@color/primary"
+            android:textColor="?attr/colorOnPrimary"
+            app:backgroundTint="?attr/colorPrimary"
             android:layout_marginTop="4dp" />
 
         <!-- Check Results Container (populated dynamically) -->

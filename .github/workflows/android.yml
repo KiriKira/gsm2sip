@@ -22,7 +22,7 @@ jobs:
         with:
           go-version: '1.27.1'
           cache: false
-      - run: sdkmanager 'platforms;android-34' 'build-tools;34.0.0'
+      - run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
       - run: bash gradlew :app:testDebugUnitTest :app:assembleDebug :app:lintDebug --no-daemon
       - run: bash -n build.sh tools/check-device.sh magisk/install.sh magisk/service.sh
       - run: sh tools/test-magisk-runtime.sh

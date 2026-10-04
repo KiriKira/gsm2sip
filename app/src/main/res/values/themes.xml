@@ -1,50 +1,73 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.SipGsmGateway" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <item name="colorPrimary">@color/primary</item>
-        <item name="colorPrimaryVariant">@color/primary_dark</item>
-        <item name="colorOnPrimary">#FFFFFF</item>
-        <item name="colorSecondary">@color/primary</item>
-        <item name="colorSecondaryVariant">@color/primary_dark</item>
-        <item name="colorOnSecondary">#FFFFFF</item>
-        <item name="android:statusBarColor">@color/status_bar</item>
+    <style name="Theme.SipGsmGateway.Base" parent="Theme.Material3Expressive.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/m3_primary</item>
+        <item name="colorOnPrimary">@color/m3_on_primary</item>
+        <item name="colorPrimaryContainer">@color/m3_primary_container</item>
+        <item name="colorOnPrimaryContainer">@color/m3_on_primary_container</item>
+        <item name="colorSecondary">@color/m3_secondary</item>
+        <item name="colorOnSecondary">@color/m3_on_secondary</item>
+        <item name="colorSecondaryContainer">@color/m3_secondary_container</item>
+        <item name="colorOnSecondaryContainer">@color/m3_on_secondary_container</item>
+        <item name="colorTertiary">@color/m3_tertiary</item>
+        <item name="colorOnTertiary">@color/m3_on_tertiary</item>
+        <item name="colorTertiaryContainer">@color/m3_tertiary_container</item>
+        <item name="colorOnTertiaryContainer">@color/m3_on_tertiary_container</item>
+        <item name="colorError">@color/m3_error</item>
+        <item name="colorOnError">@color/m3_on_error</item>
+        <item name="colorErrorContainer">@color/m3_error_container</item>
+        <item name="colorOnErrorContainer">@color/m3_on_error_container</item>
+        <item name="colorSurface">@color/m3_surface</item>
+        <item name="colorOnSurface">@color/m3_on_surface</item>
+        <item name="colorSurfaceVariant">@color/m3_surface_variant</item>
+        <item name="colorOnSurfaceVariant">@color/m3_on_surface_variant</item>
+        <item name="colorOutline">@color/m3_outline</item>
+        <item name="colorOutlineVariant">@color/m3_outline_variant</item>
+        <item name="colorSurfaceContainerLowest">@color/m3_surface_container_lowest</item>
+        <item name="colorSurfaceContainerLow">@color/m3_surface_container_low</item>
+        <item name="colorSurfaceContainer">@color/m3_surface_container</item>
+        <item name="colorSurfaceContainerHigh">@color/m3_surface_container_high</item>
+        <item name="colorSurfaceContainerHighest">@color/m3_surface_container_highest</item>
+        <item name="android:colorBackground">?attr/colorSurface</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="alertDialogTheme">@style/ThemeOverlay.Material3Expressive.Dialog.Alert</item>
+        <item name="materialAlertDialogTheme">@style/ThemeOverlay.Material3Expressive.MaterialAlertDialog</item>
+    </style>
+
+    <style name="Theme.SipGsmGateway" parent="Theme.SipGsmGateway.Base">
         <item name="android:windowLightStatusBar">true</item>
-        <item name="android:colorBackground">@color/background</item>
-        <item name="alertDialogTheme">@style/AppAlertDialog</item>
     </style>
 
-    <style name="AppAlertDialog" parent="ThemeOverlay.MaterialComponents.Dialog.Alert">
-        <item name="android:background">@color/surface</item>
-    </style>
-
-    <!-- Dial-pad button (dark rounded rectangle, fills row) -->
     <style name="DialButton">
         <item name="android:layout_height">64dp</item>
         <item name="android:layout_margin">4dp</item>
         <item name="android:gravity">center</item>
         <item name="android:textSize">24sp</item>
-        <item name="android:textColor">#FFFFFF</item>
+        <item name="android:textColor">?attr/colorOnSurface</item>
         <item name="android:background">@drawable/dial_button_bg</item>
         <item name="android:clickable">true</item>
         <item name="android:focusable">true</item>
     </style>
 
-    <!-- Settings screen field styles -->
     <style name="CfgLabel">
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
         <item name="android:textStyle">bold</item>
-        <item name="android:textColor">@color/text_label</item>
+        <item name="android:textColor">?attr/colorOnSurfaceVariant</item>
         <item name="android:layout_marginTop">14dp</item>
     </style>
 
     <style name="CfgField">
         <item name="android:layout_width">match_parent</item>
         <item name="android:layout_height">wrap_content</item>
-        <item name="android:textColor">@color/text_primary</item>
-        <item name="android:textColorHint">@color/text_hint</item>
+        <item name="android:minHeight">56dp</item>
+        <item name="android:textColor">?attr/colorOnSurface</item>
+        <item name="android:textColorHint">?attr/colorOutline</item>
         <item name="android:background">@drawable/input_bg</item>
-        <item name="android:padding">12dp</item>
+        <item name="android:paddingHorizontal">12dp</item>
+        <item name="android:paddingVertical">12dp</item>
         <item name="android:layout_marginTop">4dp</item>
         <item name="android:importantForAutofill">no</item>
     </style>

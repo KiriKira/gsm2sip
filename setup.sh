@@ -13,8 +13,8 @@ set -e
 
 ANDROID_SDK_DIR="/opt/android-sdk"
 CMDLINE_TOOLS_URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
-GRADLE_WRAPPER_URL="https://services.gradle.org/distributions/gradle-8.5-bin.zip"
-GRADLE_WRAPPER_JAR_VERSION="8.5"
+GRADLE_WRAPPER_URL="https://services.gradle.org/distributions/gradle-8.9-bin.zip"
+GRADLE_WRAPPER_JAR_VERSION="8.9"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -92,17 +92,17 @@ install_sdk_packages() {
     log "Accepting Android SDK licenses..."
     yes 2>/dev/null | sdkmanager --licenses > /dev/null 2>&1 || true
 
-    log "Installing SDK packages (platform 34, build-tools 34.0.0)..."
+    log "Installing SDK packages (platform 35, build-tools 35.0.0)..."
     sdkmanager --install \
         "platform-tools" \
-        "platforms;android-34" \
-        "build-tools;34.0.0" \
+        "platforms;android-35" \
+        "build-tools;35.0.0" \
         > /dev/null 2>&1
 
     log "Android SDK packages installed:"
     echo "  - platform-tools (adb)"
-    echo "  - platforms;android-34"
-    echo "  - build-tools;34.0.0"
+    echo "  - platforms;android-35"
+    echo "  - build-tools;35.0.0"
 }
 
 # ── 4. Gradle wrapper ───────────────────────────────

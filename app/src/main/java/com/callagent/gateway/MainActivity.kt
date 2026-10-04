@@ -6,12 +6,11 @@ import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.DialogInterface
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
-import android.graphics.Color
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.widget.SeekBar
@@ -19,7 +18,6 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
-import android.net.Uri
 import android.net.wifi.WifiManager
 import android.app.role.RoleManager
 import android.net.ConnectivityManager
@@ -28,8 +26,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.PowerManager
-import android.provider.Settings
 import android.telecom.TelecomManager
 import android.telephony.CellInfoGsm
 import android.telephony.CellInfoLte
@@ -41,19 +37,17 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
-import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.PopupMenu
 import android.widget.Toast
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.R as AppCompatR
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.callagent.gateway.service.CallLogEntry
@@ -65,6 +59,7 @@ import com.callagent.gateway.net.ControlApiException
 import com.callagent.gateway.net.MappingProposal
 import com.callagent.gateway.net.ServerMapping
 import com.callagent.gateway.service.GatewayService
+import com.callagent.gateway.background.GatewayBackgroundRuntime
 import com.callagent.gateway.sim.SimRegistry
 import com.callagent.gateway.sms.SmsOutbox
 import org.json.JSONArray
@@ -73,6 +68,15 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.materialswitch.MaterialSwitch
+import com.google.android.material.navigation.NavigationBarView
+import com.google.android.material.radiobutton.MaterialRadioButton
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import com.google.android.material.R as MaterialR
 
 class MainActivity : AppCompatActivity() {
 
@@ -100,6 +104,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvHomeSrtpBadge: TextView
     private lateinit var tvNetMobile: TextView
     private lateinit var tvNetWifi: TextView
+    private lateinit var tvSimSummary: TextView
     private val netHandler = Handler(Looper.getMainLooper())
     private val netRunnable = object : Runnable {
         override fun run() {
@@ -114,9 +119,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvHomeCallTimer: TextView
     private lateinit var tvHomeCallFrom: TextView
     private lateinit var tvHomeCallTo: TextView
-    private lateinit var btnHomeMute: Button
-    private lateinit var btnHomeSnoop: Button
-    private lateinit var btnHomeEnd: Button
+    private lateinit var btnHomeMute: MaterialButton
+    private lateinit var btnHomeSnoop: MaterialButton
+    private lateinit var btnHomeEnd: MaterialButton
     private lateinit var homeTrafficList: LinearLayout
     private lateinit var tvHomeTrafficEmpty: TextView
     private lateinit var btnFilterAll: Button
@@ -133,7 +138,20 @@ class MainActivity : AppCompatActivity() {
     private var controlBusy = false
 
     private lateinit var tabLogs: LinearLayout
+    private lateinit var bottomNavigation: NavigationBarView
     private var currentTab = ""
+    private var logsReturnTab = "home"
+
+    private lateinit var tvBackgroundState: TextView
+    private lateinit var tvBackgroundConnection: TextView
+    private lateinit var tvBackgroundNotification: TextView
+    private lateinit var tvBackgroundBattery: TextView
+    private lateinit var tvBackgroundIssue: TextView
+    private lateinit var tvVoiceStartExplanation: TextView
+    private lateinit var btnStartGatewayDiagnostics: MaterialButton
+    private lateinit var tvPermissionNotice: TextView
+    private lateinit var swBackgroundEnabled: MaterialSwitch
+    private var updatingBackgroundControls = false
 
     // In-call views
     private lateinit var inCallView: LinearLayout
@@ -214,14 +232,14 @@ class MainActivity : AppCompatActivity() {
             if (call != null && state != lastGsmPollState) {
                 lastGsmPollState = state
                 when (state) {
-                    android.telecom.Call.STATE_CONNECTING -> tvInCallStatus.text = "Calling..."
-                    android.telecom.Call.STATE_DIALING -> tvInCallStatus.text = "Ringing..."
-                    android.telecom.Call.STATE_RINGING -> tvInCallStatus.text = "Ringing..."
+                    android.telecom.Call.STATE_CONNECTING -> tvInCallStatus.text = "呼叫中"
+                    android.telecom.Call.STATE_DIALING -> tvInCallStatus.text = "正在振铃"
+                    android.telecom.Call.STATE_RINGING -> tvInCallStatus.text = "正在振铃"
                     android.telecom.Call.STATE_ACTIVE -> {
                         if (running) {
-                            tvInCallStatus.text = "Connecting..."
+                            tvInCallStatus.text = "正在连接"
                         } else {
-                            tvInCallStatus.text = "Connected"
+                            tvInCallStatus.text = "已接通"
                             if (callStartTime == 0L) {
                                 callStartTime = System.currentTimeMillis()
                                 tvInCallTimer.text = "00:00"
@@ -274,6 +292,7 @@ class MainActivity : AppCompatActivity() {
                     sipRegistered = intent.getBooleanExtra("registered", sipRegistered)
                     serviceCallStart = intent.getLongExtra("call_start", 0L)
                     updateStatus(state, info)
+                    refreshBackgroundStatus()
 
                     val newOnlineSince = intent.getLongExtra("online_since", 0L)
                     if (newOnlineSince != onlineSince) {
@@ -302,15 +321,15 @@ class MainActivity : AppCompatActivity() {
 
                     if (inCallOpen) {
                         when (state) {
-                            "GSM_DIALING" -> tvInCallStatus.text = "Calling..."
-                            "GSM_ANSWERED", "SIP_CALLING" -> tvInCallStatus.text = "Connecting..."
-                            "SIP_RINGING" -> tvInCallStatus.text = "Ringing..."
+                            "GSM_DIALING" -> tvInCallStatus.text = "呼叫中"
+                            "GSM_ANSWERED", "SIP_CALLING" -> tvInCallStatus.text = "正在连接"
+                            "SIP_RINGING" -> tvInCallStatus.text = "正在振铃"
                             "BRIDGED" -> {
-                                tvInCallStatus.text = "Connected"
+                                tvInCallStatus.text = "已接通"
                                 tvInCallTimer.visibility = View.VISIBLE
                                 startCallTimer()
                             }
-                            "TEARING_DOWN" -> tvInCallStatus.text = "Ending..."
+                            "TEARING_DOWN" -> tvInCallStatus.text = "正在结束"
                             "IDLE" -> {
                                 scheduleInCallClose()
                             }
@@ -329,20 +348,40 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Portrait lock, enforced at runtime as well as in the manifest.
-        // A priv-app APK replaced in place is not always re-parsed by
-        // PackageManager, so the manifest's screenOrientation can silently
-        // stay at its previous value (dumpsys reports UNSPECIFIED).  Asking
-        // for it here is immune to that staleness.
-        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(R.layout.activity_main)
+        findViewById<View>(R.id.rootWindow).let { root ->
+            ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
+                val safeArea = insets.getInsets(
+                    WindowInsetsCompat.Type.systemBars() or
+                        WindowInsetsCompat.Type.displayCutout() or
+                        WindowInsetsCompat.Type.ime()
+                )
+                view.setPadding(safeArea.left, safeArea.top, safeArea.right, safeArea.bottom)
+                insets
+            }
+            ViewCompat.requestApplyInsets(root)
+        }
 
         // Tab containers
         tabbedRoot = findViewById(R.id.tabbedRoot)
         tabHome = findViewById(R.id.tabHome)
         tabConfig = findViewById(R.id.tabConfig)
+        bottomNavigation = findViewById(R.id.bottomNavigation)
+        bottomNavigation.setOnItemSelectedListener { item ->
+            val destination = when (item.itemId) {
+                R.id.navHome -> "home"
+                R.id.navSettings -> "config"
+                R.id.navLogs -> "logs"
+                else -> null
+            }
+            if (destination != null && destination != currentTab) switchTab(destination)
+            destination != null
+        }
         findViewById<View>(R.id.btnConfigBack).setOnClickListener { switchTab("home") }
         findViewById<View>(R.id.btnCfgSave).setOnClickListener { saveConfigFromView() }
+        findViewById<MaterialButton>(R.id.btnStartGatewayDiagnostics)
+            .setOnClickListener { openGatewayDiagnostics() }
         findViewById<View>(R.id.btnCfgClearRecents).setOnClickListener { confirmClearRecents() }
         findViewById<View>(R.id.btnControlPair).setOnClickListener { pairControlGateway() }
         findViewById<View>(R.id.btnSimPropose).setOnClickListener { proposeSimBindings() }
@@ -354,6 +393,37 @@ class MainActivity : AppCompatActivity() {
         tvHomeSrtpBadge = findViewById(R.id.tvHomeSrtpBadge)
         tvNetMobile = findViewById(R.id.tvNetMobile)
         tvNetWifi = findViewById(R.id.tvNetWifi)
+        tvSimSummary = findViewById(R.id.tvSimSummary)
+        tvBackgroundState = findViewById(R.id.tvBackgroundState)
+        tvBackgroundConnection = findViewById(R.id.tvBackgroundConnection)
+        tvBackgroundNotification = findViewById(R.id.tvBackgroundNotification)
+        tvBackgroundBattery = findViewById(R.id.tvBackgroundBattery)
+        tvBackgroundIssue = findViewById(R.id.tvBackgroundIssue)
+        tvVoiceStartExplanation = findViewById(R.id.tvVoiceStartExplanation)
+        btnStartGatewayDiagnostics = findViewById(R.id.btnStartGatewayDiagnostics)
+        swBackgroundEnabled = findViewById(R.id.swBackgroundEnabled)
+        swBackgroundEnabled.setOnCheckedChangeListener { _, enabled ->
+            if (updatingBackgroundControls) return@setOnCheckedChangeListener
+            val changed = runCatching {
+                GatewayBackgroundRuntime.setEnabled(this, enabled)
+            }.getOrDefault(false)
+            if (!changed) {
+                updatingBackgroundControls = true
+                swBackgroundEnabled.isChecked = !enabled
+                updatingBackgroundControls = false
+                Toast.makeText(this, "后台运行设置未能保存", Toast.LENGTH_LONG).show()
+            }
+            refreshBackgroundStatus()
+        }
+        findViewById<MaterialButton>(R.id.btnRequestNotificationPermission)
+            .setOnClickListener {
+                GatewayBackgroundRuntime.requestNotificationPermission(this)
+                refreshBackgroundStatus()
+            }
+        findViewById<MaterialButton>(R.id.btnOpenNotificationSettings)
+            .setOnClickListener { GatewayBackgroundRuntime.openNotificationSettings(this) }
+        findViewById<MaterialButton>(R.id.btnOpenBatterySettings)
+            .setOnClickListener { GatewayBackgroundRuntime.openBatterySettings(this) }
         homeCallCard = findViewById(R.id.homeCallCard)
         tvHomeCallDirection = findViewById(R.id.tvHomeCallDirection)
         tvHomeCallTimer = findViewById(R.id.tvHomeCallTimer)
@@ -379,11 +449,24 @@ class MainActivity : AppCompatActivity() {
             if (gatewayOnline) {
                 // Already registered — reconnecting would drop a working
                 // registration and send SIP the server did not need.
-                Toast.makeText(this, "Registered", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "SIP 已注册", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val background = runCatching { GatewayBackgroundRuntime.snapshot(this) }.getOrNull()
+            val voiceStarted = background?.let {
+                it.running && it.connectionLabel.startsWith("SIP connecting", ignoreCase = true)
+            } == true
+            if (!voiceStarted) {
+                Toast.makeText(this, "SIP 语音尚未启动。请到设置运行设备诊断并确认启动。", Toast.LENGTH_LONG).show()
+                switchTab("config")
+                return@setOnClickListener
+            }
+            if (!GatewayBackgroundRuntime.allowedRecovery(this)) {
+                Toast.makeText(this, "请先在“后台运行”卡片中重新启用后台运行", Toast.LENGTH_LONG).show()
                 return@setOnClickListener
             }
             appendLog("Reconnect requested")
-            Toast.makeText(this, "Reconnecting…", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "正在重新连接…", Toast.LENGTH_SHORT).show()
             startService(Intent(this, GatewayService::class.java).apply {
                 action = GatewayService.ACTION_RECONNECT
             })
@@ -401,6 +484,9 @@ class MainActivity : AppCompatActivity() {
         // Logs view — opened from the Settings header, back returns there
         // rather than to home, so the icon behaves like a drill-down.
         tabLogs = findViewById(R.id.tabLogs)
+        constrainWideContent(tabHome)
+        constrainWideContent(tabConfig)
+        constrainWideContent(tabLogs)
         findViewById<View>(R.id.btnCfgLogs).setOnClickListener { switchTab("logs") }
         findViewById<View>(R.id.btnLogsBack).setOnClickListener { switchTab("config") }
         findViewById<View>(R.id.btnLogsCopy).setOnClickListener { copyLog() }
@@ -409,6 +495,7 @@ class MainActivity : AppCompatActivity() {
         // Logs-view views
         tvLog = findViewById(R.id.tvLog)
         svLog = findViewById(R.id.svLog)
+        tvPermissionNotice = findViewById(R.id.tvPermissionNotice)
 
         // Clear the view, but keep whatever the service has buffered: onResume
         // drains it into the view a moment later.  Discarding it here threw
@@ -427,7 +514,6 @@ class MainActivity : AppCompatActivity() {
         btnInCallMonitor.setOnClickListener { toggleMonitor() }
 
         requestPermissions()
-        requestBatteryOptimizationExemption()
         requestDefaultDialerRole()
 
         // Nothing is visible until a tab is selected — switchTab() returns
@@ -435,29 +521,184 @@ class MainActivity : AppCompatActivity() {
         // state has to be applied explicitly.
         switchTab("home")
         setCallFilter("all")
+        refreshBackgroundStatus()
+        refreshSimSummary()
 
-        // Auto-start gateway if autoconnect enabled and credentials configured
+        // Restore only paired HTTPS control sync; SIP voice needs an explicit
+        // user-triggered diagnostic and confirmation below.
         autoStartGateway()
     }
 
-    private fun autoStartGateway() {
-        if (running) return
+    private fun constrainWideContent(content: View) {
+        if (resources.configuration.screenWidthDp < 720) return
+        content.post {
+            val density = resources.displayMetrics.density
+            val widthDp = (resources.configuration.screenWidthDp - 48).coerceAtMost(760)
+            content.layoutParams = (content.layoutParams as? android.widget.FrameLayout.LayoutParams
+                ?: return@post).apply {
+                width = (widthDp * density).toInt()
+                height = ViewGroup.LayoutParams.MATCH_PARENT
+                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            }
+        }
+    }
+
+    private fun refreshBackgroundStatus() {
+        if (!::tvBackgroundState.isInitialized) return
+        val status = runCatching { GatewayBackgroundRuntime.snapshot(this) }.getOrNull()
+        updatingBackgroundControls = true
+        if (status == null) {
+            tvBackgroundState.text = "服务状态：暂时无法读取"
+            tvBackgroundConnection.text = "连接状态：—"
+            tvBackgroundNotification.text = "通知权限：未知"
+            tvBackgroundBattery.text = "电池优化：未知"
+            tvBackgroundIssue.text = "请稍后重试，或查看运行日志。"
+            tvBackgroundIssue.visibility = View.VISIBLE
+            updateVoiceStartVisibility(voiceRunning = false)
+            swBackgroundEnabled.isChecked = false
+            updatingBackgroundControls = false
+            refreshPairedControlStatus()
+            return
+        }
+
+        swBackgroundEnabled.isChecked = status.enabled
+        tvBackgroundState.text = "后台进程：" + when {
+            status.running -> "正在运行"
+            status.enabled -> "已启用，等待系统启动"
+            else -> "未运行"
+        }
+        val syncedAt = status.lastSyncAt?.let {
+            SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(it))
+        }
+        tvBackgroundConnection.text = buildString {
+            append("连接状态：")
+            append(localizedBackgroundConnection(status.connectionLabel))
+            if (syncedAt != null) append("\n最近同步：$syncedAt")
+        }
+        tvBackgroundNotification.text = if (status.notificationsEnabled) {
+            "通知：已允许"
+        } else {
+            "通知：未允许，后台运行状态可能无法显示在通知栏"
+        }
+        tvBackgroundBattery.text = if (status.batteryExempt) {
+            "电池优化：已豁免"
+        } else {
+            "电池优化：未豁免，系统可能限制后台运行"
+        }
+        tvBackgroundIssue.text = status.issue?.let(::localizedBackgroundIssue).orEmpty()
+        tvBackgroundIssue.visibility = if (status.issue.isNullOrBlank()) View.GONE else View.VISIBLE
+        updateVoiceStartVisibility(
+            voiceRunning = status.running && status.connectionLabel
+                .startsWith("SIP connecting", ignoreCase = true)
+        )
+        findViewById<View>(R.id.btnRequestNotificationPermission).visibility =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                !status.notificationsEnabled) View.VISIBLE else View.GONE
+        updatingBackgroundControls = false
+        refreshPairedControlStatus()
+    }
+
+    private fun refreshPairedControlStatus() {
+        if (!::tabConfig.isInitialized) return
+        val session = CredentialStore.load(this) ?: return
+        val controlStatus = findViewById<TextView>(R.id.tvControlStatus)
+        if (!controlStatus.text.toString().startsWith("Paired")) return
+        controlStatus.text = "Paired gateway ${session.gatewayId.take(8)}… · ${backgroundSyncLabel()}"
+    }
+
+    private fun updateVoiceStartVisibility(voiceRunning: Boolean) {
+        if (!::btnStartGatewayDiagnostics.isInitialized || !::tvVoiceStartExplanation.isInitialized) return
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-        if (!prefs.getBoolean("autoconnect", true)) return
-        val server = prefs.getString("server", "") ?: ""
-        val user = prefs.getString("user", "") ?: ""
-        if (server.isEmpty() || user.isEmpty()) {
-            if (CredentialStore.load(this) != null) {
-                GatewayService.startControl(this)
-                appendLog("Auto-starting paired HTTPS control gateway")
+        val hasSipConfig = !prefs.getString("server", "").isNullOrBlank() &&
+            !prefs.getString("user", "").isNullOrBlank()
+        val visible = hasSipConfig && !voiceRunning
+        btnStartGatewayDiagnostics.visibility = if (visible) View.VISIBLE else View.GONE
+        tvVoiceStartExplanation.visibility = if (visible) View.VISIBLE else View.GONE
+    }
+
+    private fun localizedBackgroundConnection(label: String): String = when (label.trim().lowercase(Locale.ROOT)) {
+        "stopped in android task manager" -> "已被 Android 任务管理器停止"
+        "stopped" -> "已停止"
+        "not paired" -> "尚未配对"
+        "starting" -> "正在启动"
+        "paused" -> "已暂停"
+        "retrying" -> "正在重试"
+        "wss connected · https polling" -> "长连接已连接 · HTTPS 轮询"
+        "wss connecting · https polling" -> "正在连接长连接 · HTTPS 轮询"
+        "https reauth pending" -> "等待 HTTPS 重新认证"
+        "https polling · wss retrying" -> "HTTPS 轮询中 · 长连接重试中"
+        "https polling · wss connecting" -> "HTTPS 轮询中 · 长连接连接中"
+        "https polling · wake auth pending" -> "HTTPS 轮询中 · 等待长连接重新认证"
+        "sip connecting · https polling" -> "SIP 连接中 · HTTPS 轮询"
+        "unknown" -> "未知"
+        else -> label.ifBlank { "未知" }
+    }
+
+    private fun localizedBackgroundIssue(issue: String): String = when {
+        issue.startsWith("Android stopped the gateway from Task Manager", ignoreCase = true) ->
+            "Android 任务管理器停止了网关。请在此卡片中重新启用后台运行后恢复。"
+        issue.startsWith("Pair this device with the control server", ignoreCase = true) ->
+            "尚未配对控制服务器。请先打开“设置”完成设备配对。"
+        issue.startsWith("Android did not allow the foreground service to start", ignoreCase = true) ->
+            "Android 暂未允许启动后台服务。请返回此应用后重试。"
+        issue.startsWith("Pair this device again", ignoreCase = true) ->
+            "配对会话已失效，请在设置中重新配对控制服务器。"
+        issue.startsWith("Wake channel could not be opened", ignoreCase = true) ->
+            "长连接暂不可用，网关会继续通过 HTTPS 轮询。"
+        issue.startsWith("Control sync failed", ignoreCase = true) ->
+            "控制服务器同步暂时失败，网关会自动重试。"
+        issue.startsWith("Android could not grant a temporary voice CPU lease", ignoreCase = true) ->
+            "Android 未能授予临时通话处理权限，屏幕关闭时通话可能受系统限制。"
+        else -> issue
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun refreshSimSummary() {
+        if (!::tvSimSummary.isInitialized) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_PHONE_STATE) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            tvSimSummary.text = "SIM 状态：未获电话状态权限，暂时无法读取"
+            return
+        }
+        val subscriptions = runCatching {
+            getSystemService(SubscriptionManager::class.java)
+                ?.activeSubscriptionInfoList
+                .orEmpty()
+                .sortedBy { it.simSlotIndex }
+        }.getOrElse {
+            tvSimSummary.text = "SIM 状态：读取失败，请检查系统权限"
+            return
+        }
+        if (subscriptions.isEmpty()) {
+            tvSimSummary.text = "SIM 状态：未检测到已启用的 SIM；插入 SIM 后可在设置中绑定"
+            return
+        }
+        val labels = subscriptions.map { info ->
+            val slot = if (info.simSlotIndex >= 0) "SIM ${info.simSlotIndex + 1}" else "SIM"
+            val carrier = info.carrierName?.toString()?.trim().orEmpty()
+            if (carrier.isBlank()) slot else "$slot · $carrier"
+        }
+        tvSimSummary.text = "SIM 状态：检测到 ${subscriptions.size} 张已启用 SIM（${labels.joinToString("，")}）"
+    }
+
+    private fun autoStartGateway() {
+        if (!GatewayBackgroundRuntime.allowedRecovery(this)) {
+            appendLog("Auto-start paused after a system stop; enable background running again from the home screen")
+            return
+        }
+        if (CredentialStore.load(this) != null) {
+            if (GatewayService.startControl(this)) {
+                appendLog("Auto-starting paired HTTPS control gateway; SIP voice waits for explicit diagnostics")
             }
             return
         }
-        val port = prefs.getInt("port", 5061)
-        val pass = prefs.getString("pass", "") ?: ""
-        GatewayService.start(this, server, port, user, pass)
-        running = true
-        appendLog("Auto-starting gateway: $user@$server:$port")
+        val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
+        if (!prefs.getString("server", "").isNullOrBlank() &&
+            !prefs.getString("user", "").isNullOrBlank()
+        ) {
+            appendLog("Saved SIP credentials found; voice startup waits for explicit diagnostics")
+        }
     }
 
     private fun restoreControlUiState() {
@@ -466,7 +707,7 @@ class MainActivity : AppCompatActivity() {
         if (session != null) {
             url.setText(session.controlBaseUrl)
             findViewById<TextView>(R.id.tvControlStatus).text =
-                "Paired gateway ${session.gatewayId.take(8)}… · HTTPS sync enabled"
+                "Paired gateway ${session.gatewayId.take(8)}… · ${backgroundSyncLabel()}"
         } else {
             val saved = getSharedPreferences("gateway", MODE_PRIVATE)
                 .getString("control_base_url", "").orEmpty()
@@ -486,6 +727,12 @@ class MainActivity : AppCompatActivity() {
         findViewById<View>(R.id.btnSimConfirm).isEnabled = !busy
         pendingMappingProposal?.let { renderSimProposal(it, simProposalSubscriptions) }
         if (status != null) findViewById<TextView>(R.id.tvControlStatus).text = status
+    }
+
+    private fun backgroundSyncLabel(): String = if (GatewayBackgroundRuntime.allowedRecovery(this)) {
+        "HTTPS 同步已启用"
+    } else {
+        "HTTPS 同步已暂停 · 请在首页启用后台运行"
     }
 
     private fun pairControlGateway() {
@@ -509,12 +756,23 @@ class MainActivity : AppCompatActivity() {
                 if (!saved) throw IllegalStateException("Could not save control server settings")
                 runOnUiThread {
                     findViewById<EditText>(R.id.etControlPairingCode).text.clear()
+                    val syncEnabled = GatewayBackgroundRuntime.allowedRecovery(this)
+                    val syncStarted = syncEnabled && GatewayService.startControl(this)
                     findViewById<TextView>(R.id.tvControlStatus).text =
-                        "Paired ${result.gatewayId.take(8)}… · ${if (result.sipAvailable) "SIP available" else "HTTPS control only"}"
+                        "Paired ${result.gatewayId.take(8)}… · ${if (result.sipAvailable) "SIP available" else "HTTPS control only"} · ${backgroundSyncLabel()}"
                     setControlBusy(false)
-                    Toast.makeText(this, "Gateway paired. Review and confirm local SIM slots.", Toast.LENGTH_LONG).show()
-                    GatewayService.startControl(this)
-                    appendLog("Control gateway paired; HTTPS sync enabled")
+                    val message = when {
+                        syncStarted -> "已配对。请核对并确认本地 SIM 插槽。"
+                        !syncEnabled -> "已配对，后台同步仍暂停。请在首页显式启用后台运行，再确认本地 SIM 插槽。"
+                        else -> "已配对，但后台服务未能启动。请查看首页后台状态后重试。"
+                    }
+                    Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+                    appendLog(when {
+                        syncStarted -> "Control gateway paired; HTTPS sync enabled"
+                        !syncEnabled -> "Control gateway paired; HTTPS sync remains paused until explicitly enabled"
+                        else -> "Control gateway paired; background service could not start"
+                    })
+                    refreshBackgroundStatus()
                 }
             } catch (e: Exception) {
                 val detail = (e as? ControlApiException)?.code ?: "PAIRING_FAILED"
@@ -642,7 +900,7 @@ class MainActivity : AppCompatActivity() {
         proposal.mappings.forEach { mapping ->
             val title = TextView(this).apply {
                 text = "Server SIM ${mapping.slotIndex + 1} · ${mapping.simId} · ${mapping.state}"
-                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+                setTextColor(themeColor(MaterialR.attr.colorOnSurface))
                 textSize = 13f
                 setPadding(0, 12, 0, 4)
             }
@@ -652,14 +910,15 @@ class MainActivity : AppCompatActivity() {
             if (options.isEmpty()) {
                 container.addView(TextView(this).apply {
                     text = "No active local SIM subscription in slot ${mapping.slotIndex + 1}"
-                    setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+                    setTextColor(themeColor(MaterialR.attr.colorOnSurfaceVariant))
                     textSize = 12f
                     setPadding(0, 2, 0, 8)
                 })
             }
             options.forEach { sub ->
-                val radio = android.widget.RadioButton(this).apply {
+                val radio = MaterialRadioButton(this).apply {
                     id = View.generateViewId()
+                    minimumHeight = (48 * resources.displayMetrics.density).toInt()
                     text = buildString {
                         append("Local SIM ${sub.slotIndex + 1}")
                         if (sub.carrierName.isNotBlank()) append(" · ${sub.carrierName}")
@@ -761,8 +1020,15 @@ class MainActivity : AppCompatActivity() {
                     selectedSimBindings.clear()
                     findViewById<LinearLayout>(R.id.llSimBindings).removeAllViews()
                     findViewById<View>(R.id.btnSimConfirm).visibility = View.GONE
-                    setControlBusy(false, "SIM bindings confirmed. SMS can use active mapped subscriptions.")
-                    GatewayService.startControl(this)
+                    val syncEnabled = GatewayBackgroundRuntime.allowedRecovery(this)
+                    val syncStarted = syncEnabled && GatewayService.startControl(this)
+                    val status = when {
+                        syncStarted -> "SIM 映射已确认；HTTPS 同步可使用已激活的 SIM。"
+                        !syncEnabled -> "SIM 映射已确认；后台同步已暂停，请在首页显式启用后台运行。"
+                        else -> "SIM 映射已确认；后台服务未能启动，请查看首页状态后重试。"
+                    }
+                    setControlBusy(false, status)
+                    refreshBackgroundStatus()
                 }
             } catch (e: Exception) {
                 val detail = (e as? ControlApiException)?.code ?: "SIM_CONFIRM_FAILED"
@@ -773,17 +1039,23 @@ class MainActivity : AppCompatActivity() {
 
     // ── Tab Navigation ───────────────────────────────────
 
-    /**
-     * Show one of the top-level views.  Navigation is the header menu on the
-     * home view now; there is no bottom bar.
-     */
+    /** Show one of the top-level views and keep the bottom navigation in sync. */
     private fun switchTab(tab: String) {
         if (tab == currentTab) return
+        if (tab == "logs" && currentTab.isNotBlank()) logsReturnTab = currentTab
         currentTab = tab
 
         tabHome.visibility = if (tab == "home") View.VISIBLE else View.GONE
         tabConfig.visibility = if (tab == "config") View.VISIBLE else View.GONE
         tabLogs.visibility = if (tab == "logs") View.VISIBLE else View.GONE
+        val selectedId = when (tab) {
+            "config" -> R.id.navSettings
+            "logs" -> R.id.navLogs
+            else -> R.id.navHome
+        }
+        if (bottomNavigation.selectedItemId != selectedId) {
+            bottomNavigation.selectedItemId = selectedId
+        }
 
         when (tab) {
             "home" -> refreshHome()
@@ -890,14 +1162,14 @@ class MainActivity : AppCompatActivity() {
         findViewById<EditText>(R.id.etCfgUser).setText(prefs.getString("user", ""))
         findViewById<EditText>(R.id.etCfgPass).setText(prefs.getString("pass", ""))
         buildOwnNumberFields(prefs)
-        findViewById<CheckBox>(R.id.cbCfgAutoconnect).isChecked =
-            prefs.getBoolean("autoconnect", true)
-        findViewById<CheckBox>(R.id.cbCfgUseStun).isChecked =
+        findViewById<MaterialSwitch>(R.id.cbCfgAutoconnect).isChecked =
+            GatewayBackgroundRuntime.allowedRecovery(this)
+        findViewById<MaterialSwitch>(R.id.cbCfgUseStun).isChecked =
             prefs.getBoolean("use_stun", false)
-        findViewById<CheckBox>(R.id.cbCfgTranslit).isChecked =
+        findViewById<MaterialSwitch>(R.id.cbCfgTranslit).isChecked =
             prefs.getBoolean("translit_ascii", false)
-        val cbTls = findViewById<CheckBox>(R.id.cbCfgTls)
-        val cbSrtp = findViewById<CheckBox>(R.id.cbCfgSrtp)
+        val cbTls = findViewById<MaterialSwitch>(R.id.cbCfgTls)
+        val cbSrtp = findViewById<MaterialSwitch>(R.id.cbCfgSrtp)
         cbTls.isChecked = true
         cbSrtp.isChecked = true
         cbTls.isEnabled = false
@@ -936,7 +1208,7 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Port switched back to 5060", Toast.LENGTH_SHORT).show()
             }
         }
-        findViewById<RadioButton>(
+        findViewById<MaterialRadioButton>(
             when (prefs.getString("codec", "g722")) {
                 "g711" -> R.id.rbCodecG711
                 "both" -> R.id.rbCodecBoth
@@ -974,7 +1246,7 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Nothing to clear", Toast.LENGTH_SHORT).show()
             return
         }
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("Clear recents?")
             .setMessage("Removes all $count calls and messages from the list. This cannot be undone.")
             .setPositiveButton("Clear") { _, _ ->
@@ -1000,9 +1272,10 @@ class MainActivity : AppCompatActivity() {
         // The lowest active SIM's number is the one everything that does not
         // know which SIM it is dealing with will use.
         val own = ownNumberFields.firstOrNull()?.second?.text?.toString()?.trim().orEmpty()
-        val auto = findViewById<CheckBox>(R.id.cbCfgAutoconnect).isChecked
-        val useStun = findViewById<CheckBox>(R.id.cbCfgUseStun).isChecked
-        val translit = findViewById<CheckBox>(R.id.cbCfgTranslit).isChecked
+        val auto = findViewById<MaterialSwitch>(R.id.cbCfgAutoconnect).isChecked
+        val backgroundEnabledBeforeSave = GatewayBackgroundRuntime.allowedRecovery(this)
+        val useStun = findViewById<MaterialSwitch>(R.id.cbCfgUseStun).isChecked
+        val translit = findViewById<MaterialSwitch>(R.id.cbCfgTranslit).isChecked
         val tls = true
         val srtp = true
         val agentVolStep = findViewById<SeekBar>(R.id.sbCfgAgentVolume).progress - 3
@@ -1035,6 +1308,11 @@ class MainActivity : AppCompatActivity() {
             .putString("codec", codec)
             .putInt("agent_vol_step", agentVolStep)
             .apply()
+        if (auto != backgroundEnabledBeforeSave &&
+            !GatewayBackgroundRuntime.setEnabled(this, auto)
+        ) {
+            Toast.makeText(this, "后台运行设置未能保存，请在首页检查状态", Toast.LENGTH_LONG).show()
+        }
         appendLog(
             "Config saved: ${if (server.isEmpty()) "HTTPS control only" else "$user@$server:$port"} (own=${own.ifEmpty { "auto" }}, " +
                 "codec=$codec, stun=${if (useStun) "on" else "off"}, " +
@@ -1043,14 +1321,22 @@ class MainActivity : AppCompatActivity() {
                 "ascii=${if (translit) "on" else "off"}, " +
                     "agent volume ${if (agentVolStep > 0) "+$agentVolStep" else "$agentVolStep"})"
         )
-        Toast.makeText(this, "Saved — reconnecting", Toast.LENGTH_SHORT).show()
-        // Apply immediately rather than waiting for the next restart.  This
-        // has to rebuild the client, not just re-register: the server, port,
-        // credentials and STUN choice are all read at bring-up.
-        startService(Intent(this, GatewayService::class.java).apply {
-            action = GatewayService.ACTION_APPLY_CONFIG
-        })
+        val background = runCatching { GatewayBackgroundRuntime.snapshot(this) }.getOrNull()
+        val voiceRuntimeActive = background?.let {
+            it.running && it.connectionLabel.startsWith("SIP connecting", ignoreCase = true)
+        } == true
+        if (voiceRuntimeActive) {
+            Toast.makeText(this, "已保存，正在重新连接 SIP…", Toast.LENGTH_SHORT).show()
+            // Apply immediately only to a voice runtime the user explicitly
+            // started. Saving legacy settings must not launch microphone FGS.
+            startService(Intent(this, GatewayService::class.java).apply {
+                action = GatewayService.ACTION_APPLY_CONFIG
+            })
+        } else {
+            Toast.makeText(this, "已保存；SIP 语音未启动。请运行诊断并确认启动。", Toast.LENGTH_LONG).show()
+        }
         switchTab("home")
+        refreshBackgroundStatus()
     }
 
     /** Cut the agent's audio to the caller.  The call stays up; this only
@@ -1063,7 +1349,7 @@ class MainActivity : AppCompatActivity() {
         })
         setCallButtonState(
             btnHomeMute,
-            if (agentMuted) "Unmute" else "Mute",
+            if (agentMuted) "取消静音" else "静音",
             if (agentMuted) R.drawable.ic_fa_volume_high else R.drawable.ic_fa_volume_xmark
         )
         appendLog(if (agentMuted) "Agent muted to caller" else "Agent unmuted")
@@ -1085,9 +1371,21 @@ class MainActivity : AppCompatActivity() {
             else -> true            // any call state means registration held
         }
         gatewayOnline = online
-        tvHomeStatusPill.text = if (online) "● Online" else "● Offline"
+        tvHomeStatusPill.text = if (online) "● SIP 已注册" else "● SIP 未注册"
         tvHomeStatusPill.setTextColor(
-            Color.parseColor(if (online) "#34D399" else "#F87171")
+            themeColor(
+                if (online) MaterialR.attr.colorOnTertiaryContainer
+                else MaterialR.attr.colorOnErrorContainer
+            )
+        )
+        ViewCompat.setBackgroundTintList(
+            tvHomeStatusPill,
+            ColorStateList.valueOf(
+                themeColor(
+                    if (online) MaterialR.attr.colorTertiaryContainer
+                    else MaterialR.attr.colorErrorContainer
+                )
+            )
         )
 
         // The badge says what the signalling is carried over, which is a
@@ -1112,7 +1410,7 @@ class MainActivity : AppCompatActivity() {
             tvHomeCallFrom.text = number
             val dest = getSharedPreferences("gateway", MODE_PRIVATE)
                 .getString("own_number", "") ?: ""
-            tvHomeCallTo.text = if (dest.isNotEmpty()) "Connected to $dest" else "Connected"
+            tvHomeCallTo.text = if (dest.isNotEmpty()) "已连接到 $dest" else "已连接"
             // Inbound is the normal direction for a gateway; a dialler-initiated
             // call is the other way round.
             tvHomeCallDirection.text =
@@ -1129,7 +1427,7 @@ class MainActivity : AppCompatActivity() {
             if (agentMuted) {
                 agentMuted = false
                 if (::btnHomeMute.isInitialized) {
-                    setCallButtonState(btnHomeMute, "Mute", R.drawable.ic_fa_volume_xmark)
+                    setCallButtonState(btnHomeMute, "静音", R.drawable.ic_fa_volume_xmark)
                 }
             }
             // Snoop likewise — the monitor lives with the RTP session and dies
@@ -1316,7 +1614,7 @@ class MainActivity : AppCompatActivity() {
         val body = TextView(this).apply {
             typeface = android.graphics.Typeface.MONOSPACE
             textSize = 12f
-            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+            setTextColor(themeColor(MaterialR.attr.colorOnSurface))
             setPadding(48, 24, 48, 24)
             setTextIsSelectable(true)
             // A blank line is enough to separate the fields from the message;
@@ -1325,7 +1623,7 @@ class MainActivity : AppCompatActivity() {
             text = header.toString() + "\n" + entry.text.ifEmpty { "(no text)" }
         }
 
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle("Message detail")
             .setView(ScrollView(this).apply { addView(body) })
             .setPositiveButton("Close", null)
@@ -1343,11 +1641,11 @@ class MainActivity : AppCompatActivity() {
         val body = TextView(this).apply {
             typeface = android.graphics.Typeface.MONOSPACE
             textSize = 12f
-            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+            setTextColor(themeColor(MaterialR.attr.colorOnSurface))
             setPadding(48, 24, 48, 24)
             text = if (mobile) mobileDetailsFast() else wifiDetailsFast()
         }
-        val dialog = AlertDialog.Builder(this)
+        val dialog = MaterialAlertDialogBuilder(this)
             .setTitle(if (mobile) "Mobile network" else "WiFi")
             .setView(ScrollView(this).apply { addView(body) })
             .setPositiveButton("Close", null)
@@ -1631,10 +1929,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun setCallFilter(filter: String) {
         callFilter = filter
-        val on = ContextCompat.getColor(this, R.color.accent)
-        val onText = ContextCompat.getColor(this, R.color.accent_on)
-        val off = ContextCompat.getColor(this, R.color.btn_secondary)
-        val offText = ContextCompat.getColor(this, R.color.text_primary)
+        val on = themeColor(MaterialR.attr.colorPrimaryContainer)
+        val onText = themeColor(MaterialR.attr.colorOnPrimaryContainer)
+        val off = themeColor(MaterialR.attr.colorSurfaceContainerHigh)
+        val offText = themeColor(MaterialR.attr.colorOnSurface)
         for ((btn, name) in listOf(
             btnFilterAll to "all", btnFilterIncoming to "in", btnFilterOutgoing to "out"
         )) {
@@ -1682,15 +1980,15 @@ class MainActivity : AppCompatActivity() {
             when {
                 sms -> {
                     dur.text = "SMS"
-                    dur.setTextColor(Color.parseColor("#60A5FA"))
+                    dur.setTextColor(themeColor(MaterialR.attr.colorTertiary))
                 }
                 e.durationSec > 0 -> {
                     dur.text = String.format("%02d:%02d", e.durationSec / 60, e.durationSec % 60)
-                    dur.setTextColor(Color.parseColor("#34D399"))
+                    dur.setTextColor(themeColor(AppCompatR.attr.colorPrimary))
                 }
                 else -> {
                     dur.text = "—"
-                    dur.setTextColor(Color.parseColor("#F87171"))
+                    dur.setTextColor(themeColor(AppCompatR.attr.colorError))
                 }
             }
             val d = java.util.Date(e.timestamp)
@@ -1711,7 +2009,7 @@ class MainActivity : AppCompatActivity() {
         if (inCallOpen) {
             return // must use END CALL
         } else if (currentTab == "logs") {
-            switchTab("config")
+            switchTab(logsReturnTab)
         } else if (currentTab != "home") {
             switchTab("home")
         } else {
@@ -1775,6 +2073,8 @@ class MainActivity : AppCompatActivity() {
 
         netHandler.removeCallbacks(netRunnable)
         netRunnable.run()
+        refreshBackgroundStatus()
+        refreshSimSummary()
 
         // Ask the service where it is.  Status is only pushed on change, so
         // opening the app onto an already-running gateway would otherwise show
@@ -1800,17 +2100,82 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("MissingPermission")
     // ── Gateway Support Checks ─────────────────────────
 
-    private fun runGatewayChecks(container: LinearLayout, onDone: () -> Unit) {
+    private fun openGatewayDiagnostics() {
+        val density = resources.displayMetrics.density
+        val results = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding((24 * density).toInt(), 0, (24 * density).toInt(), 0)
+        }
+        content.addView(TextView(this).apply {
+            text = "此检查只验证本机权限、音频采集能力和系统环境，不会拨打真实电话，也不代表完整通话链路已验证。检查通过后还需再次确认，才会启动 SIP 语音服务。"
+            setTextColor(themeColor(MaterialR.attr.colorOnSurfaceVariant))
+            textSize = 14f
+            setPadding(0, 0, 0, (12 * density).toInt())
+        })
+        content.addView(results)
+        val scroll = ScrollView(this).apply {
+            addView(content)
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                (resources.configuration.screenHeightDp.coerceAtMost(760) * 0.55f * density).toInt()
+            )
+        }
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle("SIP 本机诊断")
+            .setView(scroll)
+            .setNegativeButton("关闭", null)
+            .setPositiveButton("运行诊断", null)
+            .create()
+        dialog.setOnShowListener {
+            val action = dialog.getButton(DialogInterface.BUTTON_POSITIVE)
+            var checkComplete = false
+            var readyToStart = false
+            var checking = false
+            action.setOnClickListener {
+                if (checking) return@setOnClickListener
+                if (checkComplete && readyToStart) {
+                    if (com.callagent.gateway.gsm.GsmCallManager.activeCall != null || callLive) {
+                        Toast.makeText(this, "通话进行中，结束后再启动 SIP 语音", Toast.LENGTH_LONG).show()
+                        return@setOnClickListener
+                    }
+                    if (startGateway()) {
+                        dialog.dismiss()
+                        refreshBackgroundStatus()
+                    }
+                    return@setOnClickListener
+                }
+
+                results.removeAllViews()
+                checking = true
+                checkComplete = false
+                readyToStart = false
+                action.isEnabled = false
+                action.text = "正在检查…"
+                runGatewayChecks(results) { ready ->
+                    if (!dialog.isShowing) return@runGatewayChecks
+                    checking = false
+                    checkComplete = true
+                    readyToStart = ready
+                    action.isEnabled = true
+                    action.text = if (ready) "确认启动 SIP 语音" else "重新运行诊断"
+                }
+            }
+        }
+        dialog.show()
+    }
+
+    private fun runGatewayChecks(container: LinearLayout, onDone: (Boolean) -> Unit) {
         val dp = resources.displayMetrics.density
-        val greenColor = Color.parseColor("#16A34A")
-        val redColor = Color.parseColor("#DC2626")
-        val grayColor = Color.parseColor("#6B7280")
+        val greenColor = themeColor(AppCompatR.attr.colorPrimary)
+        val redColor = themeColor(AppCompatR.attr.colorError)
+        val grayColor = themeColor(MaterialR.attr.colorOnSurfaceVariant)
 
         fun addSectionHeader(title: String) {
             val tv = TextView(this).apply {
                 text = title
                 textSize = 13f
-                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.primary))
+                setTextColor(themeColor(AppCompatR.attr.colorPrimary))
                 setTypeface(null, android.graphics.Typeface.BOLD)
                 setPadding(0, (8 * dp).toInt(), 0, (2 * dp).toInt())
             }
@@ -1971,27 +2336,37 @@ class MainActivity : AppCompatActivity() {
             val hasDownlink = sourceResults.firstOrNull { it.label == "VOICE_DOWNLINK" }?.passed == true
 
             runOnUiThread {
-                addSectionHeader("Permissions")
-                for (r in results) addResultRow(r.label, r.passed, r.detail)
+                addSectionHeader("权限")
+                for (r in results) addResultRow(
+                    when (r.label) {
+                        "RECORD_AUDIO" -> "录音权限"
+                        "CAPTURE_AUDIO_OUTPUT" -> "系统通话音频采集"
+                        "ANSWER_PHONE_CALLS" -> "接听电话权限"
+                        "CALL_PHONE" -> "拨打电话权限"
+                        "READ_PHONE_STATE" -> "电话状态读取权限"
+                        "Default Dialer" -> "默认拨号器"
+                        else -> r.label
+                    }, r.passed, r.detail
+                )
 
-                addSectionHeader("Audio Sources")
+                addSectionHeader("音频采集源（仅本机短时探测）")
                 for (r in sourceResults) addResultRow(r.label, r.passed, r.detail)
 
-                addSectionHeader("Audio Effects")
-                addResultRow("AcousticEchoCanceler", aecAvail)
-                addResultRow("NoiseSuppressor", nsAvail)
+                addSectionHeader("音频处理")
+                addResultRow("回声消除", aecAvail)
+                addResultRow("降噪", nsAvail)
 
-                addSectionHeader("System Properties")
+                addSectionHeader("系统属性")
                 for (r in propResults) addResultRow(r.label, r.passed, r.detail)
 
-                addSectionHeader("System")
-                addResultRow("Root (su)", hasRoot, if (hasRoot) "" else "needed for Magisk")
+                addSectionHeader("系统环境")
+                addResultRow("Magisk root", hasRoot, if (hasRoot) "" else "需要 Magisk")
 
                 val divider = View(this).apply {
                     layoutParams = LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, (1 * dp).toInt()
                     ).apply { topMargin = (8 * dp).toInt(); bottomMargin = (8 * dp).toInt() }
-                    setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.border_card))
+                    setBackgroundColor(themeColor(MaterialR.attr.colorOutlineVariant))
                 }
                 container.addView(divider)
 
@@ -2000,14 +2375,14 @@ class MainActivity : AppCompatActivity() {
                     text = if (gatewayReady) {
                         val src = if (hasDownlink) "VOICE_DOWNLINK" else
                             sourceResults.firstOrNull { it.passed }?.label ?: "?"
-                        "\u2713 Gateway supported (capture: $src)"
+                        "\u2713 本机检查通过（采集源：$src），可启动 SIP 语音服务；尚未验证完整通话链路"
                     } else {
                         val missing = mutableListOf<String>()
-                        if (!hasRecordAudio) missing.add("RECORD_AUDIO")
-                        if (!hasCaptureOutput) missing.add("CAPTURE_AUDIO_OUTPUT")
-                        if (!isDefaultDialer) missing.add("Default Dialer")
-                        if (!hasUsableSource) missing.add("audio source")
-                        "\u2717 Not ready: missing ${missing.joinToString(", ")}"
+                        if (!hasRecordAudio) missing.add("录音权限")
+                        if (!hasCaptureOutput) missing.add("系统通话音频采集权限")
+                        if (!isDefaultDialer) missing.add("默认拨号器角色")
+                        if (!hasUsableSource) missing.add("可用音频采集源")
+                        "\u2717 暂不能启动语音服务：缺少 ${missing.joinToString("、")}"
                     }
                     textSize = 13f
                     setTextColor(if (gatewayReady) greenColor else redColor)
@@ -2015,7 +2390,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 container.addView(verdict)
 
-                onDone()
+                onDone(gatewayReady)
             }
         }.start()
     }
@@ -2054,7 +2429,7 @@ class MainActivity : AppCompatActivity() {
     private fun scheduleInCallClose() {
         if (!inCallOpen || inCallCloseScheduled) return
         inCallCloseScheduled = true
-        tvInCallStatus.text = "Call ended"
+        tvInCallStatus.text = "通话已结束"
         callTimerHandler.removeCallbacks(gsmPollRunnable)
         callTimerHandler.postDelayed({ closeInCallScreen() }, 1500)
     }
@@ -2073,12 +2448,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateMonitorButtons() {
         if (::btnInCallMonitor.isInitialized) {
-            btnInCallMonitor.text = if (monitoring) "STOP LISTENING" else "LISTEN IN"
+            btnInCallMonitor.text = if (monitoring) "停止监听" else "开始监听"
         }
         if (::btnHomeSnoop.isInitialized) {
             setCallButtonState(
                 btnHomeSnoop,
-                if (monitoring) "Stop" else "Snoop",
+                if (monitoring) "停止" else "监听",
                 if (monitoring) R.drawable.ic_fa_circle_stop else R.drawable.ic_fa_headphones
             )
         }
@@ -2091,7 +2466,7 @@ class MainActivity : AppCompatActivity() {
         callStartTime = 0L
         lastGsmPollState = -1
         tvInCallNumber.text = number
-        tvInCallStatus.text = "Calling..."
+        tvInCallStatus.text = "呼叫中"
         tvInCallTimer.visibility = View.GONE
         viewBeforeInCall = currentTab
         // Hide tabs, show in-call overlay
@@ -2125,7 +2500,7 @@ class MainActivity : AppCompatActivity() {
     private fun endCallFromInCallScreen() {
         val call = com.callagent.gateway.gsm.GsmCallManager.activeCall
         if (call != null) {
-            tvInCallStatus.text = "Ending..."
+            tvInCallStatus.text = "正在结束"
             com.callagent.gateway.gsm.GsmCallManager.hangupCall()
         } else {
             closeInCallScreen()
@@ -2134,7 +2509,7 @@ class MainActivity : AppCompatActivity() {
 
     // ── Gateway Control ──────────────────────────────────
 
-    private fun startGateway() {
+    private fun startGateway(): Boolean {
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
         val server = prefs.getString("server", "") ?: ""
         val port = prefs.getInt("port", 5061)
@@ -2142,15 +2517,21 @@ class MainActivity : AppCompatActivity() {
         val pass = prefs.getString("pass", "") ?: ""
 
         if (server.isEmpty() || user.isEmpty()) {
-            appendLog("ERROR: Open config and set server + username first")
-            return
+            Toast.makeText(this, "请先保存 SIP 服务器和用户名", Toast.LENGTH_LONG).show()
+            switchTab("config")
+            return false
         }
 
-        GatewayService.start(this, server, port, user, pass)
+        if (!GatewayService.start(this, server, port, user, pass)) {
+            Toast.makeText(this, "Android 未能启动 SIP 语音服务，请查看后台状态和运行日志", Toast.LENGTH_LONG).show()
+            refreshBackgroundStatus()
+            return false
+        }
 
         running = true
-
-        appendLog("Starting gateway: $user@$server:$port")
+        appendLog("User confirmed SIP voice start after device diagnostics: $user@$server:$port")
+        Toast.makeText(this, "正在启动 SIP 语音服务", Toast.LENGTH_SHORT).show()
+        return true
     }
 
     private fun stopGateway() {
@@ -2213,10 +2594,10 @@ class MainActivity : AppCompatActivity() {
         else String.format("%d:%02d", m, s)
     }
 
-    private fun resolveThemeColor(attr: Int): Int {
-        val tv = android.util.TypedValue()
-        theme.resolveAttribute(attr, tv, true)
-        return ContextCompat.getColor(this, tv.resourceId)
+    private fun themeColor(attr: Int): Int {
+        val value = android.util.TypedValue()
+        check(theme.resolveAttribute(attr, value, true)) { "Theme does not define color attr $attr" }
+        return if (value.resourceId != 0) ContextCompat.getColor(this, value.resourceId) else value.data
     }
 
     // ── Permissions ─────────────────────────────────────
@@ -2237,10 +2618,6 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             perms.add(Manifest.permission.READ_PHONE_NUMBERS)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            perms.add(Manifest.permission.POST_NOTIFICATIONS)
-        }
-
         val needed = perms.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
@@ -2269,16 +2646,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun requestBatteryOptimizationExemption() {
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                data = Uri.parse("package:$packageName")
-            }
-            startActivity(intent)
-        }
-    }
-
     @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
@@ -2293,13 +2660,32 @@ class MainActivity : AppCompatActivity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ_PERMS) {
+        if (requestCode == GatewayBackgroundRuntime.NOTIFICATION_PERMISSION_REQUEST_CODE) {
+            refreshBackgroundStatus()
+        } else if (requestCode == REQ_PERMS) {
             val denied = permissions.zip(grantResults.toTypedArray())
                 .filter { it.second != PackageManager.PERMISSION_GRANTED }
                 .map { it.first.substringAfterLast('.') }
             if (denied.isNotEmpty()) {
                 appendLog("WARN: Denied permissions: ${denied.joinToString()}")
+                val affected = denied.mapNotNull { permission ->
+                    when (permission) {
+                        "RECORD_AUDIO" -> "通话音频"
+                        "READ_PHONE_STATE" -> "SIM 与通话状态读取"
+                        "CALL_PHONE" -> "外拨电话"
+                        "ANSWER_PHONE_CALLS" -> "接听电话"
+                        "READ_CALL_LOG" -> "通话记录"
+                        "READ_PHONE_NUMBERS" -> "读取本机号码"
+                        "POST_NOTIFICATIONS" -> "后台运行通知"
+                        else -> null
+                    }
+                }
+                tvPermissionNotice.text = "已拒绝：${affected.joinToString("、")}。相关功能会受限；可到系统设置的应用权限中更改。"
+            } else {
+                tvPermissionNotice.text = "通话和短信功能需要相应系统权限；拒绝权限会停用相关功能，可在系统应用设置中更改。"
             }
+            refreshSimSummary()
+            refreshBackgroundStatus()
         }
     }
 

@@ -67,6 +67,54 @@ load_official_app_functions() {
     echo "official_app_functions_metadata=$APP_FUNCTIONS_META"
 }
 
+diagnose_util_functions_file() {
+    local LABEL=$1
+    local FILE=$2
+    echo "${LABEL}_path=$FILE"
+    if [ ! -f "$FILE" ]; then
+        echo "${LABEL}_exists=false"
+        return 0
+    fi
+
+    echo "${LABEL}_exists=true"
+    echo "${LABEL}_metadata=$(stat -c '%u:%g:%a:%s' "$FILE" 2>/dev/null || echo unknown)"
+    echo "${LABEL}_selinux_context=$(ls -Zd "$FILE" 2>/dev/null | sed -n '1p' || echo unknown)"
+    echo "${LABEL}_sha256=$(sha256sum "$FILE" 2>/dev/null | sed -n '1s/ .*//p' || echo unavailable)"
+
+    set +e
+    grep -n -E '^MAGISK_VER(_CODE)?=' "$FILE"
+    local LINES_RC=$?
+    grep -xqF "MAGISK_VER='$MAGISK_VERSION'" "$FILE"
+    local VERSION_RC=$?
+    grep -xqF "MAGISK_VER_CODE=$MAGISK_VERSION_CODE" "$FILE"
+    local VERSION_CODE_RC=$?
+    set -e
+
+    echo "${LABEL}_version_lines_rc=$LINES_RC"
+    echo "${LABEL}_version_match_rc=$VERSION_RC"
+    echo "${LABEL}_version_code_match_rc=$VERSION_CODE_RC"
+}
+
+diagnose_magisk_environment() {
+    echo "magisk_diag_expected_version=$MAGISK_VERSION"
+    echo "magisk_diag_expected_version_code=$MAGISK_VERSION_CODE"
+    echo "magisk_diag_identity=$(id 2>&1 | sed -n '1p')"
+    echo "magisk_diag_selinux_identity=$(id -Z 2>&1 | sed -n '1p')"
+    echo "magisk_diag_grep_path=$(command -v grep 2>/dev/null || echo missing)"
+    echo "magisk_diag_sha256sum_path=$(command -v sha256sum 2>/dev/null || echo missing)"
+
+    diagnose_util_functions_file active_util_functions "$MAGISKBIN/util_functions.sh"
+    diagnose_util_functions_file cache_alt_util_functions /cache/data_adb/magisk/util_functions.sh
+    diagnose_util_functions_file data_alt_util_functions /data/magisk/util_functions.sh
+    diagnose_util_functions_file manager_alt_util_functions /data/user_de/0/com.topjohnwu.magisk/install/util_functions.sh
+
+    set +e
+    grep -xqF "MAGISK_VER='$MAGISK_VERSION'" "$MAGISKBIN/util_functions.sh"
+    local EXPECTED_GREP_RC=$?
+    set -e
+    echo "magisk_diag_grep_exact_expected_line_rc=$EXPECTED_GREP_RC"
+}
+
 extract_official_apk_files() {
     local LABEL=$1
     local DESTINATION=$2
@@ -85,6 +133,7 @@ extract_official_apk_files() {
 verify_magisk_environment() {
     verify_magisk
     load_official_app_functions
+    diagnose_magisk_environment
     if env_check "$MAGISK_VERSION" "$MAGISK_VERSION_CODE"; then
         echo "magisk_environment=complete"
         echo "magisk_environment_path=$MAGISKBIN"

@@ -697,7 +697,9 @@ class MagiskAvdSmoke:
         if "gateway_post_fs_data_config_dir=0:700" not in result or "gateway_service_hook=ran" not in result:
             raise SmokeFailure("project module boot hooks were not evidenced on this cold boot")
         self.record("gateway_module_boot_hooks", "pass", "post-fs-data created root-owned 0700 config dir and service.sh logged on boot")
-        self.record("gateway_broker_probe", "pass", "broker result is recorded without account identifiers; SIM/HAL is not a voice acceptance test")
+        if "broker.query_completed=true" not in result or "broker.status=ok" not in result:
+            raise SmokeFailure("gateway broker account query did not complete successfully")
+        self.record("gateway_broker_probe", "pass", "framework account query returned ok; rows may be empty without SIMs; no identifiers or voice acceptance")
 
         magisk_log = self.adb_run("logcat", "-d", "-s", "Magisk:D", "GatewayMagisk:I", "*:S",
                                   name="filtered-magisk-boot-logs", timeout=30, check=False)

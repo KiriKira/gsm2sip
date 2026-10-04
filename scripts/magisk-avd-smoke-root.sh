@@ -269,10 +269,14 @@ probe_gateway() {
     BROKER_STATUS=$(printf '%s\n' "$ACCOUNTS_OUTPUT" | sed -n 's/^status=//p' | sed -n '1p')
     BROKER_COUNT=$(printf '%s\n' "$ACCOUNTS_OUTPUT" | sed -n 's/^count=//p' | sed -n '1p')
     BROKER_ERROR=$(printf '%s\n' "$ACCOUNTS_OUTPUT" | sed -n 's/^error=//p' | sed -n '1p')
+    # This API 34 image has framework Telephony/Telecom services. A successful
+    # empty query is valid without real SIMs; setup/attribution errors are not.
     case "$ACCOUNTS_RC:$BROKER_STATUS" in
-        0:ok|10:unavailable) ;;
+        0:ok) ;;
+        10:unavailable) fail "gateway_broker_query_unavailable_${BROKER_ERROR:-unknown}" ;;
         *) fail gateway_broker_unexpected_result ;;
     esac
+    echo "broker.query_completed=true"
     echo "broker.status=$BROKER_STATUS"
     echo "broker.count=${BROKER_COUNT:-unknown}"
     echo "broker.error=${BROKER_ERROR:-none}"

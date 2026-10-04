@@ -96,7 +96,8 @@ class Smoke:
     def capture(self, name: str) -> ET.Element:
         device_xml = "/sdcard/ui-smoke-window.xml"
         attempts = 4
-        retry_deadline = time.monotonic() + 12.0
+        retry_budget = 45.0
+        retry_deadline = time.monotonic() + retry_budget
         last_error = "no fresh hierarchy was produced"
         attempts_made = 0
         root: ET.Element | None = None
@@ -118,11 +119,23 @@ class Smoke:
             if remaining <= 0:
                 last_error = "retry time budget expired before UIAutomator dump"
                 break
-            adb_timeout = min(ADB_TIMEOUT_SECONDS, remaining)
-            dump = self.command(["shell", "uiautomator", "dump", device_xml],
-                                timeout=adb_timeout,
-                                label=f"uiautomator_{name}_attempt_{attempt}")
+            adb_timeout = min(15.0, ADB_TIMEOUT_SECONDS, remaining)
             attempts_made = attempt
+            try:
+                dump = self.command(["shell", "uiautomator", "dump", device_xml],
+                                    timeout=adb_timeout,
+                                    label=f"uiautomator_{name}_attempt_{attempt}")
+            except RuntimeError as exc:
+                # A transitioning window can stall UiAutomation as well as
+                # return a null root. Retry only an actual subprocess timeout;
+                # missing tools and other command failures remain fatal.
+                if not isinstance(exc.__cause__, subprocess.TimeoutExpired):
+                    raise
+                last_error = f"UIAutomator dump timed out on attempt {attempt}"
+                remaining = retry_deadline - time.monotonic()
+                if remaining > 0 and attempt < attempts:
+                    self.wait(min(2.0, remaining))
+                continue
             dump_text = f"{dump.stdout}\n{dump.stderr}".lower()
             null_root = "null root node returned by uitestautomationbridge" in dump_text
             attempt_xml = self.artifacts / f"{safe_name(name)}_attempt_{attempt}.xml"
@@ -170,7 +183,7 @@ class Smoke:
         if root is None:
             raise RuntimeError(
                 f"uiautomator hierarchy for {name} remained unavailable after "
-                f"{attempts_made} attempt(s) / 12-second retry budget: {last_error}"
+                f"{attempts_made} attempt(s) / {retry_budget:g}-second retry budget: {last_error}"
             )
         image = self.command(["exec-out", "screencap", "-p"], binary=True,
                              label=f"screencap_{name}")

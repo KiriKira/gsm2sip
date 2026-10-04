@@ -6,6 +6,7 @@ import java.util.Base64
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -60,6 +61,25 @@ class MagiskRuntimeProtocolTest {
                 expectedAppVersion = BuildConfig.VERSION_CODE
             )
         )
+        assertNull(
+            MagiskRuntimeProtocol.parse(
+                response(emptyList(), status = "unavailable", error = "context"),
+                expectedUserId = 0,
+                expectedAppVersion = BuildConfig.VERSION_CODE
+            )
+        )
+    }
+
+    @Test
+    fun successfulEmptySnapshotIsDistinctFromUnavailableBroker() {
+        val parsed = MagiskRuntimeProtocol.parse(
+            response(emptyList()),
+            expectedUserId = 0,
+            expectedAppVersion = BuildConfig.VERSION_CODE
+        )
+
+        assertNotNull(parsed)
+        assertTrue(parsed!!.isEmpty())
     }
 
     @Test

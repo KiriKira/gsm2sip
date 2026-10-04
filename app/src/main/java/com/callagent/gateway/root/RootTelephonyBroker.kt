@@ -62,7 +62,8 @@ object RootTelephonyBroker {
     }
 
     private fun execute(args: Array<String>): Pair<Result, Int> {
-        if (Process.myUid() != Process.SYSTEM_UID) {
+        val processUid = Process.myUid()
+        if (processUid != Process.SYSTEM_UID) {
             return Result("error", 0, errorCode = "uid") to 20
         }
 
@@ -91,7 +92,7 @@ object RootTelephonyBroker {
 
         enableProcessLocalHiddenApiAccess()
         val context = systemContext()
-        if (context.packageName != "android" || context.applicationInfo?.uid != Process.SYSTEM_UID) {
+        if (!isTrustedSystemContext(context, processUid)) {
             return Result("unavailable", expectedUserId, errorCode = "context") to 10
         }
         val expectedHandleUser = UserHandle.getUserHandleForUid(Process.SYSTEM_UID)
@@ -150,6 +151,14 @@ object RootTelephonyBroker {
         }
         return Result("ok", expectedUserId, selected) to 0
     }
+
+    /**
+     * systemMain() creates a synthetic LoadedApk for package "android" whose
+     * ApplicationInfo uid can be 0. The child process UID is authoritative;
+     * only use the system context's package name as its package identity.
+     */
+    internal fun isTrustedSystemContext(context: Context, processUid: Int): Boolean =
+        processUid == Process.SYSTEM_UID && context.packageName == "android"
 
     /**
      * Use the public reverse association where it exists. Android O through Q

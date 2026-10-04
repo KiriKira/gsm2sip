@@ -25,6 +25,7 @@ ROOTAVD_COMMIT = "613caa44371f85e1a461bc030e07ddc2d71afe32"
 MAGISK_VERSION = "30.7"
 MAGISK_VERSION_CODE = "30700"
 MAGISK_APK_SHA256 = "e0d32d2123532860f97123d927b1bb86c4e08e6fd8a48bfc6b5bee0afae9ebd5"
+MAGISK_APP_FUNCTIONS_SHA256 = "6c0acfadcfca72dcdc1a6bd37874ef0ef10ff793a19ead34a4b77e5b2ca13f0b"
 SYSTEM_IMAGE = "system-images/android-34/google_apis/x86_64"
 AVD_NAME = "Gsm2SipMagiskApi34"
 MAGISK_ENV_APK_FILES = {
@@ -71,6 +72,7 @@ class MagiskAvdSmoke:
         self.emulator_log_handle: Any = None
         self.boot_ids: list[str] = []
         self.marker_boot_ids: list[str] = []
+        self.official_app_functions_path: Path | None = None
         self.root_access = "unavailable"
         self.checks: list[dict[str, str]] = []
         self.summary: dict[str, Any] = {
@@ -170,13 +172,19 @@ class MagiskAvdSmoke:
             if missing:
                 raise SmokeFailure(f"official Magisk APK is missing env-fix files: {sorted(missing)}")
             util_functions = apk.read("assets/util_functions.sh").decode("utf-8", errors="replace")
-            app_functions = apk.read("assets/app_functions.sh").decode("utf-8", errors="replace")
+            app_functions_bytes = apk.read("assets/app_functions.sh")
+            app_functions = app_functions_bytes.decode("utf-8", errors="replace")
             if f"MAGISK_VER='{MAGISK_VERSION}'" not in util_functions:
                 raise SmokeFailure("official Magisk APK util_functions.sh version does not match the pinned release")
             if f"MAGISK_VER_CODE={MAGISK_VERSION_CODE}" not in util_functions:
                 raise SmokeFailure("official Magisk APK util_functions.sh version code does not match the pinned release")
             if not re.search(r"(?m)^fix_env\(\) \{", app_functions):
                 raise SmokeFailure("official Magisk APK is missing its fix_env function")
+            app_functions_hash = hashlib.sha256(app_functions_bytes).hexdigest()
+            if app_functions_hash != MAGISK_APP_FUNCTIONS_SHA256:
+                raise SmokeFailure(f"official Magisk app_functions.sh hash mismatch: {app_functions_hash}")
+            self.official_app_functions_path = self.artifacts / "official-magisk-app_functions.sh"
+            self.official_app_functions_path.write_bytes(app_functions_bytes)
 
         original = root.read_text(encoding="utf-8")
         patched = original
@@ -249,7 +257,7 @@ class MagiskAvdSmoke:
         self.record("pinned_sources", "pass",
                     f"rootAVD={git_head}; Magisk={MAGISK_VERSION}; sha256={apk_hash}")
         self.record("official_magisk_env_fix_sources", "pass",
-                    f"validated {len(MAGISK_ENV_APK_FILES)} APK entries and official fix_env/app_functions version")
+                    f"validated {len(MAGISK_ENV_APK_FILES)} APK entries; app_functions sha256={app_functions_hash}")
         self.record("rootavd_network_guards", "pass", "; ".join(changes[1:]))
 
     def prepare_avd(self) -> None:
@@ -415,8 +423,9 @@ class MagiskAvdSmoke:
         shell_uid = self.shell("id -u", name="shell-uid", timeout=10)
         if shell_uid != "2000":
             raise SmokeFailure(f"unexpected adb shell uid before Magisk authorization: {shell_uid}")
-        command = [self.adb, "-s", self.serial, "shell",
-                   f"su -c '/system/bin/sh /data/local/tmp/magisk-avd-smoke-root.sh {action}'"]
+        inner = f"/system/bin/sh /data/local/tmp/magisk-avd-smoke-root.sh {action}"
+        remote = f"PATH=/debug_ramdisk:/sbin:$PATH su -c {shlex.quote(inner)}"
+        command = [self.adb, "-s", self.serial, "shell", remote]
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         deadline = time.monotonic() + min(60, timeout)
         once_selected = False
@@ -486,18 +495,26 @@ class MagiskAvdSmoke:
                                  check=False, log=False)
             if state.returncode == 0 and self.shell("id -u", name="adbd-root-uid",
                                                    timeout=8, check=False, log=False) == "0":
-                self.root_access = "adbd root (Magisk lifecycle remains separately verified)"
-                self.record("root_access_fallback", "pass", str(result.stdout).strip())
+                self.root_access = "adbd root; privileged actions via Magisk su -c"
+                self.record("root_access_fallback", "pass",
+                            f"{str(result.stdout).strip()}; privileged actions use Magisk su namespace")
                 return True
             time.sleep(1)
         return False
 
     def run_root_action(self, action: str, name: str, *, timeout: float = 120) -> str:
         if self.root_access.startswith("adbd root"):
-            remote = f"/system/bin/sh /data/local/tmp/magisk-avd-smoke-root.sh {action}"
+            if action not in {"fix_environment", "verify_environment", "install_probe", "install_gateway", "probe_gateway"}:
+                raise SmokeFailure(f"unrecognized privileged smoke action: {action}")
+            inner = f"/system/bin/sh /data/local/tmp/magisk-avd-smoke-root.sh {action}"
+            remote = f"PATH=/debug_ramdisk:/sbin:$PATH su -c {shlex.quote(inner)}"
         else:
             raise SmokeFailure("direct privileged action requires adbd root")
-        return self.shell(remote, name=name, timeout=timeout)
+        output = self.shell(remote, name=name, timeout=timeout)
+        if "root_uid=0" not in output:
+            raise SmokeFailure(f"Magisk su action did not confirm UID 0: {name}")
+        self.record("magisk_su_action", "pass", f"{action} ran via Magisk su -c")
+        return output
 
     def perform_root_action(self, action: str, name: str, *, timeout: float = 120) -> str:
         if self.try_adbd_root_fallback():
@@ -509,6 +526,15 @@ class MagiskAvdSmoke:
 
     def push(self, local: Path, remote: str, label: str) -> None:
         self.adb_run("push", str(local), remote, name=label, timeout=90)
+
+    def push_root_probe(self, label: str) -> None:
+        app_functions = self.official_app_functions_path
+        if app_functions is None:
+            raise SmokeFailure("official Magisk app_functions.sh was not extracted from the pinned APK")
+        root_shell = Path(__file__).resolve().parent / "magisk-avd-smoke-root.sh"
+        self.push(root_shell, "/data/local/tmp/magisk-avd-smoke-root.sh", label)
+        self.push(app_functions, "/data/local/tmp/magisk-avd-app-functions.sh",
+                  f"{label}-official-app-functions")
 
     def validate_repeat_boot_markers(self, output: str, label: str) -> str:
         values: dict[str, str] = {}
@@ -570,8 +596,7 @@ class MagiskAvdSmoke:
         self.record("magisk_ramdisk_patch", "pass", f"ramdisk sha256 {original_ramdisk_hash} -> {patched_hash}")
 
         self.start_emulator()
-        self.push(Path(__file__).resolve().parent / "magisk-avd-smoke-root.sh",
-                  "/data/local/tmp/magisk-avd-smoke-root.sh", "push-root-probe")
+        self.push_root_probe("push-root-probe")
         official_apk = self.rootavd / "Magisk.zip"
         env_fix_apk_hash = hashlib.sha256(official_apk.read_bytes()).hexdigest()
         if env_fix_apk_hash != MAGISK_APK_SHA256:
@@ -586,8 +611,7 @@ class MagiskAvdSmoke:
 
         self.stop_emulator()
         self.start_emulator()
-        self.push(Path(__file__).resolve().parent / "magisk-avd-smoke-root.sh",
-                  "/data/local/tmp/magisk-avd-smoke-root.sh", "refresh-root-probe-after-env-fix")
+        self.push_root_probe("refresh-root-probe-after-env-fix")
         result = self.perform_root_action("verify_environment", "verify-magisk-environment-after-cold-boot", timeout=120)
         if "magisk_environment=complete" not in result:
             raise SmokeFailure("Magisk environment fix did not persist across a cold boot")
@@ -599,8 +623,7 @@ class MagiskAvdSmoke:
 
         self.stop_emulator()
         self.start_emulator()
-        self.push(Path(__file__).resolve().parent / "magisk-avd-smoke-root.sh",
-                  "/data/local/tmp/magisk-avd-smoke-root.sh", "refresh-root-probe-boot2")
+        self.push_root_probe("refresh-root-probe-boot2")
         self.push(self.gateway_zip, "/data/local/tmp/gateway-magisk.zip", "push-gateway-module")
         result = self.perform_root_action("install_gateway", "install-gateway-module", timeout=240)
         first_marker_boot = self.validate_repeat_boot_markers(result, "probe boot 2")
@@ -609,8 +632,7 @@ class MagiskAvdSmoke:
         self.shell("logcat -c", name="clear-pre-project-module-logs", timeout=15)
         self.stop_emulator()
         self.start_emulator()
-        self.push(Path(__file__).resolve().parent / "magisk-avd-smoke-root.sh",
-                  "/data/local/tmp/magisk-avd-smoke-root.sh", "refresh-root-probe-boot3")
+        self.push_root_probe("refresh-root-probe-boot3")
         result = self.perform_root_action("probe_gateway", "probe-gateway-module", timeout=180)
         second_marker_boot = self.validate_repeat_boot_markers(result, "probe boot 3")
         if first_marker_boot == second_marker_boot:

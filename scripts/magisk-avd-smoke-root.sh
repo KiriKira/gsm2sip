@@ -11,6 +11,7 @@ PROBE_DIR=/data/adb/modules/$PROBE_ID
 GATEWAY_DIR=/data/adb/modules/$GATEWAY_ID
 CTL=$GATEWAY_DIR/bin/gsm2sipctl
 OFFICIAL_APK=/data/local/tmp/magisk-v30.7.apk
+OFFICIAL_APP_FUNCTIONS=/data/local/tmp/magisk-avd-app-functions.sh
 ENV_FIX_DIR=/data/local/tmp/magisk-avd-official-env-fix
 ENV_INSTALL_DIR=$ENV_FIX_DIR/install
 
@@ -49,15 +50,36 @@ verify_shell_policy_is_not_persistent() {
 }
 
 load_official_app_functions() {
-    [ -f "$OFFICIAL_APK" ] || fail official_magisk_apk_missing
-    mkdir -p "$ENV_FIX_DIR"
-    unzip -o -j "$OFFICIAL_APK" assets/app_functions.sh -d "$ENV_FIX_DIR" >/dev/null 2>&1 || fail official_app_functions_extract_failed
-    [ -f "$ENV_FIX_DIR/app_functions.sh" ] || fail official_app_functions_missing
-    . "$ENV_FIX_DIR/app_functions.sh"
+    if [ ! -f "$OFFICIAL_APP_FUNCTIONS" ] || [ ! -r "$OFFICIAL_APP_FUNCTIONS" ]; then
+        echo "official_app_functions_file=$OFFICIAL_APP_FUNCTIONS" >&2
+        ls -ld /data/local/tmp "$OFFICIAL_APP_FUNCTIONS" >&2 2>/dev/null || true
+        fail official_app_functions_file_missing_or_unreadable
+    fi
+    grep -Fqx 'env_check() {' "$OFFICIAL_APP_FUNCTIONS" || fail official_app_functions_env_check_missing
+    grep -Fqx 'fix_env() {' "$OFFICIAL_APP_FUNCTIONS" || fail official_app_functions_fix_env_missing
+    . "$OFFICIAL_APP_FUNCTIONS" || fail official_app_functions_source_failed
     MAGISKBIN=/data/adb/magisk
     MAGISKTMP=$("$MAGISK_PATH" --path 2>/dev/null | sed -n '1p')
     [ -n "$MAGISKTMP" ] || fail magisk_tmp_path_missing
     export MAGISKBIN MAGISKTMP
+    APP_FUNCTIONS_META=$(stat -c '%u:%g:%a:%s' "$OFFICIAL_APP_FUNCTIONS" 2>/dev/null || echo unknown)
+    echo "official_app_functions=loaded"
+    echo "official_app_functions_metadata=$APP_FUNCTIONS_META"
+}
+
+extract_official_apk_files() {
+    local LABEL=$1
+    local DESTINATION=$2
+    shift 2
+    local UNZIP_LOG=$ENV_FIX_DIR/${LABEL}.unzip.log
+    if unzip -o -j "$OFFICIAL_APK" "$@" -d "$DESTINATION" >"$UNZIP_LOG" 2>&1; then
+        echo "official_apk_extract=$LABEL"
+    else
+        local UNZIP_RC=$?
+        echo "official_apk_extract=$LABEL failed exit=$UNZIP_RC log=$UNZIP_LOG" >&2
+        cat "$UNZIP_LOG" >&2 2>/dev/null || true
+        return 1
+    fi
 }
 
 verify_magisk_environment() {
@@ -81,14 +103,11 @@ fix_magisk_environment() {
     rm -rf "$ENV_INSTALL_DIR"
     mkdir -p "$ENV_INSTALL_DIR/chromeos"
 
-    unzip -o -j "$OFFICIAL_APK" \
-        assets/util_functions.sh assets/boot_patch.sh assets/addon.d.sh assets/stub.apk \
-        -d "$ENV_INSTALL_DIR" >/dev/null 2>&1 || fail official_magisk_scripts_extract_failed
-    unzip -o -j "$OFFICIAL_APK" \
-        assets/chromeos/futility assets/chromeos/kernel_data_key.vbprivk assets/chromeos/kernel.keyblock \
-        -d "$ENV_INSTALL_DIR/chromeos" >/dev/null 2>&1 || fail official_magisk_chromeos_assets_extract_failed
-    unzip -o -j "$OFFICIAL_APK" "lib/$ABI/*.so" \
-        -d "$ENV_INSTALL_DIR" >/dev/null 2>&1 || fail official_magisk_x86_64_libraries_extract_failed
+    extract_official_apk_files magisk-scripts "$ENV_INSTALL_DIR" \
+        assets/util_functions.sh assets/boot_patch.sh assets/addon.d.sh assets/stub.apk || fail official_magisk_scripts_extract_failed
+    extract_official_apk_files chromeos-assets "$ENV_INSTALL_DIR/chromeos" \
+        assets/chromeos/futility assets/chromeos/kernel_data_key.vbprivk assets/chromeos/kernel.keyblock || fail official_magisk_chromeos_assets_extract_failed
+    extract_official_apk_files x86_64-libraries "$ENV_INSTALL_DIR" "lib/$ABI/*.so" || fail official_magisk_x86_64_libraries_extract_failed
 
     grep -qx "MAGISK_VER='$MAGISK_VERSION'" "$ENV_INSTALL_DIR/util_functions.sh" || fail official_magisk_version_asset_mismatch
     grep -qx "MAGISK_VER_CODE=$MAGISK_VERSION_CODE" "$ENV_INSTALL_DIR/util_functions.sh" || fail official_magisk_version_code_asset_mismatch
@@ -104,8 +123,8 @@ fix_magisk_environment() {
     ABI32=$(getprop ro.product.cpu.abilist32 | sed 's/,.*//')
     if [ -n "$ABI32" ]; then
         mkdir -p "$ENV_FIX_DIR/abi32"
-        unzip -o -j "$OFFICIAL_APK" "lib/$ABI32/libmagisk.so" \
-            -d "$ENV_FIX_DIR/abi32" >/dev/null 2>&1 || fail official_magisk_32bit_library_extract_failed
+        extract_official_apk_files x86-32bit-library "$ENV_FIX_DIR/abi32" \
+            "lib/$ABI32/libmagisk.so" || fail official_magisk_32bit_library_extract_failed
         [ -f "$ENV_FIX_DIR/abi32/libmagisk.so" ] || fail official_magisk_32bit_library_missing
         cp "$ENV_FIX_DIR/abi32/libmagisk.so" "$ENV_INSTALL_DIR/magisk32"
     fi

@@ -338,11 +338,23 @@ class MagiskAvdSmoke:
         self.record(f"android_boot_{len(self.boot_ids)}", "pass", f"API={sdk}; ABI={abi}; boot_id={boot_id}")
         time.sleep(12)
 
-    def stop_emulator(self) -> None:
+    def sync_guest_filesystem(self, name: str) -> None:
+        result = self.adb_run("shell", "sync", name=name, timeout=30, check=True)
+        if result.returncode != 0:
+            raise SmokeFailure(f"guest filesystem sync failed: {name}")
+        self.record("guest_filesystem_sync", "pass", name)
+
+    def stop_emulator(self, *, sync_guest: bool = True) -> None:
         process = self.emulator_process
         if process is None:
             return
+        sync_failure: Exception | None = None
         if process.poll() is None:
+            if sync_guest:
+                try:
+                    self.sync_guest_filesystem("before-emulator-stop-sync")
+                except Exception as exc:
+                    sync_failure = exc
             self.run([self.adb, "start-server"], "adb-start-server-before-stop", timeout=15, check=False)
             self.adb_run("emu", "kill", name="stop-emulator", timeout=10, check=False)
             try:
@@ -358,6 +370,8 @@ class MagiskAvdSmoke:
         if self.emulator_log_handle:
             self.emulator_log_handle.close()
             self.emulator_log_handle = None
+        if sync_failure is not None:
+            raise SmokeFailure(f"guest filesystem sync failed before emulator stop: {sync_failure}")
 
     def create_probe_zip(self) -> Path:
         module = Path(__file__).resolve().parent / "magisk-avd-smoke-module"
@@ -510,18 +524,42 @@ class MagiskAvdSmoke:
             remote = f"PATH=/debug_ramdisk:/sbin:$PATH su -c {shlex.quote(inner)}"
         else:
             raise SmokeFailure("direct privileged action requires adbd root")
-        output = self.shell(remote, name=name, timeout=timeout)
+        result = self.adb_run("shell", remote, name=name, timeout=timeout, check=False)
+        output = str(result.stdout).strip()
+        if result.returncode != 0 or re.search(r"(^|\n)smoke_error=", output):
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            raise SmokeFailure(
+                f"Magisk action failed ({result.returncode}): {name}\n"
+                f"stdout:\n{output}\nstderr:\n{stderr}"
+            )
         if "root_uid=0" not in output:
             raise SmokeFailure(f"Magisk su action did not confirm UID 0: {name}")
         self.record("magisk_su_action", "pass", f"{action} ran via Magisk su -c")
         return output
 
+    @staticmethod
+    def util_functions_snapshot(output: str) -> str:
+        wanted = (
+            "active_util_functions_metadata=",
+            "active_util_functions_sha256=",
+            "active_util_functions_version_lines_rc=",
+            "active_util_functions_version_match_rc=",
+            "active_util_functions_version_code_match_rc=",
+            "magisk_diag_grep_path=",
+            "magisk_diag_grep_exact_expected_line_rc=",
+        )
+        lines = [line for line in output.splitlines() if any(line.startswith(key) for key in wanted)]
+        return "; ".join(lines) or "active util_functions diagnostics were not returned"
+
     def perform_root_action(self, action: str, name: str, *, timeout: float = 120) -> str:
         if self.try_adbd_root_fallback():
-            return self.run_root_action(action, name, timeout=timeout)
-        result = self.request_one_time_shell_root(action, name, timeout=timeout)
-        if result is None:
-            raise SmokeFailure("adbd root is unavailable and a one-time Magisk su approval was not granted")
+            result = self.run_root_action(action, name, timeout=timeout)
+        else:
+            result = self.request_one_time_shell_root(action, name, timeout=timeout)
+            if result is None:
+                raise SmokeFailure("adbd root is unavailable and a one-time Magisk su approval was not granted")
+        if action in {"fix_environment", "install_probe", "install_gateway"}:
+            self.sync_guest_filesystem(f"sync-after-{action}")
         return result
 
     def push(self, local: Path, remote: str, label: str) -> None:
@@ -588,7 +626,8 @@ class MagiskAvdSmoke:
             raise SmokeFailure(f"rootAVD patch failed or timed out: {exc}") from exc
         if completed.returncode != 0:
             raise SmokeFailure(f"pinned rootAVD exited with {completed.returncode}; inspect rootavd-run.log")
-        self.stop_emulator()
+        # rootAVD shuts down this disposable guest itself while patching the ramdisk.
+        self.stop_emulator(sync_guest=False)
         patched_hash = hashlib.sha256(ramdisk.read_bytes()).hexdigest()
         (self.artifacts / "ramdisk-patched.sha256").write_text(patched_hash + "  ramdisk.img\n", encoding="utf-8")
         if patched_hash == original_ramdisk_hash:
@@ -608,11 +647,27 @@ class MagiskAvdSmoke:
         if "magisk_environment=complete" not in result or "magisk_environment_fix=official_app_functions_fix_env" not in result:
             raise SmokeFailure("official Magisk environment fix did not report complete")
         self.record("official_magisk_environment_fix", "pass", result.replace("\n", "; "))
+        before_hash = re.search(r"(?m)^active_util_functions_sha256=([a-f0-9]{64})$", result)
+        before_size = re.search(r"(?m)^active_util_functions_metadata=[0-9]+:[0-9]+:[0-9]+:([0-9]+)$", result)
+        if before_hash is None or before_size is None or int(before_size.group(1)) == 0:
+            raise SmokeFailure("official util_functions snapshot is missing or empty before cold boot")
+        self.record("util_functions_before_cold_boot", "pass", self.util_functions_snapshot(result))
 
         self.stop_emulator()
         self.start_emulator()
         self.push_root_probe("refresh-root-probe-after-env-fix")
-        result = self.perform_root_action("verify_environment", "verify-magisk-environment-after-cold-boot", timeout=120)
+        try:
+            result = self.perform_root_action("verify_environment", "verify-magisk-environment-after-cold-boot", timeout=120)
+        except SmokeFailure as exc:
+            self.record("util_functions_after_cold_boot", "fail", self.util_functions_snapshot(str(exc)))
+            raise
+        after_hash = re.search(r"(?m)^active_util_functions_sha256=([a-f0-9]{64})$", result)
+        after_size = re.search(r"(?m)^active_util_functions_metadata=[0-9]+:[0-9]+:[0-9]+:([0-9]+)$", result)
+        if (after_hash is None or after_size is None or
+                after_hash.group(1) != before_hash.group(1) or
+                after_size.group(1) != before_size.group(1)):
+            raise SmokeFailure("official util_functions content changed or disappeared across cold boot")
+        self.record("util_functions_after_cold_boot", "pass", self.util_functions_snapshot(result))
         if "magisk_environment=complete" not in result:
             raise SmokeFailure("Magisk environment fix did not persist across a cold boot")
         self.record("official_magisk_environment_persisted", "pass", result.replace("\n", "; "))

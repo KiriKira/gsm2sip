@@ -129,6 +129,7 @@ class TlsSipTransport(
     private val host: String,
     private val port: Int,
     private val soTimeoutMs: Int = 5000,
+    private val socketFactory: SSLSocketFactory = SSLSocketFactory.getDefault() as SSLSocketFactory,
     private val log: (String) -> Unit = {}
 ) : SipTransport {
 
@@ -152,7 +153,7 @@ class TlsSipTransport(
 
     override fun open() {
         close()
-        val s = (SSLSocketFactory.getDefault() as SSLSocketFactory)
+        val s = socketFactory
             .createSocket() as SSLSocket
         s.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
         s.soTimeout = soTimeoutMs
@@ -170,7 +171,9 @@ class TlsSipTransport(
             // certificate it considers default -- which is then rejected for
             // the wrong reason.  This server's certificate has callagent.pro
             // as a SAN behind a CN of badrenovo.de, so the name must arrive.
-            serverNames = listOf(SNIHostName(host))
+            serverNames = if (host.contains(':') || host.matches(Regex("[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+"))) {
+                emptyList()
+            } else listOf(SNIHostName(host))
         }
         // Without this the handshake is deferred until the first read, so a
         // certificate failure would surface as a mysterious read error on

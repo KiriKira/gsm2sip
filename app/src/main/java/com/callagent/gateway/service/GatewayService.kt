@@ -556,8 +556,12 @@ class GatewayService : Service() {
         cfgServer = prefs.getString("server", "") ?: ""
         cfgPort = prefs.getInt("port", 5061)
         cfgUser = prefs.getString("user", "") ?: ""
-        cfgPass = prefs.getString("pass", "") ?: ""
-        if (cfgServer.isEmpty() || cfgUser.isEmpty()) {
+        cfgPass = com.callagent.gateway.data.VoiceCredentialStore.password(this,cfgServer,cfgUser)
+        if (cfgServer.isEmpty() || cfgUser.isEmpty() || cfgPass.isEmpty()) {
+            initGeneration.incrementAndGet()
+            initializing.set(false)
+            voiceRuntimeStarted = false
+            refreshVoicePowerLease()
             orchestrator?.stop()
             sipClient?.stop()
             orchestrator = null
@@ -929,7 +933,12 @@ class GatewayService : Service() {
         val client = ControlApiClient(this, session.controlBaseUrl)
         val database = GatewayDatabase.get(this)
         flushSmsRedactions(database)
-        if (database.adoptGatewayId(session.gatewayId)) SimRegistry.resetForGatewayChange(this)
+        if (database.activeGatewayId() != session.gatewayId) {
+            throw ControlApiException("SESSION_CHANGED", "Control identity changed; sync will resume with the current pairing", retryable = true)
+        }
+        // Optional READ_SMS recovery is isolated from voice and Magisk. One
+        // bounded page per round prevents a large inbox delaying heartbeat.
+        runCatching { com.callagent.gateway.sms.SmsProviderRecovery.scan(this) }
         val snapshot = SimRegistry.snapshot(this)
         val sims = snapshot.mappings
             .map { mapping ->
@@ -1256,12 +1265,14 @@ class GatewayService : Service() {
         currentAttemptStart = 0L
 
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
-        val server = intent?.getStringExtra(EXTRA_SERVER) ?: prefs.getString("server", "") ?: ""
-        val port = intent?.getIntExtra(EXTRA_PORT, 5061) ?: prefs.getInt("port", 5061)
-        val username = intent?.getStringExtra(EXTRA_USER) ?: prefs.getString("user", "") ?: ""
-        val password = intent?.getStringExtra(EXTRA_PASS) ?: prefs.getString("pass", "") ?: ""
+        val paired = CredentialStore.load(this) != null
+        val server = if (paired) prefs.getString("server", "").orEmpty() else intent?.getStringExtra(EXTRA_SERVER) ?: prefs.getString("server", "").orEmpty()
+        val port = if (paired) prefs.getInt("port", 5061) else intent?.getIntExtra(EXTRA_PORT, 5061) ?: prefs.getInt("port", 5061)
+        val username = if (paired) prefs.getString("user", "").orEmpty() else intent?.getStringExtra(EXTRA_USER) ?: prefs.getString("user", "").orEmpty()
+        val password = if (paired) com.callagent.gateway.data.VoiceCredentialStore.password(this,server,username)
+            else intent?.getStringExtra(EXTRA_PASS) ?: com.callagent.gateway.data.VoiceCredentialStore.password(this,server,username)
 
-        if (server.isEmpty() || username.isEmpty()) {
+        if (server.isEmpty() || username.isEmpty() || password.isEmpty()) {
             voiceRuntimeStarted = false
             refreshVoicePowerLease()
             cfgServer = ""
@@ -1280,8 +1291,9 @@ class GatewayService : Service() {
             .putString("server", server)
             .putInt("port", port)
             .putString("user", username)
-            .putString("pass", password)
+            .remove("pass")
             .apply()
+        if (!paired) com.callagent.gateway.data.VoiceCredentialStore.savePassword(this,password,expectedGatewayId = null)
 
         // Codec preference is a property of the SDP we build, so it has to be
         // in place before the first INVITE goes out.
@@ -1407,7 +1419,8 @@ class GatewayService : Service() {
             localPort = 5060,
             publicIp = publicIp,
             useTls = useTls,
-            srtpRequested = true
+            srtpRequested = true,
+            caPem = com.callagent.gateway.data.VoiceCredentialStore.caPem(this,cfgServer)
         )
         sipClient = sip
 

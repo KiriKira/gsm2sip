@@ -5,6 +5,7 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import org.json.JSONObject
+import com.callagent.gateway.sms.SmsProviderRecovery
 import java.security.MessageDigest
 import java.util.UUID
 
@@ -43,6 +44,46 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
     enum class DispatchStartResult { STARTED, RATE_LIMITED, NOT_READY }
     data class SmsAggregate(val state: String, val partCount: Int)
 
+    data class SmsProviderRow(
+        val rowId: Long,
+        val providerIdentity: String,
+        val sender: String,
+        val body: String,
+        val receivedAt: Long,
+        val subscriptionId: Int,
+        val slotIndex: Int = -1,
+        val recipient: String = "",
+        val simId: String? = null,
+        val mappingRevision: Long? = null,
+        val resolution: String = "unknown"
+    )
+
+    data class SmsProviderCheckpoint(
+        val ownerGatewayId: String,
+        val sessionScope: String,
+        val minimumProviderId: Long,
+        val scanStartAt: Long,
+        val lastRowId: Long,
+        val reconcileRowId: Long,
+        val reconcileTargetMaxId: Long,
+        val reconciliationActive: Boolean,
+        val lastReconciledAt: Long,
+        val lastScanAt: Long?,
+        val importedRows: Long,
+        val matchedBroadcasts: Long,
+        val lastOutcome: String
+    )
+
+    enum class SmsProviderPageState { COMMITTED, STALE_OWNER, STALE_CHECKPOINT, NOT_CONFIGURED }
+    enum class SmsProviderScanMode { INCREMENTAL, RECONCILE }
+    data class SmsProviderPageCommit(
+        val state: SmsProviderPageState,
+        val importedRows: Int = 0,
+        val matchedBroadcasts: Int = 0,
+        val duplicateRows: Int = 0,
+        val checkpoint: SmsProviderCheckpoint? = null
+    )
+
     override fun onConfigure(db: SQLiteDatabase) {
         super.onConfigure(db)
         db.setForeignKeyConstraintsEnabled(true)
@@ -70,6 +111,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             received_at INTEGER NOT NULL, parts INTEGER NOT NULL,
             sim_id TEXT, mapping_revision INTEGER, sub_id INTEGER NOT NULL,
             slot_index INTEGER NOT NULL, resolution TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'broadcast',
             FOREIGN KEY(event_id) REFERENCES events(event_id)
         )""")
         db.execSQL("""CREATE TABLE commands (
@@ -108,6 +150,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             old_sub_id INTEGER NOT NULL, old_dispatched INTEGER NOT NULL,
             state TEXT NOT NULL, imported_at INTEGER NOT NULL
         )""")
+        createSmsProviderRecoveryTables(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -125,6 +168,36 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         if (oldVersion < 4) {
             db.execSQL("CREATE TABLE heartbeat_pending (sequence INTEGER PRIMARY KEY, owner_gateway_id TEXT NOT NULL, payload TEXT NOT NULL)")
         }
+        if (oldVersion < 5) {
+            db.execSQL("ALTER TABLE inbox ADD COLUMN source TEXT NOT NULL DEFAULT 'broadcast'")
+            createSmsProviderRecoveryTables(db)
+        }
+    }
+
+    private fun createSmsProviderRecoveryTables(db: SQLiteDatabase) {
+        db.execSQL("""CREATE TABLE IF NOT EXISTS sms_provider_scan (
+            owner_gateway_id TEXT NOT NULL, session_scope TEXT NOT NULL,
+            minimum_provider_id INTEGER NOT NULL, scan_start_at INTEGER NOT NULL,
+            last_row_id INTEGER NOT NULL DEFAULT 0,
+            reconcile_row_id INTEGER NOT NULL DEFAULT 0,
+            reconcile_target_max_id INTEGER NOT NULL DEFAULT 0,
+            reconciliation_active INTEGER NOT NULL DEFAULT 1,
+            last_reconciled_at INTEGER NOT NULL DEFAULT 0,
+            last_scan_at INTEGER,
+            imported_rows INTEGER NOT NULL DEFAULT 0,
+            matched_broadcasts INTEGER NOT NULL DEFAULT 0,
+            last_outcome TEXT NOT NULL DEFAULT 'configured',
+            PRIMARY KEY(owner_gateway_id, session_scope)
+        )""")
+        db.execSQL("""CREATE TABLE IF NOT EXISTS sms_provider_imports (
+            owner_gateway_id TEXT NOT NULL, session_scope TEXT NOT NULL,
+            provider_identity TEXT NOT NULL, provider_row_id INTEGER NOT NULL,
+            message_id TEXT NOT NULL, event_id TEXT NOT NULL,
+            imported_at INTEGER NOT NULL,
+            PRIMARY KEY(owner_gateway_id, session_scope, provider_identity),
+            UNIQUE(owner_gateway_id, session_scope, event_id)
+        )""")
+        db.execSQL("CREATE INDEX IF NOT EXISTS sms_provider_imports_event ON sms_provider_imports(owner_gateway_id,session_scope,event_id)")
     }
 
     /** Insert the SMS and its upload event in one transaction. eventId is made
@@ -140,39 +213,360 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         slotIndex: Int,
         simId: String?,
         mappingRevision: Long?,
-        resolution: String
+        resolution: String,
+        source: String = "broadcast"
     ): Event {
-        CredentialStore.load(appContext)?.let { adoptGatewayId(it.gatewayId) }
+        require(source == "broadcast" || source == "recovered")
+        fun persistForCurrentDatabaseOwner(): Event {
+            val db = writableDatabase
+            db.beginTransaction()
+            try {
+                val prior = db.rawQuery("SELECT event_id FROM inbox WHERE message_id=?", arrayOf(messageId))
+                if (prior.moveToFirst()) {
+                    val event = getEvent(db, prior.getString(0))
+                    prior.close()
+                    if (event != null) {
+                        db.setTransactionSuccessful()
+                        return event
+                    }
+                } else prior.close()
+
+                val eventId = UUID.randomUUID().toString()
+                val payload = JSONObject().put("message_id", messageId).put("from", sender)
+                    .put("text", body).put("parts", partCount).toString()
+                val event = insertEvent(db, eventId, receivedAt, "sms.received", simId,
+                    mappingRevision, payload)
+                val values = ContentValues().apply {
+                    put("message_id", messageId); put("event_id", eventId)
+                    put("sender", sender); put("recipient", recipient); put("body", body)
+                    put("received_at", receivedAt); put("parts", partCount)
+                    put("source", source)
+                    if (simId == null) putNull("sim_id") else put("sim_id", simId)
+                    if (mappingRevision == null) putNull("mapping_revision") else put("mapping_revision", mappingRevision)
+                    put("sub_id", subId); put("slot_index", slotIndex); put("resolution", resolution)
+                }
+                db.insertOrThrow("inbox", null, values)
+                db.setTransactionSuccessful()
+                return event
+            } finally { db.endTransaction() }
+        }
+
+        // Pairing writes the session and then adopts it in this database. Hold
+        // the same identity monitor across owner adoption and the journal
+        // transaction, so a stale pre-pair snapshot can never move ownership
+        // backward between those operations.
+        repeat(2) {
+            val snapshot = CredentialStore.load(appContext) ?: return persistForCurrentDatabaseOwner()
+            val event = CredentialStore.withCurrentIdentity(
+                appContext, snapshot.gatewayId, snapshot.controlBaseUrl
+            ) { current ->
+                if (!isActiveGateway(current.gatewayId)) adoptGatewayId(current.gatewayId)
+                persistForCurrentDatabaseOwner()
+            }
+            if (event != null) return event
+        }
+        // If identity is changing continuously, preserve the received SMS
+        // without adopting an unverified snapshot. The transaction assigns
+        // the database's current active owner (or leaves it unresolved).
+        return persistForCurrentDatabaseOwner()
+    }
+
+    /** First configuration wins for a gateway/session scope. A repeated UI or
+     * service call cannot silently move the history boundary backwards. */
+    fun configureSmsProviderRecovery(
+        ownerGatewayId: String,
+        sessionScope: String,
+        minimumProviderId: Long,
+        scanStartAt: Long,
+        initialLastRowId: Long,
+        reconciliationTargetMaxId: Long
+    ): SmsProviderCheckpoint? {
+        require(minimumProviderId >= 0 && scanStartAt >= 0 && initialLastRowId >= 0 && reconciliationTargetMaxId >= 0)
+        require(sessionScope.matches(Regex("[0-9a-f]{64}")))
         val db = writableDatabase
         db.beginTransaction()
         try {
-            val prior = db.rawQuery("SELECT event_id FROM inbox WHERE message_id=?", arrayOf(messageId))
-            if (prior.moveToFirst()) {
-                val event = getEvent(db, prior.getString(0))
-                prior.close()
-                if (event != null) {
-                    db.setTransactionSuccessful()
-                    return event
-                }
-            } else prior.close()
-
-            val eventId = UUID.randomUUID().toString()
-            val payload = JSONObject().put("message_id", messageId).put("from", sender)
-                .put("text", body).put("parts", partCount).toString()
-            val event = insertEvent(db, eventId, receivedAt, "sms.received", simId,
-                mappingRevision, payload)
-            val values = ContentValues().apply {
-                put("message_id", messageId); put("event_id", eventId)
-                put("sender", sender); put("recipient", recipient); put("body", body)
-                put("received_at", receivedAt); put("parts", partCount)
-                if (simId == null) putNull("sim_id") else put("sim_id", simId)
-                if (mappingRevision == null) putNull("mapping_revision") else put("mapping_revision", mappingRevision)
-                put("sub_id", subId); put("slot_index", slotIndex); put("resolution", resolution)
-            }
-            db.insertOrThrow("inbox", null, values)
+            if (activeOwnerFor(db) != ownerGatewayId) return null
+            db.execSQL("""INSERT OR IGNORE INTO sms_provider_scan(
+                owner_gateway_id,session_scope,minimum_provider_id,scan_start_at,last_row_id,
+                reconcile_target_max_id,reconciliation_active
+            ) VALUES(?,?,?,?,?,?,1)""", arrayOf(ownerGatewayId, sessionScope, minimumProviderId,
+                scanStartAt, initialLastRowId, reconciliationTargetMaxId))
             db.setTransactionSuccessful()
-            return event
+            return smsProviderCheckpoint(db, ownerGatewayId, sessionScope)
         } finally { db.endTransaction() }
+    }
+
+    fun smsProviderCheckpoint(ownerGatewayId: String, sessionScope: String): SmsProviderCheckpoint? =
+        smsProviderCheckpoint(readableDatabase, ownerGatewayId, sessionScope)
+
+    /** Expand to retained history only after the caller's explicit full-history choice. */
+    fun promoteSmsProviderRecoveryToFullHistory(
+        ownerGatewayId: String,
+        sessionScope: String,
+        currentMaxRowId: Long
+    ): SmsProviderCheckpoint? {
+        require(currentMaxRowId >= 0)
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            if (activeOwnerFor(db) != ownerGatewayId) return null
+            val checkpoint = smsProviderCheckpoint(db, ownerGatewayId, sessionScope) ?: return null
+            if (checkpoint.minimumProviderId == 0L && checkpoint.scanStartAt == 0L) {
+                db.setTransactionSuccessful()
+                return checkpoint
+            }
+            db.execSQL("""UPDATE sms_provider_scan SET minimum_provider_id=0,scan_start_at=0,
+                last_row_id=0,reconcile_row_id=0,reconcile_target_max_id=?,reconciliation_active=1,
+                last_reconciled_at=0,last_outcome='configured_full_history'
+                WHERE owner_gateway_id=? AND session_scope=?""",
+                arrayOf(currentMaxRowId, ownerGatewayId, sessionScope))
+            db.setTransactionSuccessful()
+            return smsProviderCheckpoint(db, ownerGatewayId, sessionScope)
+        } finally { db.endTransaction() }
+    }
+
+    private fun smsProviderCheckpoint(
+        db: SQLiteDatabase,
+        ownerGatewayId: String,
+        sessionScope: String
+    ): SmsProviderCheckpoint? = db.rawQuery(
+        "SELECT owner_gateway_id,session_scope,minimum_provider_id,scan_start_at,last_row_id,reconcile_row_id,reconcile_target_max_id,reconciliation_active,last_reconciled_at,last_scan_at,imported_rows,matched_broadcasts,last_outcome FROM sms_provider_scan WHERE owner_gateway_id=? AND session_scope=?",
+        arrayOf(ownerGatewayId, sessionScope)
+    ).use { c ->
+        if (!c.moveToFirst()) null else SmsProviderCheckpoint(
+            c.getString(0), c.getString(1), c.getLong(2), c.getLong(3), c.getLong(4),
+            c.getLong(5), c.getLong(6), c.getInt(7) != 0, c.getLong(8),
+            c.getLongOrNull(9), c.getLong(10), c.getLong(11), c.getString(12)
+        )
+    }
+
+    /** Start a bounded low-ID reconciliation pass if none is already running. */
+    fun beginSmsProviderReconciliation(
+        ownerGatewayId: String,
+        sessionScope: String,
+        targetMaxId: Long,
+        now: Long,
+        force: Boolean = false
+    ): SmsProviderCheckpoint? {
+        require(targetMaxId >= 0)
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            if (activeOwnerFor(db) != ownerGatewayId) return null
+            val checkpoint = smsProviderCheckpoint(db, ownerGatewayId, sessionScope) ?: return null
+            if (checkpoint.reconciliationActive && !force) {
+                db.setTransactionSuccessful()
+                return checkpoint
+            }
+            db.execSQL("""UPDATE sms_provider_scan SET reconcile_row_id=0,
+                reconcile_target_max_id=?,reconciliation_active=1,last_outcome='reconcile_more'
+                WHERE owner_gateway_id=? AND session_scope=?""",
+                arrayOf(targetMaxId, ownerGatewayId, sessionScope))
+            db.setTransactionSuccessful()
+            return smsProviderCheckpoint(db, ownerGatewayId, sessionScope)
+        } finally { db.endTransaction() }
+    }
+
+    /** Restart only the active sweep cursor if the system provider reset while
+     * the old target was being paged. */
+    fun restartSmsProviderReconciliation(
+        ownerGatewayId: String,
+        sessionScope: String,
+        expectedReconcileRowId: Long,
+        newTargetMaxId: Long
+    ): SmsProviderCheckpoint? {
+        require(expectedReconcileRowId >= 0 && newTargetMaxId >= 0)
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            if (activeOwnerFor(db) != ownerGatewayId) return null
+            val checkpoint = smsProviderCheckpoint(db, ownerGatewayId, sessionScope) ?: return null
+            if (!checkpoint.reconciliationActive || checkpoint.reconcileRowId != expectedReconcileRowId) {
+                db.setTransactionSuccessful()
+                return checkpoint
+            }
+            db.execSQL("""UPDATE sms_provider_scan SET reconcile_row_id=0,
+                reconcile_target_max_id=?,last_outcome='reconcile_reset'
+                WHERE owner_gateway_id=? AND session_scope=? AND reconciliation_active=1 AND reconcile_row_id=?""",
+                arrayOf(newTargetMaxId, ownerGatewayId, sessionScope, expectedReconcileRowId))
+            db.setTransactionSuccessful()
+            return smsProviderCheckpoint(db, ownerGatewayId, sessionScope)
+        } finally { db.endTransaction() }
+    }
+
+    /**
+     * Apply one bounded provider page. Provider identity, any SMS event, and
+     * the scan cursor commit together. Compare-and-set prevents two callers
+     * from advancing over a page another caller has not imported.
+     */
+    fun importSmsProviderPage(
+        ownerGatewayId: String,
+        sessionScope: String,
+        scanMode: SmsProviderScanMode,
+        expectedCursor: Long,
+        rows: List<SmsProviderRow>,
+        pageComplete: Boolean,
+        now: Long = System.currentTimeMillis()
+    ): SmsProviderPageCommit {
+        require(sessionScope.matches(Regex("[0-9a-f]{64}")))
+        require(expectedCursor >= 0)
+        require(rows.size <= SmsProviderRecovery.MAX_PAGE_SIZE)
+        require(rows.all { it.rowId > expectedCursor && it.providerIdentity.matches(Regex("[0-9a-f]{64}")) })
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            if (activeOwnerFor(db) != ownerGatewayId) {
+                return SmsProviderPageCommit(SmsProviderPageState.STALE_OWNER)
+            }
+            val checkpoint = smsProviderCheckpoint(db, ownerGatewayId, sessionScope)
+                ?: return SmsProviderPageCommit(SmsProviderPageState.NOT_CONFIGURED)
+            val checkpointCursor = when (scanMode) {
+                SmsProviderScanMode.INCREMENTAL -> checkpoint.lastRowId
+                SmsProviderScanMode.RECONCILE -> checkpoint.reconcileRowId
+            }
+            if (checkpointCursor != expectedCursor ||
+                (scanMode == SmsProviderScanMode.RECONCILE) != checkpoint.reconciliationActive) {
+                return SmsProviderPageCommit(SmsProviderPageState.STALE_CHECKPOINT, checkpoint = checkpoint)
+            }
+            if (scanMode == SmsProviderScanMode.RECONCILE && rows.any { it.rowId > checkpoint.reconcileTargetMaxId }) {
+                return SmsProviderPageCommit(SmsProviderPageState.STALE_CHECKPOINT, checkpoint = checkpoint)
+            }
+
+            var imported = 0
+            var matched = 0
+            var duplicate = 0
+            rows.forEach { row ->
+                val prior = db.rawQuery(
+                    "SELECT 1 FROM sms_provider_imports WHERE owner_gateway_id=? AND session_scope=? AND provider_identity=?",
+                    arrayOf(ownerGatewayId, sessionScope, row.providerIdentity)
+                ).use { it.moveToFirst() }
+                if (prior) {
+                    duplicate++
+                    return@forEach
+                }
+
+                val broadcast = findBroadcastEvidence(db, ownerGatewayId, sessionScope, row)
+                val eventId: String
+                val messageId: String
+                if (broadcast != null) {
+                    eventId = broadcast.first
+                    messageId = broadcast.second
+                    matched++
+                } else {
+                    messageId = providerMessageId(ownerGatewayId, sessionScope, row.providerIdentity)
+                    eventId = UUID.randomUUID().toString()
+                    val at = row.receivedAt.takeIf { it > 0 } ?: now
+                    val payload = JSONObject().put("message_id", messageId).put("from", row.sender)
+                        .put("text", row.body).put("parts", 1).toString()
+                    insertEvent(db, eventId, at, "sms.received", row.simId, row.mappingRevision,
+                        payload, ownerGatewayId)
+                    db.insertOrThrow("inbox", null, ContentValues().apply {
+                        put("message_id", messageId); put("event_id", eventId)
+                        put("sender", row.sender); put("recipient", row.recipient); put("body", row.body)
+                        put("received_at", at); put("parts", 1)
+                        if (row.simId == null) putNull("sim_id") else put("sim_id", row.simId)
+                        if (row.mappingRevision == null) putNull("mapping_revision")
+                        else put("mapping_revision", row.mappingRevision)
+                        put("sub_id", row.subscriptionId); put("slot_index", row.slotIndex)
+                        put("resolution", row.resolution); put("source", "recovered")
+                    })
+                    imported++
+                }
+                db.insertOrThrow("sms_provider_imports", null, ContentValues().apply {
+                    put("owner_gateway_id", ownerGatewayId); put("session_scope", sessionScope)
+                    put("provider_identity", row.providerIdentity); put("provider_row_id", row.rowId)
+                    put("message_id", messageId); put("event_id", eventId); put("imported_at", now)
+                })
+            }
+
+            val nextIncrementalRowId = when (scanMode) {
+                SmsProviderScanMode.INCREMENTAL -> rows.lastOrNull()?.rowId ?: checkpoint.lastRowId
+                SmsProviderScanMode.RECONCILE -> if (pageComplete)
+                    maxOf(checkpoint.lastRowId, checkpoint.reconcileTargetMaxId) else checkpoint.lastRowId
+            }
+            val nextReconcileRowId = when {
+                scanMode != SmsProviderScanMode.RECONCILE -> checkpoint.reconcileRowId
+                pageComplete -> 0L
+                else -> rows.lastOrNull()?.rowId ?: expectedCursor
+            }
+            val stillReconciling = scanMode == SmsProviderScanMode.RECONCILE && !pageComplete
+            val reconciledAt = if (scanMode == SmsProviderScanMode.RECONCILE && pageComplete)
+                now else checkpoint.lastReconciledAt
+            val outcome = when (scanMode) {
+                SmsProviderScanMode.INCREMENTAL -> if (pageComplete) "incremental_complete" else "incremental_more"
+                SmsProviderScanMode.RECONCILE -> if (pageComplete) "reconcile_complete" else "reconcile_more"
+            }
+            val changed = db.update("sms_provider_scan", ContentValues().apply {
+                put("last_row_id", nextIncrementalRowId); put("reconcile_row_id", nextReconcileRowId)
+                put("reconciliation_active", if (stillReconciling) 1 else 0)
+                put("last_reconciled_at", reconciledAt); put("last_scan_at", now)
+                put("last_outcome", outcome)
+                put("imported_rows", checkpoint.importedRows + imported)
+                put("matched_broadcasts", checkpoint.matchedBroadcasts + matched)
+            }, "owner_gateway_id=? AND session_scope=? AND last_row_id=? AND reconcile_row_id=? AND reconcile_target_max_id=? AND reconciliation_active=?",
+                arrayOf(ownerGatewayId, sessionScope, checkpoint.lastRowId.toString(),
+                    checkpoint.reconcileRowId.toString(), checkpoint.reconcileTargetMaxId.toString(),
+                    if (checkpoint.reconciliationActive) "1" else "0"))
+            if (changed != 1) return SmsProviderPageCommit(
+                SmsProviderPageState.STALE_CHECKPOINT,
+                checkpoint = smsProviderCheckpoint(db, ownerGatewayId, sessionScope)
+            )
+            val updated = smsProviderCheckpoint(db, ownerGatewayId, sessionScope)
+            db.setTransactionSuccessful()
+            return SmsProviderPageCommit(SmsProviderPageState.COMMITTED, imported, matched, duplicate, updated)
+        } finally { db.endTransaction() }
+    }
+
+    private fun findBroadcastEvidence(
+        db: SQLiteDatabase,
+        ownerGatewayId: String,
+        sessionScope: String,
+        row: SmsProviderRow
+    ): Pair<String, String>? {
+        // These fields are not enough to distinguish messages with an empty
+        // body or a missing timestamp; preserve a possible duplicate instead.
+        if (row.sender.isBlank() || row.body.isEmpty() || row.receivedAt <= 0) return null
+        val query = if (row.subscriptionId >= 0) {
+            """SELECT i.event_id,i.message_id FROM inbox i JOIN events e ON e.event_id=i.event_id
+                WHERE e.owner_gateway_id=? AND e.type='sms.received' AND i.source='broadcast'
+                AND i.sender=? AND i.body=? AND ABS(i.received_at-?)<=?
+                AND (i.sub_id<0 OR i.sub_id=?)
+                AND NOT EXISTS (SELECT 1 FROM sms_provider_imports p
+                    WHERE p.owner_gateway_id=? AND p.session_scope=? AND p.event_id=i.event_id)
+                ORDER BY ABS(i.received_at-?),i.received_at,i.event_id LIMIT 2"""
+        } else {
+            """SELECT i.event_id,i.message_id FROM inbox i JOIN events e ON e.event_id=i.event_id
+                WHERE e.owner_gateway_id=? AND e.type='sms.received' AND i.source='broadcast'
+                AND i.sender=? AND i.body=? AND ABS(i.received_at-?)<=?
+                AND NOT EXISTS (SELECT 1 FROM sms_provider_imports p
+                    WHERE p.owner_gateway_id=? AND p.session_scope=? AND p.event_id=i.event_id)
+                ORDER BY ABS(i.received_at-?),i.received_at,i.event_id LIMIT 2"""
+        }
+        val args = if (row.subscriptionId >= 0) arrayOf(
+            ownerGatewayId, row.sender, row.body, row.receivedAt.toString(),
+            SmsProviderRecovery.BROADCAST_MATCH_WINDOW_MS.toString(), row.subscriptionId.toString(),
+            ownerGatewayId, sessionScope, row.receivedAt.toString()
+        ) else arrayOf(
+            ownerGatewayId, row.sender, row.body, row.receivedAt.toString(),
+            SmsProviderRecovery.BROADCAST_MATCH_WINDOW_MS.toString(), ownerGatewayId, sessionScope,
+            row.receivedAt.toString()
+        )
+        return db.rawQuery(query, args).use { c ->
+            if (!c.moveToFirst()) null else {
+                val candidate = c.getString(0) to c.getString(1)
+                // If more than one broadcast could describe this provider row,
+                // its identity is ambiguous. Keep a possible duplicate instead
+                // of collapsing two identical real SMS messages.
+                if (c.moveToNext()) null else candidate
+            }
+        }
+    }
+
+    private fun providerMessageId(ownerGatewayId: String, sessionScope: String, providerIdentity: String): String {
+        val input = "gsm2sip.sms.provider.message.v1\u0000$ownerGatewayId\u0000$sessionScope\u0000$providerIdentity"
+        return UUID.nameUUIDFromBytes(MessageDigest.getInstance("SHA-256")
+            .digest(input.toByteArray(Charsets.UTF_8))).toString()
     }
 
     fun pendingEvents(gatewayId: String, limit: Int = 50): List<Event> {
@@ -644,7 +1038,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
     companion object {
         private const val SMS_PER_MINUTE_LIMIT = 5
         private const val SMS_PER_HOUR_LIMIT = 30
-        private const val VERSION = 4
+        private const val VERSION = 5
         @Volatile private var instance: GatewayDatabase? = null
         fun get(context: Context): GatewayDatabase = instance ?: synchronized(this) {
             instance ?: GatewayDatabase(context).also { instance = it }

@@ -50,6 +50,8 @@
          which a gateway has no reason to do. -->
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.SEND_SMS" />
+    <!-- Optional system-inbox recovery. Requested only after visible opt-in. -->
+    <uses-permission android:name="android.permission.READ_SMS" />
 
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -73,6 +75,7 @@
             android:exported="true"
             android:label="@string/activity_title"
             android:resizeableActivity="true"
+            android:windowSoftInputMode="adjustResize"
             android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

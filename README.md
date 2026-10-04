@@ -1,7 +1,7 @@
 # 双 SIM 远程网关（开发中）
 
 目标：旧 Android 保留两张 SIM（语音适配可使用 root/Magisk），未 root Android 主机通过自建服务器收发短信、接打电话。
-本批实现 **M1/M2 的短信基础**；完整三端通话尚未完成，也没有通过目标手机的真实短信或通话验收。
+已实现短信基础、可选系统库补扫与刷新响应恢复，并继续补齐三端 SIP/ARI/Telecom 通话链路；目标手机的真实短信、数字音频与通话仍需验收。
 
 - 网关：HTTPS 配对、服务器分配 SIM 身份与本机确认、SQLite 事件/执行账本、指定订阅发送短信、分片回执。
 - [服务器](https://github.com/KiriKira/gsm2sip-server)：PostgreSQL 控制与消息接口，权威协议和联合实施顺序。
@@ -10,7 +10,7 @@
 先读 [网关计划](PLAN-selfhosted-gateway.md)、[实施审查](https://github.com/KiriKira/gsm2sip-server/blob/b93fc9c8036108e36b2652673c1dd8ceee8d197f/docs/IMPLEMENTATION-REVIEW-2026-10-03.md) 与 [设备验收状态](docs/devices.md)。
 [本批实施状态与固定协议](docs/implementation-state.md)。
 按用户要求，本批后续增加 [Magisk 通用适配](docs/magisk-runtime.md)：模块探测、受限账户 broker 和本地数字音频配置，不再按机型自动选 preset 或以 API 31 作为整体语音门槛。
-两端已增加 [Material 3 Expressive 与后台运行设置](docs/android-ui-and-background.md)，WSS 唤醒配合 HTTPS 补齐；FCM、ARI、主机 SIP SDK 和完整 Telecom 通话仍待后续实施。
+两端已增加 [Material 3 Expressive 与后台运行设置](docs/android-ui-and-background.md)，WSS 唤醒配合 HTTPS 补齐；ARI、主机内置 SIP SDK 和 Telecom 已落代码；FCM、完整切网续话及真机持续运行仍待完成。
 短信不再以 SIP MESSAGE 作为生产执行通道。不确定发送保留 `unknown`，不能自动重发或回落默认 SIM。
 
 ## 短信模式无需 root
@@ -23,7 +23,7 @@ Android 安装器可能限制短信权限授予；没有 SEND_SMS/RECEIVE_SMS �
 普通权限无法取得稳定 SIM 身份时需要本机逐卡确认，重启后重新核对；不会回落默认卡。
 
 [功能缺口与弱网恢复审查](https://github.com/KiriKira/gsm2sip-server/blob/codex/control-plane-foundation/docs/network-and-feature-status.md)
-区分短信补齐、提醒投递、未实现的通话续接和弱网音质自适应。
+区分短信补齐、提醒投递、通话续接限制、主机弱网音质策略及待验收项。
 
 ## 开发与初次连接
 

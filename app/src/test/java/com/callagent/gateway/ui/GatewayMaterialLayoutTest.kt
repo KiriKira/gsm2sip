@@ -12,6 +12,8 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
+import android.widget.EditText
+import org.junit.Assert.assertFalse
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28, 34])
@@ -22,6 +24,9 @@ class GatewayMaterialLayoutTest {
         val inflater = LayoutInflater.from(context)
         val main = inflater.inflate(R.layout.activity_main, null)
         assertTrue(main.findViewById<View>(R.id.bottomNavigation) is BottomNavigationView)
+        assertFalse(main.findViewById<EditText>(R.id.etCfgPass).isSaveEnabled)
+        assertFalse(main.findViewById<EditText>(R.id.etControlPairingCode).isSaveEnabled)
+        assertNotNull(main.findViewById<View>(R.id.svConfig))
         val configuration = inflater.inflate(R.layout.dialog_config, null)
         assertNotNull(configuration)
     }

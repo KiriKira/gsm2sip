@@ -48,15 +48,18 @@ class ControlApiClient(context: Context, baseUrl: String) {
         if (role != "gateway") throw ControlApiException("PAIRING_ROLE_MISMATCH", "该配对码不是网关角色")
         val id = response.optString("device_id")
         if (id.isBlank()) throw ControlApiException("INVALID_RESPONSE", "服务器未返回设备 ID")
-        val priorGatewayId = CredentialStore.load(app)?.gatewayId
+        val priorSession = CredentialStore.load(app)
+        val identityChanged = priorSession?.gatewayId != id || priorSession?.controlBaseUrl != base
+        if (identityChanged) com.callagent.gateway.data.VoiceCredentialStore.clear(app)
         CredentialStore.save(app, CredentialStore.Session(
             id, base, response.getString("access_token"), response.getString("access_expires_at"),
             response.getString("refresh_token"), response.getString("refresh_expires_at")
         ))
-        val changedOwner = GatewayDatabase.get(app).adoptGatewayId(id)
-        if (changedOwner || (priorGatewayId != null && priorGatewayId != id)) {
-            SimRegistry.resetForGatewayChange(app)
-        }
+        val changedOwner = CredentialStore.withCurrentIdentity(app,id,base) {
+            GatewayDatabase.get(app).adoptGatewayId(id)
+        } ?: throw ControlApiException("SESSION_CHANGED","配对身份已变化")
+        if (changedOwner || identityChanged) SimRegistry.resetForGatewayChange(app,id,base)
+        if (identityChanged) com.callagent.gateway.data.VoiceCredentialStore.invalidatePreviousIdentity(app,id)
         val sip = response.optJSONObject("sip")
         return PairResult(id, role, sip?.optBoolean("available", false) ?: false,
             sip?.optString("reason").orEmpty())
@@ -69,6 +72,40 @@ class ControlApiClient(context: Context, baseUrl: String) {
                 authenticated = false, allowRefresh = false)
             CredentialStore.clearIfCurrent(app, session)
         }
+    }
+
+    /** Return non-secret SIP transport details for the paired gateway. The
+     * returned JSON must not be logged because the rotate response also uses
+     * this type and includes the one-time password. */
+    fun getSipConfiguration(expectedGatewayId: String? = null): JSONObject = sipCredentialRequest(
+        "GET", "/v1/devices/self/sip-config", body = null, expectedGatewayId = expectedGatewayId
+    )
+
+    /** Provision or recover the same encrypted bootstrap response for this
+     * persisted key. The caller owns durable storage of the key and result. */
+    fun rotateSipCredentials(idempotencyKey: String, expectedGatewayId: String? = null): JSONObject {
+        if (!validIdempotencyKey(idempotencyKey)) {
+            throw ControlApiException("IDEMPOTENCY_KEY_INVALID", "SIP credential retry key is invalid")
+        }
+        return sipCredentialRequest("POST", "/v1/devices/self/sip-credentials/rotate",
+            body = JSONObject(), idempotencyKey = idempotencyKey, expectedGatewayId = expectedGatewayId)
+    }
+
+    private fun sipCredentialRequest(
+        method: String,
+        path: String,
+        body: JSONObject?,
+        idempotencyKey: String = UUID.randomUUID().toString(),
+        expectedGatewayId: String? = null
+    ): JSONObject {
+        val expected = sessionOrThrow()
+        if (expectedGatewayId != null && expected.gatewayId != expectedGatewayId) throw ControlApiException("SESSION_CHANGED","Control identity changed before SIP provisioning")
+        val response = request(method, path, body, idempotencyKey = idempotencyKey, expectedGatewayId = expected.gatewayId)
+        val current = sessionOrThrow()
+        if (current.gatewayId != expected.gatewayId || current.controlBaseUrl != expected.controlBaseUrl) {
+            throw ControlApiException("SESSION_CHANGED", "Control identity changed during SIP provisioning")
+        }
+        return response
     }
 
     fun proposeSimBindings(operationId: String, mappings: JSONArray): MappingProposal {
@@ -228,8 +265,14 @@ class ControlApiClient(context: Context, baseUrl: String) {
 
     private fun request(method: String, path: String, body: JSONObject? = null,
                         authenticated: Boolean = true, idempotencyKey: String = UUID.randomUUID().toString(),
-                        allowRefresh: Boolean = true): JSONObject {
+                        allowRefresh: Boolean = true, expectedGatewayId: String? = null): JSONObject {
+        if (authenticated && expectedGatewayId != null && sessionOrThrow().gatewayId != expectedGatewayId) {
+            throw ControlApiException("SESSION_CHANGED","Control identity changed before request")
+        }
         val session = if (authenticated) accessSession() else null
+        if (authenticated && expectedGatewayId != null && session?.gatewayId != expectedGatewayId) {
+            throw ControlApiException("SESSION_CHANGED","Control identity changed before request")
+        }
         val url = URL(base + path)
         val conn = url.openConnection() as? HttpsURLConnection
             ?: throw ControlApiException("HTTPS_REQUIRED", "控制端点必须使用 HTTPS")
@@ -253,7 +296,7 @@ class ControlApiClient(context: Context, baseUrl: String) {
                 val rejectedToken = session?.accessToken
                     ?: throw ControlApiException("SESSION_CHANGED", "Control session changed during request")
                 refreshSession(rejectedAccessToken = rejectedToken)
-                return request(method, path, body, authenticated, idempotencyKey, allowRefresh = false)
+                return request(method, path, body, authenticated, idempotencyKey, allowRefresh = false, expectedGatewayId = expectedGatewayId)
             }
             val response = readResponse(conn, success = code in 200..299)
             if (code !in 200..299) {
@@ -284,20 +327,24 @@ class ControlApiClient(context: Context, baseUrl: String) {
             if (rejectedAccessToken != null && old.accessToken != rejectedAccessToken) return old
             val expiry = try { Instant.parse(old.accessExpiresAt).toEpochMilli() } catch (_: Exception) { 0L }
             if (rejectedAccessToken == null && expiry > System.currentTimeMillis() + 60_000) return old
+            val pending = CredentialStore.beginRefresh(app, old)
+                ?: throw ControlApiException("SESSION_CHANGED", "Control session changed during refresh")
+            val retryKey = pending.pendingRefreshKey
+                ?: throw ControlApiException("REFRESH_RETRY_KEY_MISSING", "Could not persist refresh retry state", retryable = true)
             val response = try {
-                request("POST", "/v1/auth/refresh", JSONObject().put("refresh_token", old.refreshToken),
-                    authenticated = false, idempotencyKey = UUID.randomUUID().toString(), allowRefresh = false)
+                request("POST", "/v1/auth/refresh", JSONObject().put("refresh_token", pending.refreshToken),
+                    authenticated = false, idempotencyKey = retryKey, allowRefresh = false)
             } catch (e: ControlApiException) {
                 if (e.httpStatus == 401 || e.code == "SESSION_REVOKED") {
-                    CredentialStore.clearIfCurrent(app, old)
+                    CredentialStore.clearIfCurrent(app, pending)
                 }
                 throw e
             }
-            val rotated = old.copy(accessToken = response.getString("access_token"),
+            val rotated = pending.copy(accessToken = response.getString("access_token"),
                 accessExpiresAt = response.getString("access_expires_at"),
                 refreshToken = response.getString("refresh_token"),
-                refreshExpiresAt = response.getString("refresh_expires_at"))
-            if (CredentialStore.saveIfCurrent(app, old, rotated)) return rotated
+                refreshExpiresAt = response.getString("refresh_expires_at"), pendingRefreshKey = null)
+            if (CredentialStore.saveIfCurrent(app, pending, rotated)) return rotated
             val latest = CredentialStore.load(app)
                 ?: throw ControlApiException("SESSION_CHANGED", "Control session changed during refresh")
             if (latest.gatewayId != old.gatewayId || latest.controlBaseUrl != old.controlBaseUrl) {
@@ -338,7 +385,10 @@ class ControlApiClient(context: Context, baseUrl: String) {
         private const val MAX_RESPONSE_BYTES = 512 * 1024
         private const val MAX_BATCH_BYTES = 256 * 1024
         private val LOWER_SHA256 = Regex("^[a-f0-9]{64}$")
+        private val IDEMPOTENCY_KEY = Regex("^[\\x21-\\x7e]{16,128}$")
         private val refreshLock = Any()
+
+        private fun validIdempotencyKey(value: String): Boolean = IDEMPOTENCY_KEY.matches(value)
 
         private fun normalizeBase(input: String): String {
             val value = input.trim().trimEnd('/')

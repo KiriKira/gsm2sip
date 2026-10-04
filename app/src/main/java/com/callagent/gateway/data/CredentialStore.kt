@@ -6,6 +6,7 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import org.json.JSONObject
 import java.security.KeyStore
+import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -19,7 +20,8 @@ object CredentialStore {
         val accessToken: String,
         val accessExpiresAt: String,
         val refreshToken: String,
-        val refreshExpiresAt: String
+        val refreshExpiresAt: String,
+        val pendingRefreshKey: String? = null
     )
 
     private const val PREFS = "control-session"
@@ -42,6 +44,18 @@ object CredentialStore {
         return true
     }
 
+    /** Persist a retry key before sending refresh. The key remains attached to
+     * the current refresh token until its rotated replacement is committed. */
+    @Synchronized
+    fun beginRefresh(context: Context, expected: Session): Session? {
+        val current = load(context) ?: return null
+        if (!sameVersion(current, expected)) return null
+        if (current.pendingRefreshKey != null) return current
+        val pending = current.copy(pendingRefreshKey = UUID.randomUUID().toString())
+        persist(context, pending)
+        return pending
+    }
+
     /** Clear credentials only if they still match the request that failed. */
     @Synchronized
     fun clearIfCurrent(context: Context, expected: Session): Boolean {
@@ -58,10 +72,11 @@ object CredentialStore {
             .put("control_base_url", session.controlBaseUrl)
             .put("access_token", session.accessToken).put("access_expires_at", session.accessExpiresAt)
             .put("refresh_token", session.refreshToken).put("refresh_expires_at", session.refreshExpiresAt)
-            .toString().toByteArray(Charsets.UTF_8)
-        val (iv, encrypted) = try { encrypt(plain, key()) } catch (_: Exception) {
+        session.pendingRefreshKey?.let { plain.put("pending_refresh_key", it) }
+        val plaintext = plain.toString().toByteArray(Charsets.UTF_8)
+        val (iv, encrypted) = try { encrypt(plaintext, key()) } catch (_: Exception) {
             deleteKey()
-            encrypt(plain, key())
+            encrypt(plaintext, key())
         }
         val packed = iv + encrypted
         val persisted = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
@@ -83,12 +98,29 @@ object CredentialStore {
             val json = JSONObject(String(cipher.doFinal(body), Charsets.UTF_8))
             Session(json.getString("gateway_id"), json.getString("control_base_url"), json.getString("access_token"),
                 json.getString("access_expires_at"), json.getString("refresh_token"),
-                json.getString("refresh_expires_at"))
+                json.getString("refresh_expires_at"),
+                json.optString("pending_refresh_key").takeIf { it.isNotBlank() && it != "null" })
         } catch (_: Exception) {
             // A restored backup or invalidated Keystore key cannot authenticate.
             clear(context)
             null
         }
+    }
+
+    /** Run an operation while the paired gateway identity is still current.
+     * Pairing and token refresh writes share this monitor, so a result cannot
+     * be committed under a replacement gateway/base URL after the caller's
+     * identity check. */
+    @Synchronized
+    fun <T> withCurrentIdentity(
+        context: Context,
+        expectedGatewayId: String,
+        expectedBaseUrl: String,
+        block: (Session) -> T
+    ): T? {
+        val current = load(context) ?: return null
+        if (current.gatewayId != expectedGatewayId || current.controlBaseUrl != expectedBaseUrl) return null
+        return block(current)
     }
 
     @Synchronized

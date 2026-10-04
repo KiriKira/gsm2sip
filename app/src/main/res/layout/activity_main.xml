@@ -593,6 +593,7 @@
                 </LinearLayout>
 
                 <ScrollView
+                    android:id="@+id/svConfig"
                     android:layout_width="match_parent"
                     android:layout_height="0dp"
                     android:layout_weight="1"
@@ -661,6 +662,7 @@
                             android:id="@+id/etControlPairingCode"
                             style="@style/CfgField"
                             android:hint="Paste code from server CLI"
+                            android:saveEnabled="false"
                             android:inputType="textPassword" />
 
                         <com.google.android.material.button.MaterialButton
@@ -684,6 +686,36 @@
                             android:textColor="?attr/colorOnSurfaceVariant"
                             android:textSize="12sp"
                             android:paddingTop="8dp" />
+
+                        <TextView
+                            android:id="@+id/tvSmsRecoveryStatus"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="短信补收：未启用。允许读取系统收件箱后，可补回应用未运行时已存入系统的短信。"
+                            android:textColor="?attr/colorOnSurfaceVariant"
+                            android:textSize="13sp"
+                            android:paddingTop="12dp" />
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnConfigureServerSip"
+                            style="?attr/materialButtonOutlinedStyle"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="从服务器配置 SIP 语音"
+                            android:textAllCaps="false" />
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnEnableSmsRecovery"
+                            style="?attr/materialButtonOutlinedStyle"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="启用短信补收"
+                            android:textAllCaps="false" />
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnScanSmsRecovery"
+                            style="?attr/materialButtonOutlinedStyle"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="立即补收并同步"
+                            android:textAllCaps="false" />
 
                         <TextView
                             android:layout_width="match_parent"
@@ -748,7 +780,7 @@
 
                         <TextView style="@style/CfgLabel" android:text="SIP Password" />
                         <com.google.android.material.textfield.TextInputEditText android:id="@+id/etCfgPass" style="@style/CfgField"
-                            android:hint="password" android:inputType="textPassword" />
+                            android:hint="password" android:saveEnabled="false" android:inputType="textPassword" />
 
                         <TextView style="@style/CfgLabel" android:text="Own Number (SIM)" />
                         <!-- One field per active SIM, built at runtime: the

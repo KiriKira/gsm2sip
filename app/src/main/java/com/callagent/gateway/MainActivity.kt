@@ -53,6 +53,7 @@ import androidx.core.content.ContextCompat
 import com.callagent.gateway.service.CallLogEntry
 import com.callagent.gateway.service.CallLogStore
 import com.callagent.gateway.data.CredentialStore
+import com.callagent.gateway.data.VoiceCredentialStore
 import com.callagent.gateway.data.GatewayDatabase
 import com.callagent.gateway.net.ControlApiClient
 import com.callagent.gateway.net.ControlApiException
@@ -62,6 +63,7 @@ import com.callagent.gateway.service.GatewayService
 import com.callagent.gateway.background.GatewayBackgroundRuntime
 import com.callagent.gateway.sim.SimRegistry
 import com.callagent.gateway.sms.SmsOutbox
+import com.callagent.gateway.sms.SmsProviderRecovery
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -136,6 +138,15 @@ class MainActivity : AppCompatActivity() {
     private var pendingMappingProposal: MappingProposal? = null
     private var simProposalSubscriptions: List<SimRegistry.SimSubscription> = emptyList()
     private var controlBusy = false
+    private var pendingRecoveryMode: SmsProviderRecovery.HistoryMode? = null
+    private var pendingRecoveryGatewayId: String? = null
+    private var pendingRecoveryControlBaseUrl: String? = null
+    private var recoveryPermissionRequestInFlight = false
+    private val recoveryBusy = java.util.concurrent.atomic.AtomicBoolean(false)
+    private var configGatewayIdAtOpen: String? = null
+    private var configControlBaseUrlAtOpen: String? = null
+    private var configServerAtOpen: String? = null
+    private var configUserAtOpen: String? = null
 
     private lateinit var tabLogs: LinearLayout
     private lateinit var bottomNavigation: NavigationBarView
@@ -375,7 +386,10 @@ class MainActivity : AppCompatActivity() {
                 R.id.navLogs -> "logs"
                 else -> null
             }
-            if (destination != null && destination != currentTab) switchTab(destination)
+            if (destination == "config" && destination != currentTab) {
+                if (currentTab == "logs" && logsReturnTab == "config") switchTab("config")
+                else openConfigView()
+            } else if (destination != null && destination != currentTab) switchTab(destination)
             destination != null
         }
         findViewById<View>(R.id.btnConfigBack).setOnClickListener { switchTab("home") }
@@ -384,6 +398,9 @@ class MainActivity : AppCompatActivity() {
             .setOnClickListener { openGatewayDiagnostics() }
         findViewById<View>(R.id.btnCfgClearRecents).setOnClickListener { confirmClearRecents() }
         findViewById<View>(R.id.btnControlPair).setOnClickListener { pairControlGateway() }
+        findViewById<View>(R.id.btnEnableSmsRecovery).setOnClickListener { offerSmsRecovery() }
+        findViewById<View>(R.id.btnScanSmsRecovery).setOnClickListener { scanSmsRecovery() }
+        findViewById<View>(R.id.btnConfigureServerSip).setOnClickListener { configureServerSip() }
         findViewById<View>(R.id.btnSimPropose).setOnClickListener { proposeSimBindings() }
         findViewById<View>(R.id.btnSimConfirm).setOnClickListener { confirmSimBindings() }
         restoreControlUiState()
@@ -458,7 +475,7 @@ class MainActivity : AppCompatActivity() {
             } == true
             if (!voiceStarted) {
                 Toast.makeText(this, "SIP 语音尚未启动。请到设置运行设备诊断并确认启动。", Toast.LENGTH_LONG).show()
-                switchTab("config")
+                openConfigView()
                 return@setOnClickListener
             }
             if (!GatewayBackgroundRuntime.allowedRecovery(this)) {
@@ -515,10 +532,22 @@ class MainActivity : AppCompatActivity() {
 
         requestSmsPermissions()
 
+        // Rebuild the settings controls before restoring their non-secret
+        // state. The password field is restored from encrypted storage only.
+        val restoredTab = savedInstanceState?.getString(STATE_CURRENT_TAB)
+            ?.takeIf { it in setOf("home", "config", "logs") } ?: "home"
+        val restoreConfig = savedInstanceState?.getBoolean(STATE_CONFIG_OPEN) == true
+        if (restoreConfig) {
+            openConfigView()
+            restoreConfigFormState(savedInstanceState!!)
+        }
+        restorePendingSmsRecovery(savedInstanceState)
+        logsReturnTab = savedInstanceState?.getString(STATE_LOGS_RETURN_TAB)
+            ?.takeIf { it == "home" || it == "config" } ?: "home"
         // Nothing is visible until a tab is selected — switchTab() returns
         // early when the requested tab is already current, so the initial
         // state has to be applied explicitly.
-        switchTab("home")
+        switchTab(restoredTab)
         setCallFilter("all")
         refreshBackgroundStatus()
         refreshSimSummary()
@@ -526,6 +555,97 @@ class MainActivity : AppCompatActivity() {
         // Restore only paired HTTPS control sync; SIP voice needs an explicit
         // user-triggered diagnostic and confirmation below.
         autoStartGateway()
+        if (savedInstanceState != null && pendingRecoveryMode != null && !recoveryPermissionRequestInFlight) {
+            window.decorView.post { if (!isFinishing && !isDestroyed) requestRecoveryPermissionOrConfigure() }
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(STATE_CURRENT_TAB, currentTab)
+        outState.putString(STATE_LOGS_RETURN_TAB, logsReturnTab)
+        val configOpen = currentTab == "config" || (currentTab == "logs" && logsReturnTab == "config")
+        outState.putBoolean(STATE_CONFIG_OPEN, configOpen)
+        if (configOpen) saveConfigFormState(outState)
+        outState.putString(STATE_RECOVERY_MODE, pendingRecoveryMode?.name)
+        outState.putString(STATE_RECOVERY_GATEWAY_ID, pendingRecoveryGatewayId)
+        outState.putString(STATE_RECOVERY_CONTROL_BASE_URL, pendingRecoveryControlBaseUrl)
+        outState.putBoolean(STATE_RECOVERY_PERMISSION_IN_FLIGHT, recoveryPermissionRequestInFlight)
+    }
+
+    /** Save editable settings except the password. It remains only in the
+     * encrypted Keystore-backed credential store across activity recreation. */
+    private fun saveConfigFormState(state: Bundle) {
+        state.putString(STATE_CONFIG_GATEWAY_ID, configGatewayIdAtOpen)
+        state.putString(STATE_CONFIG_CONTROL_BASE_URL, configControlBaseUrlAtOpen)
+        state.putString(STATE_CONFIG_SERVER_AT_OPEN, configServerAtOpen)
+        state.putString(STATE_CONFIG_USER_AT_OPEN, configUserAtOpen)
+        listOf(
+            R.id.etControlUrl to STATE_CONTROL_URL,
+            R.id.etControlDeviceName to STATE_CONTROL_DEVICE_NAME,
+            R.id.etCfgServer to STATE_CFG_SERVER,
+            R.id.etCfgPort to STATE_CFG_PORT,
+            R.id.etCfgUser to STATE_CFG_USER
+        ).forEach { (id, key) ->
+            state.putString(key, findViewById<EditText>(id).text.toString())
+        }
+        state.putIntArray(STATE_OWN_NUMBER_SLOTS, ownNumberFields.map { it.first }.toIntArray())
+        state.putStringArray(STATE_OWN_NUMBER_VALUES,
+            ownNumberFields.map { it.second.text.toString() }.toTypedArray())
+        state.putBoolean(STATE_CFG_AUTOCONNECT, findViewById<MaterialSwitch>(R.id.cbCfgAutoconnect).isChecked)
+        state.putBoolean(STATE_CFG_STUN, findViewById<MaterialSwitch>(R.id.cbCfgUseStun).isChecked)
+        state.putBoolean(STATE_CFG_TRANSLIT, findViewById<MaterialSwitch>(R.id.cbCfgTranslit).isChecked)
+        state.putInt(STATE_CFG_CODEC, findViewById<RadioGroup>(R.id.rgCfgCodec).checkedRadioButtonId)
+        state.putInt(STATE_CFG_AGENT_VOLUME, findViewById<SeekBar>(R.id.sbCfgAgentVolume).progress)
+        state.putInt(STATE_CFG_SCROLL_Y, findViewById<ScrollView>(R.id.svConfig).scrollY)
+    }
+
+    private fun restoreConfigFormState(state: Bundle) {
+        configGatewayIdAtOpen = state.getString(STATE_CONFIG_GATEWAY_ID)
+        configControlBaseUrlAtOpen = state.getString(STATE_CONFIG_CONTROL_BASE_URL)
+        configServerAtOpen = state.getString(STATE_CONFIG_SERVER_AT_OPEN)
+        configUserAtOpen = state.getString(STATE_CONFIG_USER_AT_OPEN)
+        listOf(
+            R.id.etControlUrl to STATE_CONTROL_URL,
+            R.id.etControlDeviceName to STATE_CONTROL_DEVICE_NAME,
+            R.id.etCfgServer to STATE_CFG_SERVER,
+            R.id.etCfgPort to STATE_CFG_PORT,
+            R.id.etCfgUser to STATE_CFG_USER
+        ).forEach { (id, key) -> state.getString(key)?.let { findViewById<EditText>(id).setText(it) } }
+        val slots = state.getIntArray(STATE_OWN_NUMBER_SLOTS) ?: intArrayOf()
+        val values = state.getStringArray(STATE_OWN_NUMBER_VALUES) ?: emptyArray()
+        val restored = slots.zip(values).toMap()
+        ownNumberFields.forEach { (slot, field) -> restored[slot]?.let { field.setText(it) } }
+        findViewById<MaterialSwitch>(R.id.cbCfgAutoconnect).isChecked = state.getBoolean(STATE_CFG_AUTOCONNECT)
+        findViewById<MaterialSwitch>(R.id.cbCfgUseStun).isChecked = state.getBoolean(STATE_CFG_STUN)
+        findViewById<MaterialSwitch>(R.id.cbCfgTranslit).isChecked = state.getBoolean(STATE_CFG_TRANSLIT)
+        val codec = state.getInt(STATE_CFG_CODEC, R.id.rbCodecG722)
+        findViewById<RadioGroup>(R.id.rgCfgCodec).check(codec)
+        findViewById<SeekBar>(R.id.sbCfgAgentVolume).progress = state.getInt(STATE_CFG_AGENT_VOLUME, 3)
+        findViewById<ScrollView>(R.id.svConfig).post {
+            findViewById<ScrollView>(R.id.svConfig).scrollTo(0, state.getInt(STATE_CFG_SCROLL_Y, 0))
+        }
+    }
+
+    private fun restorePendingSmsRecovery(state: Bundle?) {
+        pendingRecoveryMode = state?.getString(STATE_RECOVERY_MODE)
+            ?.let { runCatching { SmsProviderRecovery.HistoryMode.valueOf(it) }.getOrNull() }
+        pendingRecoveryGatewayId = state?.getString(STATE_RECOVERY_GATEWAY_ID)
+        pendingRecoveryControlBaseUrl = state?.getString(STATE_RECOVERY_CONTROL_BASE_URL)
+        recoveryPermissionRequestInFlight = state?.getBoolean(STATE_RECOVERY_PERMISSION_IN_FLIGHT) == true
+        val currentSession = CredentialStore.load(this)
+        if (pendingRecoveryMode != null && (pendingRecoveryGatewayId != currentSession?.gatewayId ||
+                pendingRecoveryControlBaseUrl != currentSession?.controlBaseUrl)) {
+            clearPendingSmsRecovery()
+            Toast.makeText(this, "配对账户已变化，短信补收确认已取消。", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun clearPendingSmsRecovery() {
+        pendingRecoveryMode = null
+        pendingRecoveryGatewayId = null
+        pendingRecoveryControlBaseUrl = null
+        recoveryPermissionRequestInFlight = false
     }
 
     private fun constrainWideContent(content: View) {
@@ -543,6 +663,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshBackgroundStatus() {
+        refreshSmsRecoveryStatus()
         if (!::tvBackgroundState.isInitialized) return
         val status = runCatching { GatewayBackgroundRuntime.snapshot(this) }.getOrNull()
         updatingBackgroundControls = true
@@ -595,6 +716,145 @@ class MainActivity : AppCompatActivity() {
                 !status.notificationsEnabled) View.VISIBLE else View.GONE
         updatingBackgroundControls = false
         refreshPairedControlStatus()
+    }
+
+    private fun refreshSmsRecoveryStatus() {
+        if (!::tabConfig.isInitialized) return
+        val status = runCatching { SmsProviderRecovery.status(this) }.getOrNull() ?: return
+        findViewById<TextView>(R.id.tvSmsRecoveryStatus).text = when {
+            status.state == SmsProviderRecovery.State.NOT_PAIRED -> "短信补收：请先配对中转服务器。"
+            !status.configured -> "短信补收：未启用，可恢复 Android 已保存的收件箱短信。"
+            status.state == SmsProviderRecovery.State.PERMISSION_REQUIRED -> "短信补收：需要允许读取短信。广播收发不受此选项影响。"
+            else -> "短信补收：已启用 · 补入 ${status.importedRows} 条 · 已匹配 ${status.matchedBroadcasts} 条广播。"
+        }
+        findViewById<View>(R.id.btnScanSmsRecovery).isEnabled = status.configured && !recoveryBusy.get()
+    }
+
+    private fun configureServerSip() {
+        val session = CredentialStore.load(this) ?: run {
+            Toast.makeText(this,"请先配对中转服务器",Toast.LENGTH_LONG).show();return
+        }
+        val button = findViewById<View>(R.id.btnConfigureServerSip)
+        button.isEnabled = false
+        Thread({
+            try {
+                val client = ControlApiClient(this,session.controlBaseUrl)
+                val available = client.getSipConfiguration(session.gatewayId).optBoolean("available",false)
+                check(available) { "SIP_NOT_CONFIGURED" }
+                val retryKey = VoiceCredentialStore.beginProvisioning(this,session.gatewayId)
+                val config = client.rotateSipCredentials(retryKey,session.gatewayId)
+                VoiceCredentialStore.saveProvisioned(this,session.gatewayId,config)
+                runOnUiThread {
+                    findViewById<EditText>(R.id.etCfgServer).setText(config.getString("server_name"))
+                    findViewById<EditText>(R.id.etCfgUser).setText(config.getString("auth_username"))
+                    findViewById<EditText>(R.id.etCfgPort).setText(getSharedPreferences("gateway",MODE_PRIVATE).getInt("port",5061).toString())
+                    findViewById<EditText>(R.id.etCfgPass).setText(VoiceCredentialStore.password(this))
+                    refreshBackgroundStatus()
+                    Toast.makeText(this,"SIP 已配置并加密保存。请运行设备诊断，再确认启动语音。",Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                val code = (e as? ControlApiException)?.code ?: "SIP_CONFIGURATION_FAILED"
+                if (code in setOf("SIP_BOOTSTRAP_EXPIRED", "IDEMPOTENCY_KEY_REUSED")) {
+                    VoiceCredentialStore.expireProvisioning(this,session.gatewayId)
+                }
+                runOnUiThread {Toast.makeText(this,"SIP 配置未完成：$code。可重试；请检查服务器是否已启用语音。",Toast.LENGTH_LONG).show()}
+            } finally {runOnUiThread {button.isEnabled=true}}
+        },"sip-provisioning").start()
+    }
+
+    private fun offerSmsRecovery() {
+        clearPendingSmsRecovery()
+        val session = CredentialStore.load(this)
+        if (session == null) {
+            Toast.makeText(this, "请先配对中转服务器", Toast.LENGTH_LONG).show(); return
+        }
+        pendingRecoveryGatewayId = session.gatewayId
+        pendingRecoveryControlBaseUrl = session.controlBaseUrl
+        MaterialAlertDialogBuilder(this).setTitle("短信补收范围")
+            .setMessage("补收需要读取系统短信权限，无需 root。默认只保护启用之后的短信；导入现有收件箱会将其中所有短信上传给当前配对的账户。")
+            .setPositiveButton("只保护今后的短信") { _, _ ->
+                pendingRecoveryMode = SmsProviderRecovery.HistoryMode.SINCE_ENABLE
+                requestRecoveryPermissionOrConfigure()
+            }.setNeutralButton("预览现有收件箱") { _, _ ->
+                pendingRecoveryMode = SmsProviderRecovery.HistoryMode.FULL_CURRENT_INBOX
+                requestRecoveryPermissionOrConfigure()
+            }.setNegativeButton("取消") { _, _ -> clearPendingSmsRecovery() }
+            .setOnCancelListener { clearPendingSmsRecovery() }
+            .show()
+    }
+
+    private fun requestRecoveryPermissionOrConfigure() {
+        val expectedGatewayId = pendingRecoveryGatewayId ?: return
+        val expectedControlBaseUrl = pendingRecoveryControlBaseUrl ?: return
+        val currentSession = CredentialStore.load(this)
+        if (currentSession?.gatewayId != expectedGatewayId ||
+            currentSession.controlBaseUrl != expectedControlBaseUrl) {
+            clearPendingSmsRecovery()
+            Toast.makeText(this,"配对账户已变化，请重新选择补收范围",Toast.LENGTH_LONG).show();return
+        }
+        if (SmsProviderRecovery.permissionState(this) != SmsProviderRecovery.PermissionState.AVAILABLE) {
+            recoveryPermissionRequestInFlight = true
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_SMS), REQ_SMS_RECOVERY)
+            return
+        }
+        val mode = pendingRecoveryMode ?: return
+        if (mode == SmsProviderRecovery.HistoryMode.FULL_CURRENT_INBOX) {
+            Thread({
+                val preview = SmsProviderRecovery.preview(this, mode)
+                runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+                    if (preview.state != SmsProviderRecovery.State.READY) {
+                        clearPendingSmsRecovery()
+                        Toast.makeText(this,"无法读取系统收件箱，请检查权限",Toast.LENGTH_LONG).show();return@runOnUiThread
+                    }
+                    MaterialAlertDialogBuilder(this).setTitle("确认导入现有短信")
+                        .setMessage("预览首页有 ${preview.firstPageRows} 条${if (preview.moreRows) "，还有更多" else ""}。继续会分批上传当前系统收件箱，包含过去的私人短信。")
+                        .setPositiveButton("导入到当前账户") { _, _ ->
+                            clearPendingSmsRecovery()
+                            configureSmsRecovery(mode, expectedGatewayId, expectedControlBaseUrl)
+                        }
+                        .setNegativeButton("取消") { _, _ -> clearPendingSmsRecovery() }
+                        .setOnCancelListener { clearPendingSmsRecovery() }
+                        .show()
+                }
+            },"sms-recovery-preview").start()
+        } else {
+            clearPendingSmsRecovery()
+            configureSmsRecovery(mode, expectedGatewayId, expectedControlBaseUrl)
+        }
+    }
+
+    private fun configureSmsRecovery(
+        mode: SmsProviderRecovery.HistoryMode,
+        expectedGatewayId: String,
+        expectedControlBaseUrl: String?
+    ) {
+        Thread({
+            val result = SmsProviderRecovery.configure(this, mode, expectedGatewayId = expectedGatewayId,
+                expectedControlBaseUrl = expectedControlBaseUrl)
+            runOnUiThread {
+                refreshSmsRecoveryStatus()
+                if (result.configured) scanSmsRecovery()
+                else Toast.makeText(this,"短信补收未启用，请检查权限及配对状态",Toast.LENGTH_LONG).show()
+            }
+        },"sms-recovery-configure").start()
+    }
+
+    private fun scanSmsRecovery() {
+        if (!recoveryBusy.compareAndSet(false,true)) return
+        Thread({
+            try {
+                // Bounded work per UI attempt; later service rounds resume the checkpoint.
+                for (page in 0 until 4) {
+                    val result = SmsProviderRecovery.scan(this)
+                    if (result.state != SmsProviderRecovery.State.MORE_PAGES) break
+                }
+                if (GatewayBackgroundRuntime.allowedRecovery(this)) GatewayService.startControl(this)
+            } finally {
+                recoveryBusy.set(false)
+                runOnUiThread { if (!isDestroyed) refreshSmsRecoveryStatus() }
+            }
+        },"sms-recovery-scan").start()
     }
 
     private fun refreshPairedControlStatus() {
@@ -757,6 +1017,9 @@ class MainActivity : AppCompatActivity() {
                     findViewById<EditText>(R.id.etControlPairingCode).text.clear()
                     val syncEnabled = GatewayBackgroundRuntime.allowedRecovery(this)
                     val syncStarted = syncEnabled && GatewayService.startControl(this)
+                    if (syncStarted) startService(Intent(this,GatewayService::class.java).apply {
+                        action = GatewayService.ACTION_APPLY_CONFIG
+                    })
                     findViewById<TextView>(R.id.tvControlStatus).text =
                         "Paired ${result.gatewayId.take(8)}… · ${if (result.sipAvailable) "SIP available" else "HTTPS control only"} · ${backgroundSyncLabel()}"
                     setControlBusy(false)
@@ -1128,6 +1391,7 @@ class MainActivity : AppCompatActivity() {
             // device that will not describe its SIMs stays configurable.
             val row = layoutInflater.inflate(R.layout.item_sim_number, container, false)
             val et = row.findViewById<EditText>(R.id.etSimNumber)
+            et.isSaveEnabled = false
             et.setText(prefs.getString("own_number", ""))
             row.findViewById<TextView>(R.id.tvSimCaption).text = "No active SIM detected"
             container.addView(row)
@@ -1139,6 +1403,7 @@ class MainActivity : AppCompatActivity() {
         for (sim in sims) {
             val row = layoutInflater.inflate(R.layout.item_sim_number, container, false)
             val et = row.findViewById<EditText>(R.id.etSimNumber)
+            et.isSaveEnabled = false
             val stored = prefs.getString(ownNumberKey(sim.slot), "").orEmpty()
             // First run after upgrading there are no per-slot values yet; the
             // one legacy number belongs to whichever SIM was in use, so offer
@@ -1155,11 +1420,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openConfigView() {
+        val session = CredentialStore.load(this)
+        configGatewayIdAtOpen = session?.gatewayId
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
+        configControlBaseUrlAtOpen = session?.controlBaseUrl
+        configServerAtOpen = prefs.getString("server", "")
+        configUserAtOpen = prefs.getString("user", "")
         findViewById<EditText>(R.id.etCfgServer).setText(prefs.getString("server", ""))
         findViewById<EditText>(R.id.etCfgPort).setText(prefs.getInt("port", 5061).toString())
         findViewById<EditText>(R.id.etCfgUser).setText(prefs.getString("user", ""))
-        findViewById<EditText>(R.id.etCfgPass).setText(prefs.getString("pass", ""))
+        findViewById<EditText>(R.id.etCfgPass).setText(VoiceCredentialStore.password(this))
         buildOwnNumberFields(prefs)
         findViewById<MaterialSwitch>(R.id.cbCfgAutoconnect).isChecked =
             GatewayBackgroundRuntime.allowedRecovery(this)
@@ -1264,6 +1534,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveConfigFromView() {
+        val currentSession = CredentialStore.load(this)
+        val prefsAtSave = getSharedPreferences("gateway", MODE_PRIVATE)
+        if (configGatewayIdAtOpen != currentSession?.gatewayId ||
+            configControlBaseUrlAtOpen != currentSession?.controlBaseUrl ||
+            configServerAtOpen != prefsAtSave.getString("server", "") ||
+            configUserAtOpen != prefsAtSave.getString("user", "")) {
+            findViewById<EditText>(R.id.etCfgPass).text.clear()
+            Toast.makeText(this,"配对身份或 SIP 设置已变化，请重新打开设置。",Toast.LENGTH_LONG).show()
+            return
+        }
         val server = findViewById<EditText>(R.id.etCfgServer).text.toString().trim()
         val port = findViewById<EditText>(R.id.etCfgPort).text.toString().trim().toIntOrNull() ?: 5061
         val user = findViewById<EditText>(R.id.etCfgUser).text.toString().trim()
@@ -1292,7 +1572,7 @@ class MainActivity : AppCompatActivity() {
             .putString("server", server)
             .putInt("port", port)
             .putString("user", user)
-            .putString("pass", pass)
+            .remove("pass")
             .putString("own_number", own)
             .also { ed ->
                 ownNumberFields.forEach { (slot, et) ->
@@ -1306,7 +1586,13 @@ class MainActivity : AppCompatActivity() {
             .putBoolean("srtp_enabled", srtp)
             .putString("codec", codec)
             .putInt("agent_vol_step", agentVolStep)
-            .apply()
+            .commit()
+        runCatching { VoiceCredentialStore.savePassword(this,pass,configGatewayIdAtOpen) }
+            .onFailure {
+                findViewById<EditText>(R.id.etCfgPass).text.clear()
+                Toast.makeText(this,"配对身份已变化，密码未保存。请重新打开设置。",Toast.LENGTH_LONG).show()
+                return
+            }
         if (auto != backgroundEnabledBeforeSave &&
             !GatewayBackgroundRuntime.setEnabled(this, auto)
         ) {
@@ -2012,6 +2298,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (SmsProviderRecovery.status(this).configured) scanSmsRecovery()
         val filter = IntentFilter().apply {
             addAction(GatewayService.STATUS_ACTION)
             addAction(GatewayService.LOG_ACTION)
@@ -2519,11 +2806,11 @@ class MainActivity : AppCompatActivity() {
         val server = prefs.getString("server", "") ?: ""
         val port = prefs.getInt("port", 5061)
         val user = prefs.getString("user", "") ?: ""
-        val pass = prefs.getString("pass", "") ?: ""
+        val pass = VoiceCredentialStore.password(this,server,user)
 
-        if (server.isEmpty() || user.isEmpty()) {
+        if (server.isEmpty() || user.isEmpty() || pass.isEmpty()) {
             Toast.makeText(this, "请先保存 SIP 服务器和用户名", Toast.LENGTH_LONG).show()
-            switchTab("config")
+            openConfigView()
             return false
         }
 
@@ -2675,6 +2962,13 @@ class MainActivity : AppCompatActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == GatewayBackgroundRuntime.NOTIFICATION_PERMISSION_REQUEST_CODE) {
             refreshBackgroundStatus()
+        } else if (requestCode == REQ_SMS_RECOVERY) {
+            recoveryPermissionRequestInFlight = false
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) requestRecoveryPermissionOrConfigure()
+            else {
+                clearPendingSmsRecovery()
+                refreshSmsRecoveryStatus()
+            }
         } else if (requestCode == REQ_SMS_PERMS || requestCode == REQ_VOICE_PERMS) {
             val denied = permissions.zip(grantResults.toTypedArray())
                 .filter { it.second != PackageManager.PERMISSION_GRANTED }
@@ -2705,8 +2999,33 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
+        private const val STATE_CURRENT_TAB = "ui.current_tab"
+        private const val STATE_LOGS_RETURN_TAB = "ui.logs_return_tab"
+        private const val STATE_CONFIG_OPEN = "ui.config_open"
+        private const val STATE_CONFIG_GATEWAY_ID = "ui.config_gateway_id"
+        private const val STATE_CONFIG_CONTROL_BASE_URL = "ui.config_control_base_url"
+        private const val STATE_CONFIG_SERVER_AT_OPEN = "ui.config_server_at_open"
+        private const val STATE_CONFIG_USER_AT_OPEN = "ui.config_user_at_open"
+        private const val STATE_CONTROL_URL = "ui.control_url"
+        private const val STATE_CONTROL_DEVICE_NAME = "ui.control_device_name"
+        private const val STATE_CFG_SERVER = "ui.cfg_server"
+        private const val STATE_CFG_PORT = "ui.cfg_port"
+        private const val STATE_CFG_USER = "ui.cfg_user"
+        private const val STATE_OWN_NUMBER_SLOTS = "ui.own_number_slots"
+        private const val STATE_OWN_NUMBER_VALUES = "ui.own_number_values"
+        private const val STATE_CFG_AUTOCONNECT = "ui.cfg_autoconnect"
+        private const val STATE_CFG_STUN = "ui.cfg_stun"
+        private const val STATE_CFG_TRANSLIT = "ui.cfg_translit"
+        private const val STATE_CFG_CODEC = "ui.cfg_codec"
+        private const val STATE_CFG_AGENT_VOLUME = "ui.cfg_agent_volume"
+        private const val STATE_CFG_SCROLL_Y = "ui.cfg_scroll_y"
+        private const val STATE_RECOVERY_MODE = "ui.recovery_mode"
+        private const val STATE_RECOVERY_GATEWAY_ID = "ui.recovery_gateway_id"
+        private const val STATE_RECOVERY_CONTROL_BASE_URL = "ui.recovery_control_base_url"
+        private const val STATE_RECOVERY_PERMISSION_IN_FLIGHT = "ui.recovery_permission_in_flight"
         private const val REQ_SMS_PERMS = 100
         private const val REQ_VOICE_PERMS = 102
+        private const val REQ_SMS_RECOVERY = 103
         private const val REQ_DEFAULT_DIALER = 101
         private const val MAX_CALL_LOG = 20
     }

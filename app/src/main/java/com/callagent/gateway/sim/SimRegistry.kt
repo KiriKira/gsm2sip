@@ -35,6 +35,7 @@ object SimRegistry {
     private const val KEY_REVISION = "mapping_revision"
     private const val KEY_LOCAL_BARRIER = "local_revision_barrier"
     private const val KEY_OWNER_ID = "server_owner_id"
+    private const val KEY_OWNER_CONTROL_BASE_URL = "server_owner_control_base_url"
     private const val KEY_SALT = "fingerprint_salt"
     private const val KEY_MAPPINGS = "mappings"
 
@@ -157,7 +158,9 @@ object SimRegistry {
         /** Monotonic local invalidation counter; not sent as the wire revision. */
         val localRevisionBarrier: Long,
         val mappings: List<SimMapping>,
-        val subscriptions: List<SimSubscription>
+        val subscriptions: List<SimSubscription>,
+        val ownerGatewayId: String,
+        val ownerControlBaseUrl: String?
     )
 
     private data class StoredMapping(
@@ -177,6 +180,7 @@ object SimRegistry {
         var mappingRevision: Long,
         var localRevisionBarrier: Long,
         var ownerId: String,
+        var ownerControlBaseUrl: String,
         val salt: ByteArray,
         val mappings: LinkedHashMap<String, StoredMapping>
     )
@@ -201,14 +205,24 @@ object SimRegistry {
 
     /** Clear server-owned SIM UUIDs after the gateway is paired to a new owner. */
     @JvmStatic
-    fun resetForGatewayChange(context: Context) = synchronized(lock) {
+    fun resetForGatewayChange(
+        context: Context,
+        expectedGatewayId: String,
+        expectedControlBaseUrl: String
+    ): Boolean = synchronized(lock) {
         val appContext = context.applicationContext
+        val current = CredentialStore.load(appContext)
+        if (current?.gatewayId != expectedGatewayId || current.controlBaseUrl != expectedControlBaseUrl) {
+            return@synchronized false
+        }
         val state = loadState(appContext)
-        state.ownerId = CredentialStore.load(appContext)?.gatewayId.orEmpty()
+        state.ownerId = current.gatewayId
+        state.ownerControlBaseUrl = current.controlBaseUrl
         state.mappings.clear()
         state.mappingRevision = 0L
         state.localRevisionBarrier = 0L
         persist(appContext, state)
+        true
     }
 
     /** Apply the server's authoritative heartbeat revision and local invalidations atomically. */
@@ -596,7 +610,11 @@ object SimRegistry {
                 voiceAvailable = item.phoneAccountHandle != null
             )
         }
-        return SimRegistrySnapshot(state.mappingRevision, state.localRevisionBarrier, mappings, subscriptions)
+        return SimRegistrySnapshot(
+            state.mappingRevision, state.localRevisionBarrier, mappings, subscriptions,
+            ownerGatewayId = state.ownerId,
+            ownerControlBaseUrl = state.ownerControlBaseUrl.takeIf { state.ownerId.isNotEmpty() }
+        )
     }
 
     private fun mappingFor(
@@ -839,6 +857,7 @@ object SimRegistry {
             mappingRevision = prefs.getLong(KEY_REVISION, 0L).coerceAtLeast(0L),
             localRevisionBarrier = prefs.getLong(KEY_LOCAL_BARRIER, 0L).coerceAtLeast(0L),
             ownerId = prefs.getString(KEY_OWNER_ID, null).orEmpty(),
+            ownerControlBaseUrl = prefs.getString(KEY_OWNER_CONTROL_BASE_URL, "").orEmpty(),
             salt = salt,
             mappings = mappings
         )
@@ -862,6 +881,7 @@ object SimRegistry {
             .putLong(KEY_REVISION, state.mappingRevision)
             .putLong(KEY_LOCAL_BARRIER, state.localRevisionBarrier)
             .putString(KEY_OWNER_ID, state.ownerId)
+            .putString(KEY_OWNER_CONTROL_BASE_URL, state.ownerControlBaseUrl)
             .putString(KEY_SALT, android.util.Base64.encodeToString(state.salt, android.util.Base64.NO_WRAP))
             .putString(KEY_MAPPINGS, array.toString())
             .commit()
@@ -875,11 +895,14 @@ object SimRegistry {
     }
 
     private fun ensureGatewayOwner(context: Context, state: RegistryState) {
-        val ownerId = CredentialStore.load(context)?.gatewayId.orEmpty()
-        if (state.ownerId == ownerId) return
+        val session = CredentialStore.load(context)
+        val ownerId = session?.gatewayId.orEmpty()
+        val controlBaseUrl = session?.controlBaseUrl.orEmpty()
+        if (state.ownerId == ownerId && state.ownerControlBaseUrl == controlBaseUrl) return
         state.mappings.clear()
         state.mappingRevision = 0L
         state.localRevisionBarrier = 0L
         state.ownerId = ownerId
+        state.ownerControlBaseUrl = controlBaseUrl
     }
 }

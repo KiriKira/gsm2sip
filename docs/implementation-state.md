@@ -1,9 +1,9 @@
-# 首批三端实施状态
+# 三端实施状态
 
-权威服务端协议固定为 `42f1b3c2c26a9eda018e7baa9d365f97f5bfcfec`：
-[wire addendum](https://github.com/KiriKira/gsm2sip-server/blob/42f1b3c2c26a9eda018e7baa9d365f97f5bfcfec/docs/server-wire-addendum.md)、
-[OpenAPI](https://github.com/KiriKira/gsm2sip-server/blob/42f1b3c2c26a9eda018e7baa9d365f97f5bfcfec/openapi/openapi.yaml) 与
-[fixture](https://github.com/KiriKira/gsm2sip-server/tree/42f1b3c2c26a9eda018e7baa9d365f97f5bfcfec/fixtures/api)。
+权威服务端协议固定为 `77a79f95961d3a8aba0645bbd0c8062ed158a653`：
+[wire addendum](https://github.com/KiriKira/gsm2sip-server/blob/77a79f95961d3a8aba0645bbd0c8062ed158a653/docs/server-wire-addendum.md)、
+[OpenAPI](https://github.com/KiriKira/gsm2sip-server/blob/77a79f95961d3a8aba0645bbd0c8062ed158a653/openapi/openapi.yaml) 与
+[fixture](https://github.com/KiriKira/gsm2sip-server/tree/77a79f95961d3a8aba0645bbd0c8062ed158a653/fixtures/api)。
 原计划仍是三个仓库的完整验收目标；首批完成 M1/M2 短信基础，后续按
 用户要求增加 [Magisk 通用能力适配](magisk-runtime.md)，继续推进通话基础。
 
@@ -38,8 +38,8 @@ modem 调用前先写入 dispatching。应用重启后不确定任务转 unknown
 M0 音频和 DSDS 尚未通过。语音选卡按实际精确账户关联支持，公开接口
 不足时通过 Magisk 查询，不按机型或 API 31 整体拒绝。数字 capture/uplink
 按系统端点与实际路由验证；Magisk 无法创建系统未提供的蜂窝音频接口。
-主机 SIP SDK、Asterisk ARI、完整 Telecom 和三端通话未实现。网关已有
-SIP/媒体加固与呼叫账本，只是供后续 M3 的受限实现，不能作为已验收通话。
+主机内置 PJSUA2、Telecom、服务器 Asterisk ARI 编排与通话授权已落代码。
+网关 SIP/媒体加固与呼叫账本仍需同实际蜂窝音频联合验收。
 
 SIP 子集不支持 auth-int、Digest sess、DTLS-SRTP、SRTCP 或 rekey；
 RFC 4733 桥接目前是接收 RTP 事件后向 Telecom 发送 DTMF。完整通话
@@ -47,8 +47,14 @@ RFC 4733 桥接目前是接收 RTP 事件后向 Telecom 发送 DTMF。完整通�
 
 两端现采用 [Material 3 Expressive 与后台运行设置](android-ui-and-background.md)。
 WSS 唤醒、HTTPS 补齐、用户停止/开机恢复与主机后台短信通知已落代码；
-FCM、完整背压与长期留存尚待实施。旧机隔离事件/未知任务不会删除或
+FCM、完整切网媒体重协商、背压和留存管理尚待实施。旧机隔离事件/未知任务不会删除或
 重发，需后续管理界面和保留策略。当前 debug APK 和本地 Docker Compose
 均待真机验收，也没有部署公网生产服务。
 
 完整缺口和网络场景见 [弱网恢复审查](https://github.com/KiriKira/gsm2sip-server/blob/codex/control-plane-foundation/docs/network-and-feature-status.md)。
+
+## 本次短信恢复与凭据隔离
+
+可选 READ_SMS 系统库恢复需要显式启用，默认从启用时间开始；全历史导入先预览再确认。分页 checkpoint、provider fingerprint 与事件同事务写入，未知 SIM 不猜卡。配对切换按 gateway/控制 URL 租约隔离，旧扫描不能写入新身份。网络刷新响应丢失保留原 token 与请求键；服务端仅恢复当前代际至自然到期。
+
+SIP 密码和 CA 单独通过 Keystore 保存，服务器 bootstrap 可用同请求键恢复。普通短信控制不读取这些语音凭据，也不触发 Magisk；显式配置语音后仍需用户启动和设备能力检查。

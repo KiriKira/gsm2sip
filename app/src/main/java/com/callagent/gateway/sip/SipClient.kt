@@ -33,7 +33,8 @@ class SipClient(
     /** Legacy preference input. TLS calls always require SRTP in v1. */
     @Suppress("unused") private val srtpRequested: Boolean = true,
     /** Explicit development-only escape hatch. Production callers leave this false. */
-    private val allowInsecureSignalling: Boolean = false
+    private val allowInsecureSignalling: Boolean = false,
+    private val caPem: String? = null
 ) {
     /**
      * Whether this call leg may use SRTP at all.
@@ -174,7 +175,7 @@ class SipClient(
         transport?.close()
         sendExecutor?.shutdownNow()
         val t: SipTransport = if (useTls) {
-            TlsSipTransport(serverDomain, serverPort, SOCKET_TIMEOUT_MS) { uiLog(it) }
+            TlsSipTransport(serverDomain, serverPort, SOCKET_TIMEOUT_MS, SipTrust.socketFactory(caPem)) { uiLog(it) }
         } else {
             UdpSipTransport(localPort, SOCKET_TIMEOUT_MS)
         }

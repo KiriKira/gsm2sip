@@ -63,7 +63,11 @@ class SipCancelTest {
                 assertNotNull(receivedCall.get())
                 val pending = receivedCall.get()!!
                 val terminations = AtomicInteger()
-                pending.listener = testListener(onTerminated = { terminations.incrementAndGet() })
+                val terminationReady = CountDownLatch(1)
+                pending.listener = testListener(onTerminated = {
+                    terminations.incrementAndGet()
+                    terminationReady.countDown()
+                })
 
                 send(peer, localPort, cancel("unknown-call", 41, "z9hG4bK-pending"))
                 assertNotNull(awaitResponse(peer, "unknown-call", "41 CANCEL", 481))
@@ -87,6 +91,9 @@ class SipCancelTest {
                 val inviteTerminated = awaitResponse(peer, "pending-call", "41 INVITE", 487)
                 assertNotNull("matching CANCEL must terminate the INVITE with 487", inviteTerminated)
                 assertEquals(SipCall.State.TERMINATED, pending.state)
+                // Receiving the UDP response does not synchronize with the
+                // listener callback that follows it on the receiver thread.
+                assertTrue("termination listener should complete", terminationReady.await(2, TimeUnit.SECONDS))
                 assertEquals("termination listener fires once", 1, terminations.get())
                 val lateDispatches = AtomicInteger()
                 assertFalse(pending.withPendingInvite { lateDispatches.incrementAndGet(); true })

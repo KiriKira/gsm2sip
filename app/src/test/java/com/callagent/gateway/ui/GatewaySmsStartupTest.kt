@@ -39,4 +39,29 @@ class GatewaySmsStartupTest {
             controller.pause().stop().destroy()
         }
     }
+    @Test
+    @Config(sdk = [28])
+    fun explicitVoiceDiagnosticRequestsPhoneRoleBeforeRestrictedVoicePermissions() {
+        val application = RuntimeEnvironment.getApplication()
+        Shadows.shadowOf(application).grantPermissions(
+            "${application.packageName}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
+            Manifest.permission.READ_PHONE_STATE, Manifest.permission.SEND_SMS, Manifest.permission.RECEIVE_SMS
+        )
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        try {
+            val activity = controller.get()
+            MainActivity::class.java.getDeclaredMethod("openGatewayDiagnostics").apply { isAccessible = true }.invoke(activity)
+            val dialog = org.robolectric.shadows.ShadowDialog.getLatestDialog() as androidx.appcompat.app.AlertDialog
+            // OnShowListener is dispatched through the Android main looper.
+            Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).performClick()
+            val shadow = Shadows.shadowOf(activity)
+            assertNull(shadow.lastRequestedPermission)
+            assertEquals(android.telecom.TelecomManager.ACTION_CHANGE_DEFAULT_DIALER,
+                shadow.nextStartedActivityForResult.intent.action)
+        } finally {
+            controller.pause().stop().destroy()
+        }
+    }
+
 }

@@ -2139,14 +2139,16 @@ class MainActivity : AppCompatActivity() {
                     return@setOnClickListener
                 }
 
-                if (requestVoicePermissions()) {
-                    Toast.makeText(this, "授权后再次点击运行诊断；短信模式无需这些语音权限", Toast.LENGTH_LONG).show()
-                    return@setOnClickListener
-                }
                 val telecom = getSystemService(Context.TELECOM_SERVICE) as TelecomManager
                 if (telecom.defaultDialerPackage != packageName) {
                     requestDefaultDialerRole()
                     Toast.makeText(this, "语音需要默认电话角色；设置后再次运行诊断", Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
+                // READ_CALL_LOG is restricted for ordinary installations until
+                // the phone role is held; request that role before voice permissions.
+                if (requestVoicePermissions()) {
+                    Toast.makeText(this, "授权后再次点击运行诊断；短信模式无需这些语音权限", Toast.LENGTH_LONG).show()
                     return@setOnClickListener
                 }
                 results.removeAllViews()

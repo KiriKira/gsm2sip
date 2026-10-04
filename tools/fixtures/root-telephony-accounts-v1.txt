@@ -1,6 +1,6 @@
 protocol=1
 broker_version=1
-app_version=428
+app_version=429
 broker_uid=1000
 source=magisk-system-telephony
 status=ok

@@ -1,6 +1,6 @@
 # 双 SIM 远程网关（开发中）
 
-目标：旧 root Android 保留两张 SIM，未 root Android 主机通过自建服务器收发短信、接打电话。
+目标：旧 Android 保留两张 SIM（语音适配可使用 root/Magisk），未 root Android 主机通过自建服务器收发短信、接打电话。
 本批实现 **M1/M2 的短信基础**；完整三端通话尚未完成，也没有通过目标手机的真实短信或通话验收。
 
 - 网关：HTTPS 配对、服务器分配 SIM 身份与本机确认、SQLite 事件/执行账本、指定订阅发送短信、分片回执。
@@ -12,6 +12,18 @@
 按用户要求，本批后续增加 [Magisk 通用适配](docs/magisk-runtime.md)：模块探测、受限账户 broker 和本地数字音频配置，不再按机型自动选 preset 或以 API 31 作为整体语音门槛。
 两端已增加 [Material 3 Expressive 与后台运行设置](docs/android-ui-and-background.md)，WSS 唤醒配合 HTTPS 补齐；FCM、ARI、主机 SIP SDK 和完整 Telecom 通话仍待后续实施。
 短信不再以 SIP MESSAGE 作为生产执行通道。不确定发送保留 `unknown`，不能自动重发或回落默认 SIM。
+
+## 短信模式无需 root
+
+只收发短信可直接安装普通 APK；启动只申请 `READ_PHONE_STATE`、`SEND_SMS`、
+`RECEIVE_SMS`，不申请录音、拨号、默认电话角色，也不初始化 su 或 Magisk broker。
+开启后台后按需允许通知与电池优化豁免。语音权限和 root 探测仅在显式运行 SIP 诊断/启动语音时使用。
+Android 安装器可能限制短信权限授予；没有 SEND_SMS/RECEIVE_SMS 时会报告功能不可用，
+不会通过 root 静默授权。当前没有实现完整默认短信应用角色，不能将其视作现有授权 fallback。
+普通权限无法取得稳定 SIM 身份时需要本机逐卡确认，重启后重新核对；不会回落默认卡。
+
+[功能缺口与弱网恢复审查](https://github.com/KiriKira/gsm2sip-server/blob/codex/control-plane-foundation/docs/network-and-feature-status.md)
+区分短信补齐、提醒投递、未实现的通话续接和弱网音质自适应。
 
 ## 开发与初次连接
 

@@ -11,8 +11,8 @@ android {
         applicationId = "com.callagent.gateway"
         minSdk = 26
         targetSdk = 34
-        versionCode = 428
-        versionName = "1.3.2-dev"
+        versionCode = 429
+        versionName = "1.3.3-dev"
     }
 
     // Release identity is supplied outside the repository and persists across upgrades.

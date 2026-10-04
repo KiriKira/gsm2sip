@@ -323,7 +323,7 @@
                                 android:id="@+id/tvPermissionNotice"
                                 android:layout_width="match_parent"
                                 android:layout_height="wrap_content"
-                                android:text="通话和短信功能需要相应系统权限；拒绝权限会停用相关功能，可在系统应用设置中更改。"
+                                android:text="短信模式只需 SIM 与短信权限，无需 root、录音或默认电话角色。语音权限在显式运行 SIP 诊断时申请。"
                                 android:textColor="?attr/colorOnSurfaceVariant"
                                 android:textSize="12sp"
                                 android:paddingTop="8dp" />

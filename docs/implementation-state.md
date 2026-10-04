@@ -20,6 +20,10 @@ modem 调用前先写入 dispatching。应用重启后不确定任务转 unknown
 入站未知 SIM 显式上报 unknown，不猜卡；上游旧 SIP MESSAGE 执行器停用，
 旧 outbox 只迁入隔离账本。SQLite WAL 主写连接明确采用 synchronous=FULL。
 
+短信模式普通 APK 无需 root 或 Magisk：只申请 SIM/SMS 权限，控制服务启动、
+本机 SIM 确认和心跳不查询语音账户，不请求默认电话角色。root 初始化及旧版
+特权通知迁移只在显式语音启动时执行，网络详情也使用普通公开接口。
+
 空闲服务在 Android 14+ 使用 specialUse FGS；开机只启动已配对控制服务，
 不弹出 Activity 或强制录音授权。Magisk 不再改全局短信限额、su 自动授权、
 其他短信应用通知或 PermissionController。发布包必须使用自有签名；
@@ -46,3 +50,5 @@ WSS 唤醒、HTTPS 补齐、用户停止/开机恢复与主机后台短信通知
 FCM、完整背压与长期留存尚待实施。旧机隔离事件/未知任务不会删除或
 重发，需后续管理界面和保留策略。当前 debug APK 和本地 Docker Compose
 均待真机验收，也没有部署公网生产服务。
+
+完整缺口和网络场景见 [弱网恢复审查](https://github.com/KiriKira/gsm2sip-server/blob/codex/control-plane-foundation/docs/network-and-feature-status.md)。

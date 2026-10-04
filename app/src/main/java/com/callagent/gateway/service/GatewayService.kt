@@ -215,6 +215,8 @@ class GatewayService : Service() {
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 Log.i(TAG, "Network available")
+                // Do not wait out a prior offline retry backoff after connectivity returns.
+                if (wakeRuntimeAllowed()) wakeControlLoop()
                 logTransportIfChanged()
                 checkNetworkChanged()
                 refreshVoicePowerLease()
@@ -244,6 +246,9 @@ class GatewayService : Service() {
                 checkNetworkChanged()
             }
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) && wakeRuntimeAllowed()) {
+                    wakeControlLoop()
+                }
                 logTransportIfChanged()
                 checkNetworkChanged()
                 refreshVoicePowerLease()
@@ -267,6 +272,7 @@ class GatewayService : Service() {
     }
 
     private fun checkNetworkChanged() {
+        if (!voiceRuntimeStarted) return
         // Skip if no prior IP (first start handles its own init)
         if (currentLocalIp.isEmpty()) return
         if (cfgServer.isEmpty()) return
@@ -288,7 +294,7 @@ class GatewayService : Service() {
     }
 
     private fun reconnect() {
-        if (stopped || cfgServer.isEmpty()) return
+        if (!voiceRuntimeStarted || stopped || cfgServer.isEmpty()) return
         clearStaleInitializing()
         if (!initializing.compareAndSet(false, true)) {
             Log.i(TAG, "Reconnect skipped — already initializing")
@@ -322,16 +328,12 @@ class GatewayService : Service() {
         super.onCreate()
         createNotificationChannel()
         registerNetworkCallback()
-        RootShell.init()
         LegacySmsMigration.migrate(this)
         val recovered = GatewayDatabase.get(this).recoverUnknownDispatches()
         if (recovered > 0) broadcastLog("SMS: marked $recovered interrupted dispatch(es) unknown; no automatic retry")
         if (callRecoveryDone.compareAndSet(false, true)) {
             val recoveredCalls = GatewayDatabase.get(this).recoverDispatchingCallsToUnknown()
             if (recoveredCalls > 0) broadcastLog("CALL: marked $recoveredCalls interrupted call dispatch(es) unknown")
-        }
-        thread(name = "notif-setup") {
-            applyNotificationVisibility()
         }
         Log.i(TAG, "GatewayService created")
     }
@@ -866,6 +868,7 @@ class GatewayService : Service() {
             }
             return false
         }
+        checkSmsPermission()
         broadcastLog("CONTROL: paired gateway session active")
         startControlLoop()
         return true
@@ -1329,7 +1332,7 @@ class GatewayService : Service() {
     /** Shared SIP init — called from both startGateway and reconnect threads. */
     private fun initSipClient(gen: Int) {
         /** True while this thread is still the newest bring-up. */
-        fun current() = gen == initGeneration.get() && !stopped &&
+        fun current() = voiceRuntimeStarted && gen == initGeneration.get() && !stopped &&
             GatewayBackgroundRuntime.allowedRecovery(this)
 
         if (!current()) {
@@ -1349,6 +1352,10 @@ class GatewayService : Service() {
             sipClient = null
         }
 
+        // Root and legacy privileged migration belong only to explicit voice mode.
+        RootShell.init()
+        applyNotificationVisibility()
+        if (!current()) return
         checkDefaultDialer()
         checkSmsPermission()
 
@@ -1622,7 +1629,8 @@ class GatewayService : Service() {
      * Suspending the package's notifications did hide the icon, but it is a
      * blunt instrument -- it swallows everything the app might ever post --
      * and it is unnecessary now that the icon draws nothing.  That state
-     * survives app updates, so clear it unconditionally on start.
+     * survives app updates; clear it when the user explicitly starts voice mode.
+     * SMS-only startup never opens a root shell.
      */
     private fun applyNotificationVisibility() {
         RootShell.exec("cmd notification unsuspend_package $packageName 2>/dev/null", 5000)

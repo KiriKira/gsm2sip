@@ -40,6 +40,11 @@ object SimRegistry {
 
     private val lock = Any()
 
+    /** Test seam for proving that SMS/control paths do not ask for voice accounts. */
+    @Volatile
+    internal var voiceAccountResolverOverrideForTest:
+        ((Context, List<SubscriptionInfo>) -> Map<Int, PhoneAccountHandle>)? = null
+
     enum class IdentityState {
         FINGERPRINT_VERIFIED,
         LOCAL_CONFIRMED,
@@ -182,13 +187,13 @@ object SimRegistry {
         val phoneAccountHandle: PhoneAccountHandle?
     )
 
-    /** Read current subscriptions, account associations, and local mappings. */
+    /** Read current subscriptions and local mappings; voice accounts are opt-in. */
     @JvmStatic
-    fun snapshot(context: Context): SimRegistrySnapshot = synchronized(lock) {
+    fun snapshot(context: Context, includeVoice: Boolean = false): SimRegistrySnapshot = synchronized(lock) {
         val appContext = context.applicationContext
         val state = loadState(appContext)
         ensureGatewayOwner(appContext, state)
-        val current = readCurrentSubscriptions(appContext, state.salt, includeVoice = true)
+        val current = readCurrentSubscriptions(appContext, state.salt, includeVoice)
         refreshBindings(appContext, state, current)
         persist(appContext, state)
         makeSnapshot(appContext, state, current)
@@ -248,7 +253,7 @@ object SimRegistry {
             }
         }
         state.mappingRevision = serverRevision
-        val current = readCurrentSubscriptions(appContext, state.salt, includeVoice = true)
+        val current = readCurrentSubscriptions(appContext, state.salt, includeVoice = false)
         refreshBindings(appContext, state, current)
         persist(appContext, state)
         makeSnapshot(appContext, state, current)
@@ -273,7 +278,7 @@ object SimRegistry {
             }
         }
         state.mappingRevision = serverRevision
-        val current = readCurrentSubscriptions(appContext, state.salt, includeVoice = true)
+        val current = readCurrentSubscriptions(appContext, state.salt, includeVoice = false)
         refreshBindings(appContext, state, current)
         persist(appContext, state)
         makeSnapshot(appContext, state, current)
@@ -303,7 +308,7 @@ object SimRegistry {
         if (state.ownerId.isEmpty()) {
             throw SimMappingException(ErrorCode.SIM_UNAVAILABLE, "Gateway is not paired to a server")
         }
-        val current = readCurrentSubscriptions(appContext, state.salt, includeVoice = true)
+        val current = readCurrentSubscriptions(appContext, state.salt, includeVoice = false)
         refreshBindings(appContext, state, current)
         if (serverRevision != null && serverRevision < state.mappingRevision) {
             throw SimMappingException(ErrorCode.SIM_MAPPING_CHANGED, "Server SIM mapping revision is stale")
@@ -387,7 +392,7 @@ object SimRegistry {
         if (state.ownerId.isEmpty()) {
             throw SimMappingException(ErrorCode.SIM_UNAVAILABLE, "Gateway is not paired to a server")
         }
-        val currentSubscriptions = readCurrentSubscriptions(appContext, state.salt, includeVoice = true)
+        val currentSubscriptions = readCurrentSubscriptions(appContext, state.salt, includeVoice = false)
         refreshBindings(appContext, state, currentSubscriptions)
         if (!Policy.isNewProposal(state.mappingRevision, serverRevision)) {
             throw SimMappingException(ErrorCode.SIM_MAPPING_CHANGED, "Changed SIM binding requires a newer server revision")
@@ -570,7 +575,7 @@ object SimRegistry {
     private fun makeSnapshot(
         context: Context,
         state: RegistryState,
-        current: List<CurrentSubscription> = readCurrentSubscriptions(context, state.salt)
+        current: List<CurrentSubscription> = readCurrentSubscriptions(context, state.salt, includeVoice = false)
     ): SimRegistrySnapshot {
         val currentBySubId = current.associateBy { it.info.subscriptionId }
         val mappings = state.mappings.values.map { stored ->
@@ -619,7 +624,7 @@ object SimRegistry {
     private fun refreshBindings(
         context: Context,
         state: RegistryState,
-        subscriptions: List<CurrentSubscription> = readCurrentSubscriptions(context, state.salt)
+        subscriptions: List<CurrentSubscription> = readCurrentSubscriptions(context, state.salt, includeVoice = false)
     ) {
         val current = subscriptions.associateBy { it.info.subscriptionId }
         state.mappings.values.forEach { stored ->
@@ -665,7 +670,7 @@ object SimRegistry {
     private fun readCurrentSubscriptions(
         context: Context,
         salt: ByteArray,
-        includeVoice: Boolean = true
+        includeVoice: Boolean = false
     ): List<CurrentSubscription> {
         val subscriptionManager = context.getSystemService(SubscriptionManager::class.java)
             ?: throw SimMappingException(ErrorCode.SIM_UNAVAILABLE, "Subscription service is unavailable")
@@ -676,7 +681,12 @@ object SimRegistry {
         } catch (e: RuntimeException) {
             throw SimMappingException(ErrorCode.SIM_UNAVAILABLE, "Cannot read active SIM subscriptions")
         }
-        val voiceHandles = if (includeVoice) resolveVoiceHandles(context, subscriptions) else emptyMap()
+        val voiceHandles = if (includeVoice) {
+            voiceAccountResolverOverrideForTest?.invoke(context, subscriptions)
+                ?: resolveVoiceHandles(context, subscriptions)
+        } else {
+            emptyMap()
+        }
         return subscriptions.map { info ->
             CurrentSubscription(
                 info = info,

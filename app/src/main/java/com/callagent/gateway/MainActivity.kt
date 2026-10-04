@@ -513,8 +513,7 @@ class MainActivity : AppCompatActivity() {
         btnInCallMonitor = findViewById(R.id.btnInCallMonitor)
         btnInCallMonitor.setOnClickListener { toggleMonitor() }
 
-        requestPermissions()
-        requestDefaultDialerRole()
+        requestSmsPermissions()
 
         // Nothing is visible until a tab is selected — switchTab() returns
         // early when the requested tab is already current, so the initial
@@ -794,7 +793,7 @@ class MainActivity : AppCompatActivity() {
         setControlBusy(true, "Reading local SIM capabilities…")
         Thread({
             try {
-                // Magisk may start a short-lived Binder broker; never block the UI waiting for it.
+                // Subscription reads stay off the UI thread; SMS never queries the voice broker.
                 val snapshot = SimRegistry.snapshot(this)
                 val subscriptions = snapshot.subscriptions
                 if (subscriptions.isEmpty()) {
@@ -1660,30 +1659,14 @@ class MainActivity : AppCompatActivity() {
                 // Cell identity is location data as far as Android is
                 // concerned: dumpsys blanks it even for root, so the only way
                 // to read it is getAllCellInfo() with ACCESS_FINE_LOCATION.
-                // The Magisk module grants that on boot, so no prompt appears.
+                // Without an explicitly granted location permission it stays unavailable.
                 append("\n" + describeCells())
             } else {
-                val extra = RootShell.execForOutput(
-                    "echo MAC=$(cat /sys/class/net/wlan0/address 2>/dev/null); " +
-                    "echo GW=$(ip route get 8.8.8.8 2>/dev/null | grep -oE 'via [0-9.]+' | awk '{print $2}')",
-                    timeoutMs = 8000
-                )
-                val f = extra.lines().mapNotNull {
-                    val i = it.indexOf('=')
-                    if (i > 0) it.substring(0, i) to it.substring(i + 1).trim() else null
-                }.toMap()
-                val gw = f["GW"].orEmpty()
-                append(
-                    "Phone MAC    : ${f["MAC"]?.ifEmpty { null } ?: "—"}\n" +
-                    "Router IP    : ${gw.ifEmpty { "—" }}\n"
-                )
-                if (gw.isNotEmpty()) {
-                    val mac = RootShell.execForOutput(
-                        "ip neigh show $gw 2>/dev/null | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1",
-                        timeoutMs = 5000
-                    ).trim()
-                    append("Router MAC   : ${mac.ifEmpty { "—" }}\n")
-                }
+                val connectivity = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                val gw = connectivity.getLinkProperties(connectivity.activeNetwork)?.routes
+                    ?.firstOrNull { it.isDefaultRoute && it.gateway?.isAnyLocalAddress == false }?.gateway?.hostAddress.orEmpty()
+                // MAC addresses are privacy restricted; diagnostics must not open su.
+                append("Router IP    : ${gw.ifEmpty { "—" }}\n")
 
                 append("\n— reachability —\n")
                 if (gw.isNotEmpty()) append("Router  : ${pingAvg(gw)}\n")
@@ -1907,7 +1890,17 @@ class MainActivity : AppCompatActivity() {
 
     /** Average round-trip to a host, or why it failed. */
     private fun pingAvg(host: String): String {
-        val out = RootShell.execForOutput("ping -c 3 -W 2 $host 2>&1 | tail -2", timeoutMs = 12000)
+        val out = try {
+            val process = ProcessBuilder("/system/bin/ping", "-c", "3", "-W", "2", "--", host)
+                .redirectErrorStream(true).start()
+            if (!process.waitFor(12, java.util.concurrent.TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                return "timed out"
+            }
+            process.inputStream.bufferedReader().use { it.readText() }
+        } catch (_: Exception) {
+            return "unavailable"
+        }
         val avg = Regex("= [0-9.]+/([0-9.]+)/").find(out)?.groupValues?.getOrNull(1)
         val loss = Regex("([0-9]+)% packet loss").find(out)?.groupValues?.getOrNull(1)
         return when {
@@ -2146,6 +2139,16 @@ class MainActivity : AppCompatActivity() {
                     return@setOnClickListener
                 }
 
+                if (requestVoicePermissions()) {
+                    Toast.makeText(this, "授权后再次点击运行诊断；短信模式无需这些语音权限", Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
+                val telecom = getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+                if (telecom.defaultDialerPackage != packageName) {
+                    requestDefaultDialerRole()
+                    Toast.makeText(this, "语音需要默认电话角色；设置后再次运行诊断", Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
                 results.removeAllViews()
                 checking = true
                 checkComplete = false
@@ -2602,28 +2605,36 @@ class MainActivity : AppCompatActivity() {
 
     // ── Permissions ─────────────────────────────────────
 
-    private fun requestPermissions() {
-        val perms = mutableListOf(
+    private fun requestSmsPermissions() {
+        requestMissingPermissions(listOf(
+            Manifest.permission.READ_PHONE_STATE,
+            Manifest.permission.SEND_SMS,
+            Manifest.permission.RECEIVE_SMS
+        ), REQ_SMS_PERMS)
+    }
+
+    /** Called only from the visible, explicitly selected voice diagnostic. */
+    private fun requestVoicePermissions(): Boolean {
+        val permissions = mutableListOf(
             Manifest.permission.RECORD_AUDIO,
             Manifest.permission.READ_PHONE_STATE,
             Manifest.permission.CALL_PHONE,
             Manifest.permission.ANSWER_PHONE_CALLS,
             Manifest.permission.READ_CALL_LOG
-            // Deliberately not location.  A gateway has no business asking for
-            // it, and the two things that use it are cosmetic: the cell-id
-            // readout in the info dialog, and the WiFi SSID (getSSID() has
-            // returned "<unknown ssid>" without location since Android 8.1).
-            // Both degrade to a placeholder instead.
         )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            perms.add(Manifest.permission.READ_PHONE_NUMBERS)
+            permissions.add(Manifest.permission.READ_PHONE_NUMBERS)
         }
-        val needed = perms.filter {
+        return requestMissingPermissions(permissions, REQ_VOICE_PERMS)
+    }
+
+    private fun requestMissingPermissions(permissions: List<String>, requestCode: Int): Boolean {
+        val needed = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
-        if (needed.isNotEmpty()) {
-            ActivityCompat.requestPermissions(this, needed.toTypedArray(), REQ_PERMS)
-        }
+        if (needed.isEmpty()) return false
+        ActivityCompat.requestPermissions(this, needed.toTypedArray(), requestCode)
+        return true
     }
 
     private fun requestDefaultDialerRole() {
@@ -2662,7 +2673,7 @@ class MainActivity : AppCompatActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == GatewayBackgroundRuntime.NOTIFICATION_PERMISSION_REQUEST_CODE) {
             refreshBackgroundStatus()
-        } else if (requestCode == REQ_PERMS) {
+        } else if (requestCode == REQ_SMS_PERMS || requestCode == REQ_VOICE_PERMS) {
             val denied = permissions.zip(grantResults.toTypedArray())
                 .filter { it.second != PackageManager.PERMISSION_GRANTED }
                 .map { it.first.substringAfterLast('.') }
@@ -2670,6 +2681,8 @@ class MainActivity : AppCompatActivity() {
                 appendLog("WARN: Denied permissions: ${denied.joinToString()}")
                 val affected = denied.mapNotNull { permission ->
                     when (permission) {
+                        "SEND_SMS" -> "发送短信"
+                        "RECEIVE_SMS" -> "接收短信"
                         "RECORD_AUDIO" -> "通话音频"
                         "READ_PHONE_STATE" -> "SIM 与通话状态读取"
                         "CALL_PHONE" -> "外拨电话"
@@ -2682,7 +2695,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 tvPermissionNotice.text = "已拒绝：${affected.joinToString("、")}。相关功能会受限；可到系统设置的应用权限中更改。"
             } else {
-                tvPermissionNotice.text = "通话和短信功能需要相应系统权限；拒绝权限会停用相关功能，可在系统应用设置中更改。"
+                tvPermissionNotice.text = "短信模式只需 SIM 与短信权限，无需 root、录音或默认电话角色。语音权限在显式运行 SIP 诊断时申请。"
             }
             refreshSimSummary()
             refreshBackgroundStatus()
@@ -2690,7 +2703,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
-        private const val REQ_PERMS = 100
+        private const val REQ_SMS_PERMS = 100
+        private const val REQ_VOICE_PERMS = 102
         private const val REQ_DEFAULT_DIALER = 101
         private const val MAX_CALL_LOG = 20
     }

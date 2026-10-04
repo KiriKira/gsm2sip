@@ -198,7 +198,8 @@ object GatewayBackgroundRuntime {
         val app = context.applicationContext
         val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         if (prefs.getBoolean(KEY_USER_STOPPED, false)) return true
-        val enabledAt = prefs.getLong(KEY_LAST_EXPLICIT_ENABLE, packageUpdateTime(app))
+        // Updating an older installation is not a new explicit enable.
+        val enabledAt = prefs.getLong(KEY_LAST_EXPLICIT_ENABLE, packageInstallTime(app))
         if (enabledAt <= 0L) return false
         val latestUserExit = try {
             val manager = app.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
@@ -227,9 +228,9 @@ object GatewayBackgroundRuntime {
         return true
     }
 
-    private fun packageUpdateTime(context: Context): Long = try {
+    private fun packageInstallTime(context: Context): Long = try {
         @Suppress("DEPRECATION")
-        context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
+        context.packageManager.getPackageInfo(context.packageName, 0).firstInstallTime
     } catch (_: Exception) {
         0L
     }

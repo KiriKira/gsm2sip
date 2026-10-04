@@ -9,6 +9,7 @@ local.properties
 
 # Gradle
 .gradle/
+.kotlin/
 build/
 app/build/
 

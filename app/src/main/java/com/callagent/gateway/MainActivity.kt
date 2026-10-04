@@ -148,6 +148,15 @@ class MainActivity : AppCompatActivity() {
     private var configControlBaseUrlAtOpen: String? = null
     private var configServerAtOpen: String? = null
     private var configUserAtOpen: String? = null
+    private data class ConfigEditorRestore(
+        val fieldId: Int,
+        val selectionStart: Int,
+        val selectionEnd: Int,
+        val imeVisible: Boolean
+    )
+    private var pendingConfigEditorRestore: ConfigEditorRestore? = null
+    private var configEditorRestorePosted = false
+    private var activityWindowHasFocus = false
 
     private lateinit var tabLogs: LinearLayout
     private lateinit var bottomNavigation: NavigationBarView
@@ -557,6 +566,9 @@ class MainActivity : AppCompatActivity() {
         // early when the requested tab is already current, so the initial
         // state has to be applied explicitly.
         switchTab(restoredTab)
+        if (restoreConfig && restoredTab == "config") {
+            queueConfigEditorRestore(savedInstanceState!!)
+        }
         setCallFilter("all")
         refreshBackgroundStatus()
         refreshSimSummary()
@@ -607,6 +619,17 @@ class MainActivity : AppCompatActivity() {
         state.putInt(STATE_CFG_CODEC, findViewById<RadioGroup>(R.id.rgCfgCodec).checkedRadioButtonId)
         state.putInt(STATE_CFG_AGENT_VOLUME, findViewById<SeekBar>(R.id.sbCfgAgentVolume).progress)
         state.putInt(STATE_CFG_SCROLL_Y, findViewById<ScrollView>(R.id.svConfig).scrollY)
+        val root = findViewById<View>(R.id.rootWindow)
+        val focusedField = root.findFocus() as? EditText
+        if (focusedField != null && focusedField.id in CONFIG_RESTORABLE_FOCUS_FIELD_IDS) {
+            state.putInt(STATE_CONFIG_FOCUSED_FIELD_ID, focusedField.id)
+            state.putInt(STATE_CONFIG_SELECTION_START, focusedField.selectionStart.coerceAtLeast(0))
+            state.putInt(STATE_CONFIG_SELECTION_END, focusedField.selectionEnd.coerceAtLeast(0))
+            state.putBoolean(
+                STATE_CONFIG_IME_VISIBLE,
+                ViewCompat.getRootWindowInsets(root)?.isVisible(WindowInsetsCompat.Type.ime()) == true
+            )
+        }
     }
 
     private fun restoreConfigFormState(state: Bundle) {
@@ -634,6 +657,58 @@ class MainActivity : AppCompatActivity() {
         findViewById<ScrollView>(R.id.svConfig).post {
             findViewById<ScrollView>(R.id.svConfig).scrollTo(0, state.getInt(STATE_CFG_SCROLL_Y, 0))
         }
+    }
+
+    private fun queueConfigEditorRestore(state: Bundle) {
+        val fieldId = state.getInt(STATE_CONFIG_FOCUSED_FIELD_ID, View.NO_ID)
+        if (fieldId !in CONFIG_RESTORABLE_FOCUS_FIELD_IDS) return
+        pendingConfigEditorRestore = ConfigEditorRestore(
+            fieldId = fieldId,
+            selectionStart = state.getInt(STATE_CONFIG_SELECTION_START),
+            selectionEnd = state.getInt(STATE_CONFIG_SELECTION_END),
+            imeVisible = state.getBoolean(STATE_CONFIG_IME_VISIBLE)
+        )
+    }
+
+    private fun scheduleConfigEditorRestoreWhenReady() {
+        val restore = pendingConfigEditorRestore ?: return
+        if (!activityWindowHasFocus || configEditorRestorePosted) return
+        val root = findViewById<View>(R.id.rootWindow)
+        if (!root.isAttachedToWindow) return
+
+        configEditorRestorePosted = true
+        root.post {
+            configEditorRestorePosted = false
+            if (pendingConfigEditorRestore !== restore || !activityWindowHasFocus ||
+                isFinishing || isDestroyed || !root.isAttachedToWindow
+            ) return@post
+
+            val field = findViewById<EditText>(restore.fieldId)
+            if (!field.isAttachedToWindow || !field.isShown || !field.isEnabled ||
+                !field.requestFocus()
+            ) return@post
+
+            val length = field.text.length
+            field.setSelection(
+                restore.selectionStart.coerceIn(0, length),
+                restore.selectionEnd.coerceIn(0, length)
+            )
+            pendingConfigEditorRestore = null
+            if (restore.imeVisible) {
+                WindowCompat.getInsetsController(window, root).show(WindowInsetsCompat.Type.ime())
+            }
+        }
+    }
+
+    override fun onPostResume() {
+        super.onPostResume()
+        scheduleConfigEditorRestoreWhenReady()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        activityWindowHasFocus = hasFocus
+        if (hasFocus) scheduleConfigEditorRestoreWhenReady()
     }
 
     private fun restorePendingSmsRecovery(state: Bundle?) {
@@ -3028,6 +3103,10 @@ class MainActivity : AppCompatActivity() {
         private const val STATE_CFG_CODEC = "ui.cfg_codec"
         private const val STATE_CFG_AGENT_VOLUME = "ui.cfg_agent_volume"
         private const val STATE_CFG_SCROLL_Y = "ui.cfg_scroll_y"
+        private const val STATE_CONFIG_FOCUSED_FIELD_ID = "ui.config_focused_field_id"
+        private const val STATE_CONFIG_SELECTION_START = "ui.config_selection_start"
+        private const val STATE_CONFIG_SELECTION_END = "ui.config_selection_end"
+        private const val STATE_CONFIG_IME_VISIBLE = "ui.config_ime_visible"
         private const val STATE_RECOVERY_MODE = "ui.recovery_mode"
         private const val STATE_RECOVERY_GATEWAY_ID = "ui.recovery_gateway_id"
         private const val STATE_RECOVERY_CONTROL_BASE_URL = "ui.recovery_control_base_url"
@@ -3037,5 +3116,12 @@ class MainActivity : AppCompatActivity() {
         private const val REQ_SMS_RECOVERY = 103
         private const val REQ_DEFAULT_DIALER = 101
         private const val MAX_CALL_LOG = 20
+        private val CONFIG_RESTORABLE_FOCUS_FIELD_IDS = setOf(
+            R.id.etControlUrl,
+            R.id.etControlDeviceName,
+            R.id.etCfgServer,
+            R.id.etCfgPort,
+            R.id.etCfgUser
+        )
     }
 }

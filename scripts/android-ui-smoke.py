@@ -558,8 +558,10 @@ class Smoke:
         finally:
             self.shell("settings", "put", "system", "user_rotation", "0", label="restore_portrait")
             self.shell("settings", "put", "system", "accelerometer_rotation", "1", label="restore_auto_rotation")
-        self.shell("input", "keyevent", "KEYCODE_BACK", label="hide_ime")
-        self.wait(2)
+        ime_visible, _ = self._ime_visible()
+        if ime_visible:
+            self.shell("input", "keyevent", "KEYCODE_BACK", label="hide_ime")
+            self.wait(2)
 
     @staticmethod
     def extract_current_state(state_dump: str) -> str:

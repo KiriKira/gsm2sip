@@ -17,11 +17,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
-      ANDROID_HOME: ${{ runner.temp }}/android-sdk
-      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
-      ANDROID_AVD_HOME: ${{ runner.temp }}/android-avd
       ROOTAVD_COMMIT: 613caa44371f85e1a461bc030e07ddc2d71afe32
-      MAGISK_VERSION: 30.7
+      MAGISK_VERSION: '30.7'
       MAGISK_VERSION_CODE: '30700'
       MAGISK_APK_SHA256: e0d32d2123532860f97123d927b1bb86c4e08e6fd8a48bfc6b5bee0afae9ebd5
     steps:
@@ -31,6 +28,13 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+
+      - name: Configure disposable Android SDK and AVD directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/android-sdk" "$RUNNER_TEMP/android-avd"
+          echo "ANDROID_HOME=$RUNNER_TEMP/android-sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$RUNNER_TEMP/android-sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_AVD_HOME=$RUNNER_TEMP/android-avd" >> "$GITHUB_ENV"
 
       - uses: android-actions/setup-android@v3
         with:

@@ -1,0 +1,92 @@
+name: Magisk API 34 AVD module smoke
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/magisk-avd-smoke.yml'
+      - 'scripts/magisk-avd-smoke.py'
+      - 'scripts/magisk-avd-smoke-root.sh'
+      - 'scripts/magisk-avd-smoke-module/**'
+
+permissions:
+  contents: read
+
+jobs:
+  magisk-avd-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ANDROID_HOME: ${{ runner.temp }}/android-sdk
+      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
+      ANDROID_AVD_HOME: ${{ runner.temp }}/android-avd
+      ROOTAVD_COMMIT: 613caa44371f85e1a461bc030e07ddc2d71afe32
+      MAGISK_VERSION: 30.7
+      MAGISK_VERSION_CODE: '30700'
+      MAGISK_APK_SHA256: e0d32d2123532860f97123d927b1bb86c4e08e6fd8a48bfc6b5bee0afae9ebd5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools emulator platforms;android-34 platforms;android-35 build-tools;35.0.0 system-images;android-34;google_apis;x86_64
+          log-accepted-android-sdk-licenses: false
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Enable KVM access
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Fetch pinned rootAVD source and official Magisk release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rootAVD" artifacts/magisk-avd-smoke
+          git init "$RUNNER_TEMP/rootAVD"
+          git -C "$RUNNER_TEMP/rootAVD" remote add origin https://gitlab.com/newbit/rootAVD.git
+          git -C "$RUNNER_TEMP/rootAVD" fetch --depth=1 origin "$ROOTAVD_COMMIT"
+          git -C "$RUNNER_TEMP/rootAVD" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/rootAVD" rev-parse HEAD)" = "$ROOTAVD_COMMIT"
+          curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+            "https://github.com/topjohnwu/Magisk/releases/download/v${MAGISK_VERSION}/Magisk-v${MAGISK_VERSION}.apk" \
+            --output "$RUNNER_TEMP/rootAVD/Magisk.zip"
+          printf '%s  %s\n' "$MAGISK_APK_SHA256" "$RUNNER_TEMP/rootAVD/Magisk.zip" | sha256sum --check
+          sha256sum "$RUNNER_TEMP/rootAVD/Magisk.zip" | tee artifacts/magisk-avd-smoke/magisk-apk.sha256
+          git -C "$RUNNER_TEMP/rootAVD" rev-parse HEAD | tee artifacts/magisk-avd-smoke/rootavd-commit.txt
+
+      - name: Build the gateway Magisk module
+        run: |
+          mkdir -p artifacts/magisk-avd-smoke
+          SKIP_INSTALL=1 ./build.sh
+          sha256sum gateway-magisk.zip | tee artifacts/magisk-avd-smoke/gateway-magisk.sha256
+
+      - name: Patch a disposable API 34 AVD and verify Magisk modules
+        env:
+          ROOTAVD_DIR: ${{ runner.temp }}/rootAVD
+        run: |
+          python3 scripts/magisk-avd-smoke.py \
+            --artifact-dir artifacts/magisk-avd-smoke \
+            --rootavd-dir "$ROOTAVD_DIR" \
+            --android-home "$ANDROID_HOME" \
+            --avd-home "$ANDROID_AVD_HOME" \
+            --gateway-zip gateway-magisk.zip
+
+      - name: Upload Magisk and module lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gsm2sip-magisk-avd-smoke
+          path: |
+            artifacts/magisk-avd-smoke/**
+            gateway-magisk.zip
+          if-no-files-found: warn
+          retention-days: 14

@@ -176,8 +176,17 @@ class Smoke:
                     if node is not None and self.node_is_on_screen(node):
                         return root
             width, height = self.last_image_size or (900, 1800)
-            self.shell("input", "swipe", str(width // 2), str(max(100, height - 260)),
-                       str(width // 2), str(max(100, height // 3)), "350",
+            later_field = {"pairing_server": "pairing_device_name",
+                           "etControlUrl": "etControlDeviceName"}.get(resource_id)
+            later_node = self.find_node(root, later_field) if later_field else None
+            if later_node is not None and self.node_is_on_screen(later_node):
+                # The URL is above the focused device-name field. A downward
+                # finger gesture reveals earlier content in a ScrollView.
+                start_y, end_y = height // 3, (height * 2) // 3
+            else:
+                start_y, end_y = max(100, height - 260), max(100, height // 3)
+            self.shell("input", "swipe", str(width // 2), str(start_y),
+                       str(width // 2), str(end_y), "350",
                        check=True, label=f"scroll_to_{resource_id}_{attempt}")
             self.wait(1)
             root = self.capture(f"scroll_{resource_id}_{attempt}")
@@ -377,14 +386,17 @@ class Smoke:
                     else "gateway Control server pairing form reports Not paired")
         code_id = "pairing_code" if self.args.scenario == "host" else "etControlPairingCode"
         code_node = self.find_node(root, code_id)
+        code_hint = "一次性配对码" if self.args.scenario == "host" else "Paste code from server CLI"
         if code_node is None:
             self.record("pairing_code_untouched", "blocked", "pairing code field is not exposed in the current UI hierarchy")
-        elif code_node.attrib.get("text", "").strip():
+        elif (code_node.attrib.get("password", "false") != "true" or
+              code_node.attrib.get("text", "").strip() not in ("", code_hint)):
             self.record("pairing_code_untouched", "fail", "pairing code field was unexpectedly non-empty; it was left untouched")
         else:
             self.record("pairing_code_untouched", "pass", "pairing code is empty and was never focused or changed")
         self.input_text(root, server_id, SYNTHETIC_SERVER)
         root = self.capture("server_entered")
+        server_at_entry = self.field_text(root, server_id)
         visible, _ = self._ime_visible()
         if visible:
             self.shell("input", "keyevent", "KEYCODE_BACK", label="hide_ime_before_name_field")
@@ -392,11 +404,12 @@ class Smoke:
             root = self.capture("server_entered_ime_hidden")
         self.input_text(root, name_id, SYNTHETIC_DEVICE)
         root = self.capture("synthetic_fields_and_ime")
-        if self.field_text(root, server_id) == SYNTHETIC_SERVER and self.field_text(root, name_id) == SYNTHETIC_DEVICE:
-            self.record("synthetic_input", "pass", "synthetic URL and device name are visible in their fields")
+        name_at_entry = self.field_text(root, name_id)
+        if server_at_entry == SYNTHETIC_SERVER and name_at_entry == SYNTHETIC_DEVICE:
+            self.record("synthetic_input", "pass", "synthetic URL was read back after entry and device name after entry")
         else:
             self.record("synthetic_input", "fail",
-                        f"server={self.field_text(root, server_id)!r}, name={self.field_text(root, name_id)!r}")
+                        f"server_after_entry={server_at_entry!r}, name_after_entry={name_at_entry!r}")
         self._assert_keyboard("ime_visible_before_rotation")
         self._assert_fields("input_before_rotation")
 
@@ -489,7 +502,7 @@ class Smoke:
     @staticmethod
     def extract_current_state(state_dump: str) -> str:
         lines = [line.strip() for line in state_dump.splitlines()
-                 if re.search(r"current\s+state|currentstate|base\s+state|override\s+state",
+                 if re.search(r"\bm(?:Committed|Base|Override)State\s*=",
                               line, re.IGNORECASE)]
         return " | ".join(lines)
 

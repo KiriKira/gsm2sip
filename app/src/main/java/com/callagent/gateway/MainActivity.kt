@@ -50,6 +50,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.R as AppCompatR
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.Insets
 import com.callagent.gateway.service.CallLogEntry
 import com.callagent.gateway.service.CallLogStore
 import com.callagent.gateway.data.CredentialStore
@@ -363,13 +364,18 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         findViewById<View>(R.id.rootWindow).let { root ->
             ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
-                val safeArea = insets.getInsets(
-                    WindowInsetsCompat.Type.systemBars() or
-                        WindowInsetsCompat.Type.displayCutout() or
-                        WindowInsetsCompat.Type.ime()
-                )
+                val handledInsets = WindowInsetsCompat.Type.systemBars() or
+                    WindowInsetsCompat.Type.displayCutout() or
+                    WindowInsetsCompat.Type.ime()
+                val safeArea = insets.getInsets(handledInsets)
                 view.setPadding(safeArea.left, safeArea.top, safeArea.right, safeArea.bottom)
-                insets
+
+                // The root owns these insets. Passing them on lets Material's
+                // BottomNavigationView apply the IME inset a second time,
+                // stretching the bar to fill the keyboard height.
+                WindowInsetsCompat.Builder(insets)
+                    .setInsets(handledInsets, Insets.NONE)
+                    .build()
             }
             ViewCompat.requestApplyInsets(root)
         }

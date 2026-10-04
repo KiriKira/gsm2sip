@@ -60,7 +60,7 @@ class Smoke:
         self.results.append(item)
         print(f"[{status.upper()}] {name}: {detail}", flush=True)
 
-    def command(self, args: list[str], *, binary: bool = False, timeout: int = ADB_TIMEOUT_SECONDS,
+    def command(self, args: list[str], *, binary: bool = False, timeout: float = ADB_TIMEOUT_SECONDS,
                 check: bool = False, label: str | None = None) -> subprocess.CompletedProcess[Any]:
         self.sequence += 1
         command = [self.adb, "-s", self.serial, *args]
@@ -94,18 +94,80 @@ class Smoke:
         time.sleep(seconds)
 
     def capture(self, name: str) -> ET.Element:
-        dump = self.command(["shell", "uiautomator", "dump", "/sdcard/ui-smoke-window.xml"],
-                            timeout=ADB_TIMEOUT_SECONDS, label=f"uiautomator_{name}")
-        if dump.returncode != 0:
-            raise RuntimeError(f"uiautomator dump failed: {dump.stderr.decode(errors='replace')}")
-        xml = self.command(["exec-out", "cat", "/sdcard/ui-smoke-window.xml"],
-                           timeout=ADB_TIMEOUT_SECONDS, label=f"hierarchy_{name}")
-        raw = str(xml.stdout)
-        (self.artifacts / f"{safe_name(name)}.xml").write_text(raw, encoding="utf-8")
-        try:
-            root = ET.fromstring(raw)
-        except ET.ParseError as exc:
-            raise RuntimeError(f"uiautomator returned invalid XML for {name}: {exc}") from exc
+        device_xml = "/sdcard/ui-smoke-window.xml"
+        attempts = 4
+        retry_deadline = time.monotonic() + 12.0
+        last_error = "no fresh hierarchy was produced"
+        attempts_made = 0
+        root: ET.Element | None = None
+        for attempt in range(1, attempts + 1):
+            remaining = retry_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            adb_timeout = min(ADB_TIMEOUT_SECONDS, remaining)
+            # Remove the previous file before every dump so an unsuccessful
+            # attempt can never make a stale hierarchy look current.
+            clear = self.command(["shell", "rm", "-f", device_xml], timeout=adb_timeout,
+                                 label=f"clear_hierarchy_{name}_attempt_{attempt}")
+            if clear.returncode != 0:
+                raise RuntimeError(
+                    f"could not clear stale UI hierarchy before attempt {attempt}: "
+                    f"{clear.stderr.decode(errors='replace')}"
+                )
+            remaining = retry_deadline - time.monotonic()
+            if remaining <= 0:
+                last_error = "retry time budget expired before UIAutomator dump"
+                break
+            adb_timeout = min(ADB_TIMEOUT_SECONDS, remaining)
+            dump = self.command(["shell", "uiautomator", "dump", device_xml],
+                                timeout=adb_timeout,
+                                label=f"uiautomator_{name}_attempt_{attempt}")
+            attempts_made = attempt
+            dump_text = f"{dump.stdout}\n{dump.stderr}".lower()
+            null_root = "null root node returned by uitestautomationbridge" in dump_text
+            attempt_xml = self.artifacts / f"{safe_name(name)}_attempt_{attempt}.xml"
+            if null_root:
+                attempt_xml.write_text("", encoding="utf-8")
+                last_error = "uiautomator reported a temporary null root node"
+            elif dump.returncode != 0:
+                raise RuntimeError(
+                    f"uiautomator dump failed on attempt {attempt}: "
+                    f"{dump.stderr.decode(errors='replace')}"
+                )
+            else:
+                remaining = retry_deadline - time.monotonic()
+                if remaining <= 0:
+                    last_error = "retry time budget expired before hierarchy readback"
+                    break
+                adb_timeout = min(ADB_TIMEOUT_SECONDS, remaining)
+                xml = self.command(["exec-out", "cat", device_xml], timeout=adb_timeout,
+                                   label=f"hierarchy_{name}_attempt_{attempt}")
+                raw = str(xml.stdout)
+                attempt_xml.write_text(raw, encoding="utf-8")
+                readback_text = f"{raw}\n{xml.stderr}".lower()
+                missing_xml = "no such file" in readback_text or "not found" in readback_text
+                if xml.returncode != 0 and not missing_xml:
+                    raise RuntimeError(
+                        f"uiautomator hierarchy read failed on attempt {attempt}: "
+                        f"{xml.stderr.decode(errors='replace')}"
+                    )
+                try:
+                    root = ET.fromstring(raw)
+                except ET.ParseError as exc:
+                    last_error = f"hierarchy readback was missing or invalid XML: {exc}"
+                else:
+                    (self.artifacts / f"{safe_name(name)}.xml").write_text(raw, encoding="utf-8")
+                    break
+
+            if root is None and attempt < attempts:
+                remaining = retry_deadline - time.monotonic()
+                if remaining > 0:
+                    self.wait(min(2.0, remaining))
+        if root is None:
+            raise RuntimeError(
+                f"uiautomator hierarchy for {name} remained unavailable after "
+                f"{attempts_made} attempt(s) / 12-second retry budget: {last_error}"
+            )
         image = self.command(["exec-out", "screencap", "-p"], binary=True,
                              label=f"screencap_{name}")
         if image.returncode != 0 or not isinstance(image.stdout, bytes) or not image.stdout.startswith(b"\x89PNG"):

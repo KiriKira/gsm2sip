@@ -1075,8 +1075,15 @@ class Smoke:
                     for node in root.iter("node")))
 
     def choose_smsbr_fixture_in_documents_ui(self, root: ET.Element, filename: str, *, stage: str) -> ET.Element:
+        def exact_file_text(tree: ET.Element) -> ET.Element | None:
+            # The filename also appears inside a "Preview the file ..." content
+            # description. Match the actual filename text so we never tap the
+            # preview affordance by accident.
+            return next((node for node in self.nodes(tree)
+                         if node.attrib.get("text", "").strip() == filename), None)
+
         root = self.wait_for_app_tree(self.is_documents_ui_tree, f"{stage}_documents_ui")
-        file_node = self.find_text_containing(root, filename)
+        file_node = exact_file_text(root)
         if file_node is None or not self.node_has_positive_visible_bounds(file_node):
             root_buttons: list[ET.Element] = []
             for node in self.nodes(root):
@@ -1113,12 +1120,34 @@ class Smoke:
                 raise RuntimeError("DocumentsUI location drawer did not expose the Downloads folder")
             self.tap_node(downloads, f"{stage}_open_downloads")
             self.wait(1)
-            root = self.wait_for_app_tree(lambda tree: self.find_text_containing(tree, filename) is not None,
+            root = self.wait_for_app_tree(lambda tree: exact_file_text(tree) is not None,
                                           f"{stage}_download_fixture")
-            file_node = self.find_text_containing(root, filename)
+            file_node = exact_file_text(root)
         if file_node is None or not self.node_has_positive_visible_bounds(file_node):
             raise RuntimeError(f"Synthetic XML file is not visible in DocumentsUI: {filename}")
-        self.tap_node(file_node, f"{stage}_select_fixture")
+        if file_node.attrib.get("clickable") == "true":
+            selection_node = file_node
+        else:
+            file_bounds = self.parse_bounds(file_node.attrib.get("bounds", ""))
+            cards = []
+            if file_bounds is not None:
+                for node in self.nodes(root):
+                    if (node.attrib.get("clickable") != "true" or
+                            not node.attrib.get("resource-id", "").endswith("/item_root") or
+                            not self.node_has_positive_visible_bounds(node)):
+                        continue
+                    card_bounds = self.parse_bounds(node.attrib.get("bounds", ""))
+                    if (card_bounds is not None and
+                            card_bounds[0] <= file_bounds[0] and card_bounds[1] <= file_bounds[1] and
+                            card_bounds[2] >= file_bounds[2] and card_bounds[3] >= file_bounds[3]):
+                        area = (card_bounds[2] - card_bounds[0]) * (card_bounds[3] - card_bounds[1])
+                        cards.append((area, node))
+            if not cards:
+                raise RuntimeError(f"DocumentsUI did not expose a clickable file card for exact filename: {filename}")
+            selection_node = min(cards, key=lambda candidate: candidate[0])[1]
+        if not self.node_has_positive_visible_bounds(selection_node):
+            raise RuntimeError(f"DocumentsUI file selection target has no positive visible bounds: {filename}")
+        self.tap_node(selection_node, f"{stage}_select_fixture")
         return self.wait_for_app_tree(lambda tree: self.find_text_node(tree, "导入预览") is not None,
                                       f"{stage}_import_preview")
 

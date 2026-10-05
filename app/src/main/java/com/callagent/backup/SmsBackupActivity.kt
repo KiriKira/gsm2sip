@@ -5,6 +5,7 @@ import android.content.DialogInterface
 import android.graphics.Rect
 import android.os.Bundle
 import android.text.InputType
+import android.text.method.PasswordTransformationMethod
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -416,8 +417,10 @@ abstract class SmsBackupActivity : AppCompatActivity() {
 
     private fun passwordInput(hint: String) = TextInputEditText(this).apply {
         this.hint = hint
-        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         isSingleLine = true
+        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        // setSingleLine can install a plain-text transformation. Keep masking last.
+        transformationMethod = PasswordTransformationMethod.getInstance()
         isSaveEnabled = false
         setSaveFromParentEnabled(false)
         importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO

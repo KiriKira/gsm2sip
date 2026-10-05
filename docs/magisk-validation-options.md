@@ -1,6 +1,18 @@
 # Magisk 模块验证环境调研
 
-## 实测结果（2026-10-04）
+## 最新实测结果（2026-10-05）
+
+[GitHub Actions run 37247032002](https://github.com/KiriKira/gsm2sip/actions/runs/37247032002) 对提交 `88fbadff2b59b28f95e7e6b27fd171381b34dcd7` 完成了 40/40 项检查。环境为远端 KVM、API 34 非 Play Store `google_apis` x86_64，使用下文固定的 rootAVD 和官方 Magisk v30.7。
+
+实际安装了探针模块及项目 `sip-gsm-gateway` 模块，并验证 systemless 挂载、APK/priv-app allowlist、root-owned `0700` 配置目录和项目 service hook。探针的 `post-fs-data` 与 `service` 标记在两个不同的实际 kernel boot ID 上匹配；不是手工调用钩子来制造通过记录。
+
+本次 `gsm2sipctl accounts 0` 经真实 Magisk `su` 启动 UID 1000 的只读 broker，返回退出码 0、`broker.status=ok`、`broker.query_completed=true`、`broker.count=1`，只留存数量，不记录账户标识。这条账户来自 Emulator 的模拟电话框架，不能当成实体 SIM 验收。`voice.call_acceptance=not_tested`，音频权限探测仍为 `unknown`；本次未拨号、未采集麦克风、未验收蜂窝 HAL/PCM 或双向 SIP 媒体。
+
+KVM 验证发现并修复了独立 `app_process` 的两个问题：synthetic system `ApplicationInfo.uid` 默认值不能用于进程身份判断；Android 11+ 必须先执行普通 App 启动所用的进程内 mainline 初始化，才能正常取得 Telephony 服务管理器。Android 8–10 继续使用旧查询路径；缺少框架能力时仍明确 unavailable，不伪造空账户列表。源码依据见 AOSP [ActivityThread 启动](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android14-release/core/java/android/app/ActivityThread.java#8145)、[mainline 初始化](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android14-release/core/java/android/app/ActivityThread.java#8186)和 [Telephony subscription 服务查找](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android14-release/telephony/java/android/telephony/TelephonyManager.java#16341)。
+
+API 34 的 KVM AVD 已能验证本项目 Magisk 软件路径，因此无需为这项验证切换 Waydroid 或其他镜像。实际旧手机的双 SIM、基带及音频路由仍须真机检查。
+
+## 首次模块生命周期通过记录（2026-10-04）
 
 [GitHub Actions run 37220218785](https://github.com/KiriKira/gsm2sip/actions/runs/37220218785) 在 KVM 上通过了真实 Magisk 模块生命周期验证。可从 [magisk-avd-smoke.yml](../.github/workflows/magisk-avd-smoke.yml) 重新运行 `workflow_dispatch`。该 run 对应提交 `cedfec6a862ea944c988f53ffba05ef38decac61`，40 项检查全部通过。
 

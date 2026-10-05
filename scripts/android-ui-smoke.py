@@ -234,11 +234,15 @@ class Smoke:
         bounds = self.parse_bounds(node.attrib.get("bounds", ""))
         if bounds is None:
             return False
+        left, top, right, bottom = bounds
+        if right <= left or bottom <= top:
+            return False
         if self.last_image_size is None:
             return True
         width, height = self.last_image_size
-        left, top, right, bottom = bounds
-        return left < width and right > 0 and top < height and bottom > 0
+        if width <= 0 or height <= 0:
+            return False
+        return max(0, left) < min(width, right) and max(0, top) < min(height, bottom)
 
     def ensure_node_visible(self, root: ET.Element, resource_id: str) -> ET.Element:
         for attempt in range(5):

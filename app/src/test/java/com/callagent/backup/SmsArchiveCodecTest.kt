@@ -11,6 +11,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.CancellationException
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
@@ -88,6 +89,31 @@ class SmsArchiveCodecTest {
         assertTrue(xml.contains("<smses count=\"1\""))
         assertEquals(1, Regex("<sms\\b").findAll(xml).count())
         assertEquals(record, readAll(ByteArrayInputStream(output.toByteArray()), null).single())
+    }
+
+    @Test
+    fun xmlCallbackFailuresPreserveCauseAndStopFurtherCallbacks() {
+        val xml = """<smses count="2"><sms address="+12025550123" date="1" type="1" body="one"/><sms address="+12025550123" date="2" type="1" body="two"/></smses>"""
+            .toByteArray(Charsets.UTF_8)
+        val failures = listOf(
+            CancellationException("cancel XML import"),
+            IllegalStateException("stop XML import"),
+        )
+
+        for (failure in failures) {
+            var callbacks = 0
+            var thrown: Throwable? = null
+            try {
+                SmsArchiveCodec.read(ByteArrayInputStream(xml), null) {
+                    callbacks++
+                    throw failure
+                }
+            } catch (error: Throwable) {
+                thrown = error
+            }
+            assertSame(failure, thrown)
+            assertEquals(1, callbacks)
+        }
     }
 
     @Test

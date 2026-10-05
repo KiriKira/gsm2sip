@@ -572,6 +572,8 @@ object SmsArchiveCodec {
                 }
                 event = parser.next()
             }
+        } catch (error: CallbackFailure) {
+            throw error
         } catch (error: SmsArchiveException) {
             throw error
         } catch (error: XmlPullParserException) {

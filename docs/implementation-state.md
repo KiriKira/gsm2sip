@@ -48,11 +48,15 @@ RFC 4733 桥接目前是接收 RTP 事件后向 Telecom 发送 DTMF。完整通�
 两端现采用 [Material 3 Expressive 与后台运行设置](android-ui-and-background.md)。
 WSS 唤醒、HTTPS 补齐、用户停止/开机恢复与主机后台短信通知已落代码；
 主机已实现 PJSIP IP-change 与会话更新策略，完整跨网续话仍需互通验收；
-FCM、ICE/TURN、背压和留存管理尚待实施。旧机隔离事件/未知任务不会删除或
-重发，需后续管理界面和保留策略。当前 debug APK 和本地 Docker Compose
+FCM、ICE/TURN、完整背压和隔离任务管理尚待实施。旧机隔离事件/未知任务不会删除或
+重发，需后续管理界面。短信独立归档已提供可选本机保留开关。当前 debug APK 和本地 Docker Compose
 均待真机验收，也没有部署公网生产服务。
 
-完整缺口和网络场景见 [弱网恢复审查](https://github.com/KiriKira/gsm2sip-server/blob/codex/control-plane-foundation/docs/network-and-feature-status.md)。
+完整缺口和网络场景见 [弱网恢复审查](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/network-and-feature-status.md)。
+
+## 短信备份与导入归档
+
+提供两端通用的密码加密备份、JSON 和 SMS Backup & Restore XML。导入先完整验证和预览，确认后以事务合并独立只读归档；重复导入不增加相同记录，取消、密码错误、损坏和冲突回滚。导入不会写系统短信、生成发送任务或恢复凭据、ACK。网关本机保留默认关闭，开启后在队列正文清除前保存历史副本；不能恢复旧版本已清除的正文。参见 [使用与兼容边界](sms-backup.md) 和 [KVM 截图及验证结果](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/ui-verification/README.md)。
 
 ## 本次短信恢复与凭据隔离
 

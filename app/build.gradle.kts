@@ -3,6 +3,14 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val releaseVersionCode = providers.environmentVariable("GSM_RELEASE_VERSION_CODE").orNull?.let {
+    requireNotNull(it.toIntOrNull()) { "GSM_RELEASE_VERSION_CODE must be an integer" }
+} ?: 430
+require(releaseVersionCode in 1..2_100_000_000) {
+    "GSM_RELEASE_VERSION_CODE must be in Android's supported range 1..2100000000"
+}
+val releaseVersionName = providers.environmentVariable("GSM_RELEASE_VERSION_NAME").orNull ?: "1.4.0-dev"
+
 android {
     namespace = "com.callagent.gateway"
     compileSdk = 35
@@ -11,8 +19,8 @@ android {
         applicationId = "com.callagent.gateway"
         minSdk = 26
         targetSdk = 34
-        versionCode = 430
-        versionName = "1.4.0-dev"
+        versionCode = releaseVersionCode
+        versionName = releaseVersionName
     }
 
     // Release identity is supplied outside the repository and persists across upgrades.

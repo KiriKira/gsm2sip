@@ -1196,6 +1196,15 @@ class Smoke:
     def wait_for_import_completion(self, name: str, expected_status: str) -> ET.Element:
         root = self.wait_for_app_tree(
             lambda tree: any(node.attrib.get("package", "") == self.package for node in self.nodes(tree)) and
+            not self.is_documents_ui_tree(tree),
+            f"{name}_app",
+        )
+        # The operation result sits near the top, above the import controls.
+        # Reveal that region before waiting for its exact completion status.
+        root = self.ensure_text_visible(root, "短信备份与归档", stage=f"{name}_result_region",
+                                        direction_hint="earlier")
+        root = self.wait_for_app_tree(
+            lambda tree: any(node.attrib.get("package", "") == self.package for node in self.nodes(tree)) and
             self.find_text_node(tree, expected_status) is not None and
             self.find_text_node(tree, "导入预览") is None and
             self.find_text_node(tree, "确认导入") is None,

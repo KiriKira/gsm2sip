@@ -1,5 +1,7 @@
 # 双 SIM 远程网关（开发中）
 
+[自动构建与 Release、固定签名配置](docs/releases.md)：`main` 推送发布预览版，版本标签发布正式版；首次发布前运行签名 Secrets 配置脚本。
+
 目标：旧 Android 保留两张 SIM（语音适配可使用 root/Magisk），未 root Android 主机通过自建服务器收发短信、接打电话。
 已实现短信基础、可选系统库补扫与刷新响应恢复，并继续补齐三端 SIP/ARI/Telecom 通话链路；目标手机的真实短信、数字音频与通话仍需验收。
 

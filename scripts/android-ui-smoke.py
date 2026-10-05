@@ -1148,14 +1148,47 @@ class Smoke:
         if not self.node_has_positive_visible_bounds(selection_node):
             raise RuntimeError(f"DocumentsUI file selection target has no positive visible bounds: {filename}")
         self.tap_node(selection_node, f"{stage}_select_fixture")
-        return self.wait_for_app_tree(lambda tree: self.find_text_node(tree, "导入预览") is not None,
-                                      f"{stage}_import_preview")
+        return self.wait_for_app_tree(
+            lambda tree: any(node.attrib.get("package", "") == self.package for node in self.nodes(tree)) and
+            not self.is_documents_ui_tree(tree),
+            f"{stage}_app_returned_from_picker",
+        )
+
+    def visible_sms_import_error(self, root: ET.Element) -> str | None:
+        error_prefixes = (
+            "无法读取备份文件", "无法打开所选备份文件", "Malformed SMS XML",
+            "Expected an SMS 'smses' XML root", "Unexpected content after SMS XML root",
+            "Unsupported XML entry", "Nested XML elements are not allowed",
+            "Unexpected text in SMS XML", "Custom XML entities are not allowed",
+            "DTD declarations are not allowed in SMS XML", "SMS XML document is incomplete",
+            "SMS XML count does not match", "SMS XML entry is missing",
+            "Unsupported SMS XML type", "Invalid SMS XML record", "Invalid XML integer",
+            "Invalid XML timestamp", "Invalid XML count or type",
+        )
+        messages = []
+        for node in self.nodes(root):
+            if node.attrib.get("package", "") != self.package or "TextView" not in node.attrib.get("class", ""):
+                continue
+            message = self.node_value(node).strip()
+            if message and any(message.startswith(prefix) for prefix in error_prefixes) and message not in messages:
+                messages.append(message)
+        return " | ".join(messages) if messages else None
 
     def open_smsbr_import_preview(self, root: ET.Element, filename: str, *, stage: str) -> ET.Element:
         root = self.tap_text(root, "选择备份文件并预览", stage=f"{stage}_open_picker")
         root = self.choose_smsbr_fixture_in_documents_ui(root, filename, stage=stage)
         for label in ("导入预览", "记录 2 条", "来源：sms-backup-restore+xml 2 条", "确认导入", "取消导入"):
-            root = self.ensure_text_visible(root, label, stage=f"{stage}_{safe_name(label)}")
+            try:
+                root = self.ensure_text_visible(root, label, stage=f"{stage}_{safe_name(label)}")
+            except RuntimeError as failure:
+                if label == "导入预览":
+                    diagnostic = self.capture(f"{stage}_import_preview_diagnostic")
+                    error = self.visible_sms_import_error(diagnostic)
+                    if error:
+                        raise RuntimeError(f"DocumentsUI returned to the app with an SMS archive read error: {error}") from failure
+                    if any(node.attrib.get("package", "") == self.package for node in self.nodes(diagnostic)):
+                        raise RuntimeError(f"App returned from DocumentsUI but import preview remained unavailable: {failure}") from failure
+                raise
         screenshot = "backup-import-preview" if stage == "backup_import_first" else "backup-import-repeat-preview"
         return self.capture(screenshot)
 

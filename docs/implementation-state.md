@@ -47,7 +47,8 @@ RFC 4733 桥接目前是接收 RTP 事件后向 Telecom 发送 DTMF。完整通�
 
 两端现采用 [Material 3 Expressive 与后台运行设置](android-ui-and-background.md)。
 WSS 唤醒、HTTPS 补齐、用户停止/开机恢复与主机后台短信通知已落代码；
-FCM、完整切网媒体重协商、背压和留存管理尚待实施。旧机隔离事件/未知任务不会删除或
+主机已实现 PJSIP IP-change 与会话更新策略，完整跨网续话仍需互通验收；
+FCM、ICE/TURN、背压和留存管理尚待实施。旧机隔离事件/未知任务不会删除或
 重发，需后续管理界面和保留策略。当前 debug APK 和本地 Docker Compose
 均待真机验收，也没有部署公网生产服务。
 

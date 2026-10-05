@@ -20,7 +20,7 @@ WSS `/v1/ws` 只接收 `sync_required` 提示，不承载短信正文、执行�
 
 普通前台服务不能消除 Doze 网络限制；电池豁免有助于无 GMS 的 WSS 路线，但网络故障、系统/厂商策略仍可能延迟。系统设置中的强行停止会阻止正常后台启动，需要用户重新打开并明确开启。已停止的服务不会靠短信广播或开机广播绕过用户选择。
 
-**当前实现是短信/状态后台同步，尚未实现主机 SIP SDK、完整 Asterisk 呼叫路由、Core-Telecom、CallStyle 通话通知及锁屏接听。** 不把 WSS 连通或进程常驻当作来电验收完成。后续实际通话使用对应 Telecom/phoneCall 与麦克风权限；不使用空闲 microphone/phoneCall FGS 保活，也不开机录音。
+主机 PJSUA2、self-managed Telecom、CallStyle 通知、通话前台服务与服务端 Asterisk ARI 编排已落代码；实现状态见[三端实施状态](implementation-state.md)。原生 endpoint 的模拟器探针使用 null audio，尚未证明真实双 SIM 通话、媒体往返或锁屏接听。实际通话使用对应 Telecom/phoneCall 与麦克风权限；不使用空闲 microphone/phoneCall FGS 保活，也不开机录音。WSS 连通或进程常驻不能作为来电验收依据。
 
 当前无 GMS 路线不依赖 Firebase。GMS 设备可后续增加 FCM 高优先级呼入唤醒，校验时效并通过 HTTPS 查询呼叫状态；FCM 的注册、推送凭据和呼叫流程尚未实现。两台真机仍需测试熄屏、Doze、重启、Wi-Fi/移动网络切换、通知拒绝、用户停止以及两卡短信；本机测试不能证明真实锁屏来电及时性。
 

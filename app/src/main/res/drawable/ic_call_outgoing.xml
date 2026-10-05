@@ -6,6 +6,6 @@
     android:viewportHeight="24">
     <!-- Material "call_made" arrow -->
     <path
-        android:fillColor="#2563EB"
+        android:fillColor="?attr/colorPrimary"
         android:pathData="M9,5v2h6.59L4,18.59 5.41,20 17,8.41V15h2V5z" />
 </vector>

@@ -1,0 +1,6 @@
+id=magisk-validation-smoke
+name=Magisk Validation Smoke
+version=1.0
+versionCode=1
+author=workspace
+description=No-op boot hooks and systemless mount validation

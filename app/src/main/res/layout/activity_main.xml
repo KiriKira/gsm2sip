@@ -1,8 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/rootWindow"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@color/background">
+    android:background="?attr/colorSurface">
 
     <!-- ═══ Main tabbed layout ═══ -->
     <LinearLayout
@@ -41,16 +43,18 @@
                         android:text="GSM2SIP"
                         android:textSize="20sp"
                         android:textStyle="bold"
-                        android:textColor="@color/text_primary" />
+                        android:textColor="?attr/colorOnSurface" />
 
                     <TextView
                         android:id="@+id/tvHomeStatusPill"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="● Offline"
+                        android:minHeight="48dp"
+                        android:gravity="center"
+                        android:text="● SIP 未注册"
                         android:textSize="12sp"
                         android:textStyle="bold"
-                        android:textColor="@color/text_secondary"
+                        android:textColor="?attr/colorOnSurfaceVariant"
                         android:background="@drawable/input_bg"
                         android:paddingHorizontal="10dp"
                         android:paddingVertical="5dp"
@@ -92,8 +96,8 @@
 
                     <ImageButton
                         android:id="@+id/btnHomeMenu"
-                        android:layout_width="42dp"
-                        android:layout_height="42dp"
+                        android:layout_width="48dp"
+                        android:layout_height="48dp"
                         android:src="@drawable/ic_gear"
                         android:background="@drawable/input_bg"
                         android:contentDescription="Menu" />
@@ -112,11 +116,13 @@
                         android:id="@+id/tvNetMobile"
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
+                        android:minHeight="48dp"
+                        android:gravity="center_vertical"
                         android:layout_weight="1"
                         android:text="—"
                         android:textSize="12sp"
                         android:fontFamily="monospace"
-                        android:textColor="@color/text_secondary"
+                        android:textColor="?attr/colorOnSurfaceVariant"
                         android:background="@drawable/input_bg"
                         android:padding="8dp"
                         android:layout_marginEnd="4dp"
@@ -127,17 +133,38 @@
                         android:id="@+id/tvNetWifi"
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
+                        android:minHeight="48dp"
+                        android:gravity="center_vertical"
                         android:layout_weight="1"
                         android:text="—"
                         android:textSize="12sp"
                         android:fontFamily="monospace"
-                        android:textColor="@color/text_secondary"
+                        android:textColor="?attr/colorOnSurfaceVariant"
                         android:background="@drawable/input_bg"
                         android:padding="8dp"
                         android:layout_marginStart="4dp"
                         android:singleLine="true"
                         android:ellipsize="end" />
                 </LinearLayout>
+
+                <TextView
+                    android:id="@+id/tvSimSummary"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="SIM 状态：读取中"
+                    android:textColor="?attr/colorOnSurfaceVariant"
+                    android:textSize="13sp"
+                    android:paddingTop="8dp"
+                    android:paddingBottom="2dp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnHomeSmsBackup"
+                    style="?attr/materialButtonOutlinedStyle"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:text="短信备份与归档"
+                    android:textAllCaps="false"
+                    android:layout_marginTop="8dp" />
 
                 <!-- Filter chips -->
                 <LinearLayout
@@ -146,45 +173,45 @@
                     android:orientation="horizontal"
                     android:paddingTop="16dp">
 
-                    <Button
+                    <com.google.android.material.button.MaterialButton
                         android:id="@+id/btnFilterAll"
                         android:layout_width="wrap_content"
-                        android:layout_height="42dp"
-                        android:text="All"
+                        android:layout_height="48dp"
+                        android:text="全部"
                         android:textSize="13sp"
                         android:textAllCaps="false"
-                        android:textColor="#052E16"
-                        android:backgroundTint="#34D399"
+                        android:textColor="?attr/colorOnPrimaryContainer"
+                        app:backgroundTint="?attr/colorPrimaryContainer"
                         android:minWidth="76dp"
                         android:minHeight="0dp"
                         android:insetTop="0dp"
                         android:insetBottom="0dp"
                         android:layout_marginEnd="8dp" />
 
-                    <Button
+                    <com.google.android.material.button.MaterialButton
                         android:id="@+id/btnFilterIncoming"
                         android:layout_width="wrap_content"
-                        android:layout_height="42dp"
-                        android:text="Incoming"
+                        android:layout_height="48dp"
+                        android:text="呼入"
                         android:textSize="13sp"
                         android:textAllCaps="false"
-                        android:textColor="@color/text_primary"
-                        android:backgroundTint="@color/btn_secondary"
+                        android:textColor="?attr/colorOnSurface"
+                        app:backgroundTint="?attr/colorSurfaceContainerHigh"
                         android:minWidth="76dp"
                         android:minHeight="0dp"
                         android:insetTop="0dp"
                         android:insetBottom="0dp"
                         android:layout_marginEnd="8dp" />
 
-                    <Button
+                    <com.google.android.material.button.MaterialButton
                         android:id="@+id/btnFilterOutgoing"
                         android:layout_width="wrap_content"
-                        android:layout_height="42dp"
-                        android:text="Outgoing"
+                        android:layout_height="48dp"
+                        android:text="呼出"
                         android:textSize="13sp"
                         android:textAllCaps="false"
-                        android:textColor="@color/text_primary"
-                        android:backgroundTint="@color/btn_secondary"
+                        android:textColor="?attr/colorOnSurface"
+                        app:backgroundTint="?attr/colorSurfaceContainerHigh"
                         android:minWidth="76dp"
                         android:minHeight="0dp"
                         android:insetTop="0dp"
@@ -205,15 +232,159 @@
                         android:layout_height="wrap_content"
                         android:orientation="vertical">
 
+                    <com.google.android.material.card.MaterialCardView
+                        android:id="@+id/backgroundStatusCard"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginBottom="12dp"
+                        app:cardBackgroundColor="?attr/colorSurfaceContainerLow"
+                        app:cardElevation="0dp"
+                        app:strokeColor="?attr/colorOutlineVariant"
+                        app:strokeWidth="1dp">
+
+                        <LinearLayout
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:orientation="vertical"
+                            android:padding="16dp">
+
+                            <TextView
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:text="后台运行"
+                                android:textAppearance="?attr/textAppearanceTitleLarge"
+                                android:textColor="?attr/colorOnSurface" />
+
+                            <com.google.android.material.materialswitch.MaterialSwitch
+                                android:id="@+id/swBackgroundEnabled"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:minHeight="48dp"
+                                android:text="启用后台运行"
+                                android:textColor="?attr/colorOnSurface"
+                                android:layout_marginTop="4dp" />
+
+                            <TextView
+                                android:id="@+id/tvBackgroundState"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:text="后台进程：读取中"
+                                android:textColor="?attr/colorOnSurface"
+                                android:textSize="14sp"
+                                android:paddingTop="8dp" />
+
+                            <TextView
+                                android:id="@+id/tvBackgroundConnection"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:text="连接状态：读取中"
+                                android:textColor="?attr/colorOnSurfaceVariant"
+                                android:textSize="13sp"
+                                android:paddingTop="5dp" />
+
+                            <TextView
+                                android:id="@+id/tvBackgroundNotification"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:text="通知：读取中"
+                                android:textColor="?attr/colorOnSurfaceVariant"
+                                android:textSize="13sp"
+                                android:paddingTop="5dp" />
+
+                            <TextView
+                                android:id="@+id/tvBackgroundBattery"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:text="电池优化：读取中"
+                                android:textColor="?attr/colorOnSurfaceVariant"
+                                android:textSize="13sp"
+                                android:paddingTop="5dp" />
+
+                            <TextView
+                                android:id="@+id/tvBackgroundIssue"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:textColor="?attr/colorError"
+                                android:textSize="13sp"
+                                android:paddingTop="7dp"
+                                android:visibility="gone" />
+
+                            <TextView
+                                android:id="@+id/tvVoiceStartExplanation"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:text="手动启动会先检查本机权限和音频采集能力；这不代表完整通话链路已验证。"
+                                android:textColor="?attr/colorOnSurfaceVariant"
+                                android:textSize="12sp"
+                                android:paddingTop="8dp" />
+
+                            <com.google.android.material.button.MaterialButton
+                                android:id="@+id/btnStartGatewayDiagnostics"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:minHeight="48dp"
+                                android:text="运行诊断并启动 SIP 语音"
+                                android:layout_marginTop="4dp"
+                                app:backgroundTint="?attr/colorPrimaryContainer"
+                                android:textColor="?attr/colorOnPrimaryContainer" />
+
+                            <TextView
+                                android:id="@+id/tvPermissionNotice"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:text="短信模式只需 SIM 与短信权限，无需 root、录音或默认电话角色。语音权限在显式运行 SIP 诊断时申请。"
+                                android:textColor="?attr/colorOnSurfaceVariant"
+                                android:textSize="12sp"
+                                android:paddingTop="8dp" />
+
+                            <com.google.android.material.button.MaterialButton
+                                android:id="@+id/btnRequestNotificationPermission"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:minHeight="48dp"
+                                android:text="请求通知权限"
+                                android:visibility="gone"
+                                android:layout_marginTop="10dp"
+                                app:backgroundTint="?attr/colorSecondaryContainer"
+                                android:textColor="?attr/colorOnSecondaryContainer" />
+
+                            <com.google.android.material.button.MaterialButton
+                                android:id="@+id/btnOpenNotificationSettings"
+                                style="?attr/materialButtonOutlinedStyle"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:minHeight="48dp"
+                                android:text="通知设置"
+                                android:layout_marginTop="4dp" />
+
+                            <com.google.android.material.button.MaterialButton
+                                android:id="@+id/btnOpenBatterySettings"
+                                style="?attr/materialButtonOutlinedStyle"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:minHeight="48dp"
+                                android:text="电池优化设置"
+                                android:layout_marginTop="4dp" />
+                        </LinearLayout>
+                    </com.google.android.material.card.MaterialCardView>
+
                     <!-- Active call -->
-                    <LinearLayout
+                    <com.google.android.material.card.MaterialCardView
                         android:id="@+id/homeCallCard"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
+                        android:layout_marginBottom="12dp"
+                        android:visibility="gone"
+                        app:cardBackgroundColor="?attr/colorSurfaceContainerLow"
+                        app:cardElevation="0dp"
+                        app:strokeColor="?attr/colorOutlineVariant"
+                        app:strokeWidth="1dp">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
                         android:orientation="vertical"
-                        android:background="@drawable/card_bg"
-                        android:padding="16dp"
-                        android:visibility="gone">
+                        android:padding="16dp">
 
                         <LinearLayout
                             android:layout_width="match_parent"
@@ -225,10 +396,10 @@
                                 android:layout_width="0dp"
                                 android:layout_height="wrap_content"
                                 android:layout_weight="1"
-                                android:text="● ACTIVE CALL"
+                                android:text="● 正在通话"
                                 android:textSize="13sp"
                                 android:textStyle="bold"
-                                android:textColor="#34D399" />
+                                android:textColor="?attr/colorPrimary" />
 
                             <TextView
                                 android:id="@+id/tvHomeCallDirection"
@@ -236,7 +407,7 @@
                                 android:layout_height="wrap_content"
                                 android:text="GSM → SIP"
                                 android:textSize="11sp"
-                                android:textColor="@color/text_secondary"
+                                android:textColor="?attr/colorOnSurfaceVariant"
                                 android:background="@drawable/input_bg"
                                 android:paddingHorizontal="10dp"
                                 android:paddingVertical="4dp" />
@@ -250,7 +421,7 @@
                             android:textSize="44sp"
                             android:textStyle="bold"
                             android:fontFamily="monospace"
-                            android:textColor="@color/text_primary"
+                            android:textColor="?attr/colorOnSurface"
                             android:paddingTop="10dp" />
 
                         <TextView
@@ -260,7 +431,7 @@
                             android:text="—"
                             android:textSize="20sp"
                             android:textStyle="bold"
-                            android:textColor="@color/text_primary"
+                            android:textColor="?attr/colorOnSurface"
                             android:paddingTop="6dp" />
 
                         <TextView
@@ -269,7 +440,7 @@
                             android:layout_height="wrap_content"
                             android:text=""
                             android:textSize="14sp"
-                            android:textColor="#60A5FA"
+                            android:textColor="?attr/colorTertiary"
                             android:paddingTop="2dp" />
 
                         <LinearLayout
@@ -281,15 +452,15 @@
                             <!-- Icon over label: the label carries the state
                                  (Mute/Unmute, Snoop/Stop), the icon makes the
                                  three actions distinguishable at a glance. -->
-                            <Button
+                            <com.google.android.material.button.MaterialButton
                                 android:id="@+id/btnHomeMute"
                                 android:layout_width="0dp"
                                 android:layout_height="62dp"
                                 android:layout_weight="1"
-                                android:text="Mute"
+                                android:text="静音"
                                 android:textSize="11sp"
-                                android:textColor="@color/text_primary"
-                                android:backgroundTint="@color/btn_secondary"
+                                android:textColor="?attr/colorOnSurface"
+                                app:backgroundTint="?attr/colorSurfaceContainerHigh"
                                 android:drawableTop="@drawable/ic_fa_volume_xmark"
                                 android:drawablePadding="2dp"
                                 android:paddingTop="8dp"
@@ -299,15 +470,15 @@
                                 android:insetTop="0dp"
                                 android:insetBottom="0dp" />
 
-                            <Button
+                            <com.google.android.material.button.MaterialButton
                                 android:id="@+id/btnHomeSnoop"
                                 android:layout_width="0dp"
                                 android:layout_height="62dp"
                                 android:layout_weight="1"
-                                android:text="Snoop"
+                                android:text="监听"
                                 android:textSize="11sp"
-                                android:textColor="@color/text_primary"
-                                android:backgroundTint="@color/btn_secondary"
+                                android:textColor="?attr/colorOnSurface"
+                                app:backgroundTint="?attr/colorSurfaceContainerHigh"
                                 android:drawableTop="@drawable/ic_fa_headphones"
                                 android:drawablePadding="2dp"
                                 android:paddingTop="8dp"
@@ -317,15 +488,15 @@
                                 android:insetTop="0dp"
                                 android:insetBottom="0dp" />
 
-                            <Button
+                            <com.google.android.material.button.MaterialButton
                                 android:id="@+id/btnHomeEnd"
                                 android:layout_width="0dp"
                                 android:layout_height="62dp"
                                 android:layout_weight="1"
-                                android:text="End"
+                                android:text="挂断"
                                 android:textSize="11sp"
-                                android:textColor="#FFFFFF"
-                                android:backgroundTint="#B91C1C"
+                                android:textColor="?attr/colorOnError"
+                                app:backgroundTint="?attr/colorError"
                                 android:drawableTop="@drawable/ic_fa_phone_slash"
                                 android:drawablePadding="2dp"
                                 android:paddingTop="8dp"
@@ -336,6 +507,7 @@
                                 android:insetBottom="0dp" />
                         </LinearLayout>
                     </LinearLayout>
+                    </com.google.android.material.card.MaterialCardView>
 
                     <!-- Recent calls -->
                     <LinearLayout
@@ -349,18 +521,18 @@
                             android:layout_width="0dp"
                             android:layout_height="wrap_content"
                             android:layout_weight="1"
-                            android:text="RECENT CALLS"
+                            android:text="最近通话与短信"
                             android:textSize="12sp"
                             android:textStyle="bold"
-                            android:textColor="@color/text_secondary" />
+                            android:textColor="?attr/colorOnSurfaceVariant" />
 
                         <TextView
                             android:id="@+id/tvHomeTrafficDay"
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="Today"
+                            android:text="今天"
                             android:textSize="12sp"
-                            android:textColor="@color/text_secondary" />
+                            android:textColor="?attr/colorOnSurfaceVariant" />
                     </LinearLayout>
 
                     <LinearLayout
@@ -373,9 +545,9 @@
                         android:id="@+id/tvHomeTrafficEmpty"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:text="No calls yet"
+                        android:text="暂无通话或短信"
                         android:textSize="13sp"
-                        android:textColor="@color/text_hint"
+                        android:textColor="?attr/colorOutline"
                         android:paddingVertical="14dp" />
                     </LinearLayout>
                 </ScrollView>
@@ -399,8 +571,8 @@
 
                     <ImageButton
                         android:id="@+id/btnConfigBack"
-                        android:layout_width="42dp"
-                        android:layout_height="42dp"
+                        android:layout_width="48dp"
+                        android:layout_height="48dp"
                         android:src="@drawable/ic_arrow_back"
                         android:scaleType="centerInside"
                         android:background="@drawable/input_bg"
@@ -413,7 +585,7 @@
                         android:text="Settings"
                         android:textSize="20sp"
                         android:textStyle="bold"
-                        android:textColor="@color/text_primary"
+                        android:textColor="?attr/colorOnSurface"
                         android:paddingStart="12dp" />
 
                     <!-- Live event log — SIP registration, calls, GSM and
@@ -421,8 +593,8 @@
                          it inline; it has its own screen now, reached here. -->
                     <ImageButton
                         android:id="@+id/btnCfgLogs"
-                        android:layout_width="42dp"
-                        android:layout_height="42dp"
+                        android:layout_width="48dp"
+                        android:layout_height="48dp"
                         android:src="@drawable/ic_logs"
                         android:scaleType="centerInside"
                         android:background="@drawable/input_bg"
@@ -430,6 +602,7 @@
                 </LinearLayout>
 
                 <ScrollView
+                    android:id="@+id/svConfig"
                     android:layout_width="match_parent"
                     android:layout_height="0dp"
                     android:layout_weight="1"
@@ -457,7 +630,7 @@
                             android:text="gsm2sip"
                             android:textSize="16sp"
                             android:textStyle="bold"
-                            android:textColor="@color/text_primary"
+                            android:textColor="?attr/colorOnSurface"
                             android:paddingTop="8dp" />
 
                         <TextView
@@ -466,25 +639,166 @@
                             android:layout_height="wrap_content"
                             android:gravity="center_horizontal"
                             android:textSize="12sp"
-                            android:textColor="@color/text_label"
+                            android:textColor="?attr/colorOnSurfaceVariant"
                             android:paddingTop="2dp"
                             android:paddingBottom="14dp" />
 
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnCfgSmsBackup"
+                            style="?attr/materialButtonOutlinedStyle"
+                            android:layout_width="match_parent"
+                            android:layout_height="48dp"
+                            android:text="短信备份与归档"
+                            android:textAllCaps="false"
+                            android:layout_marginBottom="12dp" />
+
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="Control server pairing"
+                            android:textColor="?attr/colorOnSurface"
+                            android:textStyle="bold"
+                            android:textSize="16sp"
+                            android:paddingTop="8dp" />
+
+                        <TextView style="@style/CfgLabel" android:text="HTTPS control server" />
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/etControlUrl"
+                            style="@style/CfgField"
+                            android:hint="https://your-server.example"
+                            android:inputType="textUri" />
+
+                        <TextView style="@style/CfgLabel" android:text="Device name" />
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/etControlDeviceName"
+                            style="@style/CfgField"
+                            android:hint="Old Android phone"
+                            android:inputType="textCapWords" />
+
+                        <TextView style="@style/CfgLabel" android:text="One-time pairing code" />
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/etControlPairingCode"
+                            style="@style/CfgField"
+                            android:hint="Paste code from server CLI"
+                            android:saveEnabled="false"
+                            android:inputType="textPassword" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnControlPair"
+                            android:layout_width="match_parent"
+                            android:layout_height="48dp"
+                            android:text="PAIR GATEWAY"
+                            android:textStyle="bold"
+                            android:textColor="?attr/colorOnPrimaryContainer"
+                            app:backgroundTint="?attr/colorPrimaryContainer"
+                            android:layout_marginTop="8dp"
+                            android:minHeight="0dp"
+                            android:insetTop="0dp"
+                            android:insetBottom="0dp" />
+
+                        <TextView
+                            android:id="@+id/tvControlStatus"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="Not paired"
+                            android:textColor="?attr/colorOnSurfaceVariant"
+                            android:textSize="12sp"
+                            android:paddingTop="8dp" />
+
+                        <TextView
+                            android:id="@+id/tvSmsRecoveryStatus"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="短信补收：未启用。允许读取系统收件箱后，可补回应用未运行时已存入系统的短信。"
+                            android:textColor="?attr/colorOnSurfaceVariant"
+                            android:textSize="13sp"
+                            android:paddingTop="12dp" />
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnConfigureServerSip"
+                            style="?attr/materialButtonOutlinedStyle"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="从服务器配置 SIP 语音"
+                            android:textAllCaps="false" />
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnEnableSmsRecovery"
+                            style="?attr/materialButtonOutlinedStyle"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="启用短信补收"
+                            android:textAllCaps="false" />
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnScanSmsRecovery"
+                            style="?attr/materialButtonOutlinedStyle"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="立即补收并同步"
+                            android:textAllCaps="false" />
+
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="SIM UUIDs come from the server. Each SIM is activated only after you confirm its local slot here. ICCID and IMSI values are never uploaded."
+                            android:textSize="12sp"
+                            android:textColor="?attr/colorOutline"
+                            android:paddingTop="6dp" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnSimPropose"
+                            android:layout_width="match_parent"
+                            android:layout_height="48dp"
+                            android:text="SYNC SIM LIST"
+                            android:textAllCaps="false"
+                            android:textColor="?attr/colorOnSurface"
+                            app:backgroundTint="?attr/colorSurfaceContainerHigh"
+                            android:layout_marginTop="10dp"
+                            android:minHeight="0dp"
+                            android:insetTop="0dp"
+                            android:insetBottom="0dp" />
+
+                        <LinearLayout
+                            android:id="@+id/llSimBindings"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:orientation="vertical"
+                            android:paddingTop="4dp" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnSimConfirm"
+                            android:layout_width="match_parent"
+                            android:layout_height="48dp"
+                            android:text="CONFIRM SELECTED SIMS"
+                            android:textAllCaps="false"
+                            android:textColor="?attr/colorOnSurface"
+                            app:backgroundTint="?attr/colorSurfaceContainerHigh"
+                            android:layout_marginTop="4dp"
+                            android:visibility="gone"
+                            android:minHeight="0dp"
+                            android:insetTop="0dp"
+                            android:insetBottom="0dp" />
+
+                        <View
+                            android:layout_width="match_parent"
+                            android:layout_height="1dp"
+                            android:background="?attr/colorSurfaceContainerHigh"
+                            android:layout_marginTop="18dp"
+                            android:layout_marginBottom="10dp" />
+
                         <TextView style="@style/CfgLabel" android:text="SIP Server" />
-                        <EditText android:id="@+id/etCfgServer" style="@style/CfgField"
-                            android:hint="callagent.pro" android:inputType="textUri" />
+                        <com.google.android.material.textfield.TextInputEditText android:id="@+id/etCfgServer" style="@style/CfgField"
+                            android:hint="SIP host (optional)" android:inputType="textUri" />
 
                         <TextView style="@style/CfgLabel" android:text="SIP Port" />
-                        <EditText android:id="@+id/etCfgPort" style="@style/CfgField"
-                            android:hint="5060" android:inputType="number" />
+                        <com.google.android.material.textfield.TextInputEditText android:id="@+id/etCfgPort" style="@style/CfgField"
+                            android:hint="5061" android:inputType="number" />
 
                         <TextView style="@style/CfgLabel" android:text="SIP Username" />
-                        <EditText android:id="@+id/etCfgUser" style="@style/CfgField"
+                        <com.google.android.material.textfield.TextInputEditText android:id="@+id/etCfgUser" style="@style/CfgField"
                             android:hint="extension" android:inputType="text" />
 
                         <TextView style="@style/CfgLabel" android:text="SIP Password" />
-                        <EditText android:id="@+id/etCfgPass" style="@style/CfgField"
-                            android:hint="password" android:inputType="textPassword" />
+                        <com.google.android.material.textfield.TextInputEditText android:id="@+id/etCfgPass" style="@style/CfgField"
+                            android:hint="password" android:saveEnabled="false" android:inputType="textPassword" />
 
                         <TextView style="@style/CfgLabel" android:text="Own Number (SIM)" />
                         <!-- One field per active SIM, built at runtime: the
@@ -501,7 +815,7 @@
                             android:layout_height="wrap_content"
                             android:text="Sent as the SIP destination so the server can map the call to an assistant. Without it the gateway addresses its own extension and the call loops back."
                             android:textSize="12sp"
-                            android:textColor="@color/text_hint"
+                            android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
 
                         <TextView style="@style/CfgLabel" android:text="Audio Codec" />
@@ -513,29 +827,29 @@
                             android:orientation="vertical"
                             android:layout_marginTop="4dp">
 
-                            <RadioButton
+                            <com.google.android.material.radiobutton.MaterialRadioButton
                                 android:id="@+id/rbCodecG722"
                                 android:layout_width="match_parent"
                                 android:layout_height="wrap_content"
+                                android:minHeight="48dp"
                                 android:text="G.722 only — wideband 16 kHz (recommended)"
-                                android:buttonTint="@color/accent"
-                                android:textColor="@color/text_label" />
+                                    android:textColor="?attr/colorOnSurfaceVariant" />
 
-                            <RadioButton
+                            <com.google.android.material.radiobutton.MaterialRadioButton
                                 android:id="@+id/rbCodecBoth"
                                 android:layout_width="match_parent"
                                 android:layout_height="wrap_content"
+                                android:minHeight="48dp"
                                 android:text="G.722 preferred, G.711 allowed"
-                                android:buttonTint="@color/accent"
-                                android:textColor="@color/text_label" />
+                                    android:textColor="?attr/colorOnSurfaceVariant" />
 
-                            <RadioButton
+                            <com.google.android.material.radiobutton.MaterialRadioButton
                                 android:id="@+id/rbCodecG711"
                                 android:layout_width="match_parent"
                                 android:layout_height="wrap_content"
+                                android:minHeight="48dp"
                                 android:text="G.711 only — narrowband 8 kHz"
-                                android:buttonTint="@color/accent"
-                                android:textColor="@color/text_label" />
+                                    android:textColor="?attr/colorOnSurfaceVariant" />
                         </RadioGroup>
 
                         <TextView
@@ -543,7 +857,7 @@
                             android:layout_height="wrap_content"
                             android:text="Offering G.711 alongside G.722 usually means the server picks G.711 and every call is narrowband, which is why G.722 alone is the default."
                             android:textSize="12sp"
-                            android:textColor="@color/text_hint"
+                            android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
 
                         <TextView style="@style/CfgLabel" android:text="Agent Volume" />
@@ -562,8 +876,8 @@
                                 android:layout_height="wrap_content"
                                 android:max="6"
                                 android:progress="3"
-                                android:progressTint="@color/accent"
-                                android:thumbTint="@color/accent" />
+                                android:progressTint="?attr/colorPrimaryContainer"
+                                android:thumbTint="?attr/colorPrimaryContainer" />
 
                             <TextView
                                 android:id="@+id/tvCfgAgentVolume"
@@ -572,7 +886,7 @@
                                 android:gravity="end"
                                 android:text="0"
                                 android:textStyle="bold"
-                                android:textColor="@color/text_label"
+                                android:textColor="?attr/colorOnSurfaceVariant"
                                 android:paddingStart="8dp" />
                         </LinearLayout>
 
@@ -581,25 +895,25 @@
                             android:layout_height="wrap_content"
                             android:text="How loud the agent is to the GSM caller. 0 is what the detected device asks for; each step roughly a third louder or quieter. Raise it if callers say the agent is faint, lower it if the line distorts."
                             android:textSize="12sp"
-                            android:textColor="@color/text_hint"
+                            android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
 
-                        <CheckBox
+                        <com.google.android.material.materialswitch.MaterialSwitch
                             android:id="@+id/cbCfgAutoconnect"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="Autoconnect on startup"
-                            android:buttonTint="@color/accent"
-                            android:textColor="@color/text_label"
+                            android:minHeight="48dp"
+                            android:text="开机恢复后台控制同步（SIP 语音需手动启动）"
+                            android:textColor="?attr/colorOnSurfaceVariant"
                             android:layout_marginTop="16dp" />
 
-                        <CheckBox
+                        <com.google.android.material.materialswitch.MaterialSwitch
                             android:id="@+id/cbCfgUseStun"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
+                            android:minHeight="48dp"
                             android:text="Use STUN"
-                            android:buttonTint="@color/accent"
-                            android:textColor="@color/text_label"
+                            android:textColor="?attr/colorOnSurfaceVariant"
                             android:layout_marginTop="8dp" />
 
                         <TextView
@@ -607,16 +921,16 @@
                             android:layout_height="wrap_content"
                             android:text="Finds the public IP so SIP and RTP survive NAT. Turn off for a SIP server on the local network."
                             android:textSize="12sp"
-                            android:textColor="@color/text_hint"
+                            android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
 
-                        <CheckBox
+                        <com.google.android.material.materialswitch.MaterialSwitch
                             android:id="@+id/cbCfgTls"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
+                            android:minHeight="48dp"
                             android:text="Enable TLS"
-                            android:buttonTint="@color/accent"
-                            android:textColor="@color/text_label"
+                            android:textColor="?attr/colorOnSurfaceVariant"
                             android:layout_marginTop="8dp" />
 
                         <TextView
@@ -624,16 +938,16 @@
                             android:layout_height="wrap_content"
                             android:text="Encrypts SIP signalling — registration, calls and SMS text. Call audio (RTP) is not encrypted either way. The server must offer TLS, usually on port 5061."
                             android:textSize="12sp"
-                            android:textColor="@color/text_hint"
+                            android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
 
-                        <CheckBox
+                        <com.google.android.material.materialswitch.MaterialSwitch
                             android:id="@+id/cbCfgSrtp"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
+                            android:minHeight="48dp"
                             android:text="Encrypt audio (SRTP)"
-                            android:buttonTint="@color/accent"
-                            android:textColor="@color/text_label"
+                            android:textColor="?attr/colorOnSurfaceVariant"
                             android:layout_marginTop="8dp" />
 
                         <TextView
@@ -642,16 +956,16 @@
                             android:layout_height="wrap_content"
                             android:text="SDES-keyed SRTP (RFC 3711). Requires TLS: the keys travel inside the SIP signalling, so over plain UDP they would be readable by anyone on the path."
                             android:textSize="12sp"
-                            android:textColor="@color/text_hint"
+                            android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
 
-                        <CheckBox
+                        <com.google.android.material.materialswitch.MaterialSwitch
                             android:id="@+id/cbCfgTranslit"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
+                            android:minHeight="48dp"
                             android:text="ASCII-only outgoing SMS"
-                            android:buttonTint="@color/accent"
-                            android:textColor="@color/text_label"
+                            android:textColor="?attr/colorOnSurfaceVariant"
                             android:layout_marginTop="8dp" />
 
                         <TextView
@@ -659,20 +973,20 @@
                             android:layout_height="wrap_content"
                             android:text="Rewrites accents before sending: für becomes fuer. Turn on if umlauts arrive mangled. Cyrillic, Hebrew, Arabic and other non-Latin text is never rewritten — it is sent as-is."
                             android:textSize="12sp"
-                            android:textColor="@color/text_hint"
+                            android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
 
-                        <Button
+                        <com.google.android.material.button.MaterialButton
                             android:id="@+id/btnCfgClearRecents"
                             android:layout_width="wrap_content"
                             android:layout_gravity="center_horizontal"
-                            android:layout_height="40dp"
+                            android:layout_height="48dp"
                             android:text="CLEAR RECENTS"
                             android:textSize="12sp"
                             android:paddingStart="20dp"
                             android:paddingEnd="20dp"
-                            android:textColor="#F87171"
-                            android:backgroundTint="#374151"
+                            android:textColor="?attr/colorError"
+                            app:backgroundTint="?attr/colorSurfaceContainerHigh"
                             android:layout_marginTop="24dp"
                             android:layout_marginBottom="20dp"
                             android:minHeight="0dp"
@@ -680,14 +994,14 @@
                             android:insetTop="0dp"
                             android:insetBottom="0dp" />
 
-                        <Button
+                        <com.google.android.material.button.MaterialButton
                             android:id="@+id/btnCfgSave"
                             android:layout_width="match_parent"
                             android:layout_height="52dp"
                             android:text="SAVE"
                             android:textStyle="bold"
-                            android:textColor="@color/accent_on"
-                            android:backgroundTint="@color/accent"
+                            android:textColor="?attr/colorOnPrimaryContainer"
+                            app:backgroundTint="?attr/colorPrimaryContainer"
                             android:layout_marginTop="0dp"
                             android:minHeight="0dp"
                             android:insetTop="0dp"
@@ -702,7 +1016,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"
                 android:orientation="vertical"
-                android:background="@color/background"
+                android:background="?attr/colorSurface"
                 android:visibility="gone">
 
                 <LinearLayout
@@ -714,8 +1028,8 @@
 
                     <ImageButton
                         android:id="@+id/btnLogsBack"
-                        android:layout_width="42dp"
-                        android:layout_height="42dp"
+                        android:layout_width="48dp"
+                        android:layout_height="48dp"
                         android:src="@drawable/ic_arrow_back"
                         android:scaleType="centerInside"
                         android:background="@drawable/input_bg"
@@ -728,13 +1042,13 @@
                         android:text="Logs"
                         android:textSize="20sp"
                         android:textStyle="bold"
-                        android:textColor="@color/text_primary"
+                        android:textColor="?attr/colorOnSurface"
                         android:paddingStart="12dp" />
 
                     <ImageButton
                         android:id="@+id/btnLogsCopy"
-                        android:layout_width="42dp"
-                        android:layout_height="42dp"
+                        android:layout_width="48dp"
+                        android:layout_height="48dp"
                         android:src="@drawable/ic_copy"
                         android:scaleType="centerInside"
                         android:background="@drawable/input_bg"
@@ -743,8 +1057,8 @@
 
                     <ImageButton
                         android:id="@+id/btnLogsClear"
-                        android:layout_width="42dp"
-                        android:layout_height="42dp"
+                        android:layout_width="48dp"
+                        android:layout_height="48dp"
                         android:src="@drawable/ic_trash"
                         android:scaleType="centerInside"
                         android:background="@drawable/input_bg"
@@ -756,7 +1070,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="0dp"
                     android:layout_weight="1"
-                    android:background="@color/surface"
+                    android:background="?attr/colorSurfaceContainerLow"
                     android:padding="8dp"
                     android:layout_marginHorizontal="14dp"
                     android:layout_marginBottom="14dp">
@@ -765,7 +1079,7 @@
                         android:id="@+id/tvLog"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:textColor="@color/text_log"
+                        android:textColor="?attr/colorOnSurfaceVariant"
                         android:textSize="12sp"
                         android:fontFamily="monospace"
                         android:textIsSelectable="true"
@@ -776,7 +1090,13 @@
 
         </FrameLayout>
 
-<!-- Bottom tab bar removed: navigation is the header menu on the home view -->
+        <com.google.android.material.bottomnavigation.BottomNavigationView
+            android:id="@+id/bottomNavigation"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="?attr/colorSurfaceContainer"
+            app:labelVisibilityMode="labeled"
+            app:menu="@menu/main_navigation" />
     </LinearLayout>
 
     <!-- ═══ Full-screen in-call overlay (above everything, hidden by default) ═══ -->
@@ -785,7 +1105,7 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:orientation="vertical"
-        android:background="@color/background"
+        android:background="?attr/colorSurface"
         android:visibility="gone"
         android:gravity="center_horizontal">
 
@@ -798,16 +1118,16 @@
             android:id="@+id/tvInCallStatus"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Calling..."
+            android:text="呼叫中"
             android:textSize="16sp"
-            android:textColor="@color/text_secondary" />
+            android:textColor="?attr/colorOnSurfaceVariant" />
 
         <TextView
             android:id="@+id/tvInCallNumber"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:textSize="32sp"
-            android:textColor="@color/text_primary"
+            android:textColor="?attr/colorOnSurface"
             android:fontFamily="monospace"
             android:gravity="center"
             android:paddingVertical="16dp"
@@ -823,7 +1143,7 @@
             android:layout_height="wrap_content"
             android:text="00:00"
             android:textSize="48sp"
-            android:textColor="@color/text_primary"
+            android:textColor="?attr/colorOnSurface"
             android:fontFamily="monospace"
             android:paddingVertical="24dp"
             android:visibility="gone" />
@@ -835,32 +1155,32 @@
 
         <!-- Listen in on both sides through the speaker.  Does not touch the
              microphone, which stays muted for the whole call. -->
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnInCallMonitor"
             android:layout_width="match_parent"
             android:layout_height="56dp"
             android:layout_marginHorizontal="24dp"
             android:layout_marginBottom="12dp"
-            android:text="LISTEN IN"
+            android:text="开始监听"
             android:textSize="18sp"
             android:textStyle="bold"
-            android:textColor="#FFFFFF"
-            android:backgroundTint="#2563EB"
+            android:textColor="?attr/colorOnPrimary"
+            app:backgroundTint="?attr/colorPrimary"
             android:minHeight="0dp"
             android:insetTop="0dp"
             android:insetBottom="0dp" />
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnInCallEnd"
             android:layout_width="match_parent"
             android:layout_height="64dp"
             android:layout_marginHorizontal="24dp"
             android:layout_marginBottom="32dp"
-            android:text="END CALL"
+            android:text="结束通话"
             android:textSize="20sp"
             android:textStyle="bold"
-            android:textColor="#FFFFFF"
-            android:backgroundTint="#DC2626"
+            android:textColor="?attr/colorOnError"
+            app:backgroundTint="?attr/colorError"
             android:minHeight="0dp"
             android:insetTop="0dp"
             android:insetBottom="0dp" />

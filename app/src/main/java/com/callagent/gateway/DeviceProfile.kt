@@ -6,16 +6,15 @@ import android.os.SystemClock
 import android.util.Log
 
 /**
- * Device-specific audio profile.  Each supported device has different
- * mixer controls, volume calibration, and audio HAL behavior.
+ * Audio routing profile. Legacy device presets remain available only when
+ * explicitly selected in the root-managed local profile.
  *
  * The mixer commands are shell strings executed via RootShell in a
  * single `su` call.  Tinymix control names and default volumes are
  * entirely SoC/codec-specific.
  *
- * Auto-detection uses Build.HARDWARE and Build.BOARD.  Unknown devices
- * fall back to GenericProfile which skips mixer hacks and relies on
- * Android APIs only.
+ * The default profile is generic and discovers Android telephony audio
+ * routes at runtime. It never guesses an OEM profile from build properties.
  */
 data class DeviceProfile(
     val name: String,
@@ -46,17 +45,9 @@ data class DeviceProfile(
     val silenceLocalAudio: Boolean = false,
 
     /** Consecutive silent frames before a capture source is abandoned.
-     *
-     *  The default is deliberately impatient, which is right when the fallback
-     *  is a microphone that always works.  Where the digital source is the only
-     *  acceptable one, bailing out after half a second throws it away during
-     *  the ordinary gap before the far end starts talking.
-     *
-     *  25 frames was the old hard-coded value and is why in-call capture looked
-     *  impossible on SM6150 for a long time: the source was working, and was
-     *  being discarded during the pause before either party spoke.  The default
-     *  is now 100 (~2s), which is still prompt enough to fall back off a source
-     *  that is genuinely dead. */
+     *  The 100-frame default allows ordinary pauses before testing the next
+     *  digital source. Acoustic sources are appended only when the local
+     *  profile explicitly enables [allowMicFallback]. */
     val captureSilenceFrames: Int = 100,
 
     /** Voice sessions to mark ACTIVE with the audio HAL, as hex VSIDs.
@@ -171,14 +162,13 @@ data class DeviceProfile(
      *  than a call on a second-choice source. */
     val preferVoiceRecognition: Boolean = false,
 
-    /** Ask AudioRecord to capture from the telephony RX device.
-     *
-     *  The mirror of [playbackToTelephonyTx].  Without it, capture on a device
-     *  whose HAL refuses AudioSource.VOICE_CALL falls back to the microphone,
-     *  which records the room rather than the call — the far end is only heard
-     *  at all if the downlink happens to be audible on the speaker, and once
-     *  the downlink is muted there the agent hears nothing but background. */
+    /** Require the capture stream to route to the telephony RX device.
+     *  This route request is not proof that the source delivers call audio;
+     *  the capture loop still has to observe usable frames. */
     val captureFromTelephonyRx: Boolean = false,
+
+    /** Require AudioRecord to actually route to TYPE_TELEPHONY. */
+    val requireTelephonyRx: Boolean = false,
 
     /** Ask for the playback track to be routed to the telephony TX device.
      *
@@ -188,6 +178,18 @@ data class DeviceProfile(
      *  the track's preferred device asks the policy manager for that route
      *  explicitly, which is something only a privileged app can get away with. */
     val playbackToTelephonyTx: Boolean = false,
+
+    /** Fail the media session unless AudioTrack actually routes to TYPE_TELEPHONY. */
+    val requireTelephonyTx: Boolean = false,
+
+    /** Local-only permission to try acoustic microphone sources after digital ones. */
+    val allowMicFallback: Boolean = false,
+
+    /** The profile uses Android's generic audio routing and state handling. */
+    val useGenericRouting: Boolean = false,
+
+    /** Non-null when an installed local profile exists but could not be used. */
+    val configError: String? = null,
 
     /** Turn incall_music on before the AudioTrack is created, not after.
      *
@@ -384,41 +386,80 @@ data class DeviceProfile(
             return cmd.replace("tinymix", bin)
         }
 
-        /** Auto-detect the device and return the appropriate profile. */
+        private const val AUDIO_PROFILE_PATH = "/data/adb/gsm2sip/audio-profile.json"
+        private const val AUDIO_PROFILE_PRESENT = "__AUDIO_PROFILE_PRESENT__"
+        private const val AUDIO_PROFILE_ABSENT = "__AUDIO_PROFILE_ABSENT__"
+        private const val AUDIO_PROFILE_READ_LIMIT = AudioProfileConfigParser.MAX_BYTES + 1
+        private const val AUDIO_PROFILE_OUTPUT_LIMIT = AudioProfileConfigParser.MAX_BYTES + 256
+
+        /** Load an explicitly selected local profile, or use generic routing. */
         fun detect(): DeviceProfile {
-            val hw = Build.HARDWARE.lowercase()
-            val board = Build.BOARD.lowercase()
-            val model = Build.MODEL.lowercase()
-            Log.i(TAG, "Detecting device: hw=$hw board=$board model=${Build.MODEL} device=${Build.DEVICE}")
-
-            return when {
-                // Samsung Galaxy S4 Mini (MSM8930 / WCD9304)
-                board.contains("msm8930") || hw.contains("qcom") && model.contains("gt-i919") ->
-                    msm8930()
-
-                // Samsung Galaxy S10e Exynos (Exynos 9820)
-                board.contains("exynos9820") || hw.contains("exynos") && model.contains("sm-g970") ->
-                    exynos9820()
-
-                // Snapdragon 7-series (SM6150/SM7150) with WCD9375 codec —
-                // e.g. Poco X3 NFC.  Same incall_music path as MSM8930 but a
-                // different codec, so the WCD9304 control names do not apply.
-                board.contains("sm6150") || board.contains("sm7150") ->
-                    sm6150()
-
-                // Generic Qualcomm — try incall_music, skip WCD9304-specific controls
-                hw.contains("qcom") || hw.contains("qualcomm") ->
-                    genericQualcomm()
-
-                // Generic Samsung Exynos
-                hw.contains("exynos") || hw.contains("samsung") ->
-                    genericExynos()
-
-                // Unknown device — minimal mixer interaction
-                else -> generic()
-            }.also {
-                Log.i(TAG, "Selected profile: ${it.name}")
+            val command = "if [ -e '$AUDIO_PROFILE_PATH' ]; then " +
+                "printf '%s' '$AUDIO_PROFILE_PRESENT'; head -c $AUDIO_PROFILE_READ_LIMIT '$AUDIO_PROFILE_PATH'; " +
+                "else printf '%s' '$AUDIO_PROFILE_ABSENT'; fi"
+            val output = try {
+                RootShell.execForOutput(
+                    command,
+                    timeoutMs = 2500,
+                    maxOutputChars = AUDIO_PROFILE_OUTPUT_LIMIT,
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Local audio profile read failed: ${e.message}")
+                return generic().copy(configError = "Local audio profile read failed")
             }
+
+            if (output.startsWith(AUDIO_PROFILE_ABSENT)) {
+                return generic().also { Log.i(TAG, "Audio profile: missing; using safe generic defaults") }
+            }
+            if (!output.startsWith(AUDIO_PROFILE_PRESENT)) {
+                val reason = "Local audio profile read failed or exceeded the output limit"
+                Log.e(TAG, reason)
+                return generic().copy(configError = reason)
+            }
+
+            return try {
+                val parsed = AudioProfileConfigParser.parse(output.removePrefix(AUDIO_PROFILE_PRESENT))
+                profileFromConfig(parsed).also {
+                    Log.i(TAG, "Audio profile: selected=${it.name} generic=${it.useGenericRouting} " +
+                        "rxRequired=${it.requireTelephonyRx} txRequired=${it.requireTelephonyTx} " +
+                        "micFallback=${it.allowMicFallback}")
+                }
+            } catch (e: IllegalArgumentException) {
+                val reason = "Local audio profile rejected: ${e.message?.take(180) ?: "invalid configuration"}"
+                Log.e(TAG, reason)
+                generic().copy(configError = reason)
+            }
+        }
+
+        private fun profileFromConfig(config: AudioProfileConfig): DeviceProfile {
+            val base = when (config.preset) {
+                AudioProfileConfig.Preset.GENERIC -> generic()
+                AudioProfileConfig.Preset.LEGACY_MSM8930 -> msm8930()
+                AudioProfileConfig.Preset.LEGACY_EXYNOS9820 -> exynos9820()
+                AudioProfileConfig.Preset.LEGACY_SM6150 -> sm6150()
+                AudioProfileConfig.Preset.LEGACY_QUALCOMM -> genericQualcomm()
+                AudioProfileConfig.Preset.LEGACY_EXYNOS -> genericExynos()
+            }
+            val genericRouting = config.preset == AudioProfileConfig.Preset.GENERIC
+            val rxRequired = config.telephonyRxRequired ?: if (genericRouting) false else base.requireTelephonyRx
+            val requestTelephonyRx = base.captureFromTelephonyRx || rxRequired
+            val txRequired = config.telephonyTxRequired ?: (genericRouting || base.playbackToTelephonyTx)
+            val micFallback = config.allowMicFallback ?: false
+            return base.copy(
+                name = if (genericRouting) "Generic" else base.name,
+                captureGain = config.captureGain ?: base.captureGain,
+                captureSilenceFrames = config.captureSilenceFrames ?: base.captureSilenceFrames,
+                playbackGain = config.playbackGain ?: base.playbackGain,
+                playbackBufferMs = config.playbackBufferMs ?: base.playbackBufferMs,
+                preferVoiceRecognition = config.preferVoiceRecognition ?: base.preferVoiceRecognition,
+                captureFromTelephonyRx = requestTelephonyRx,
+                requireTelephonyRx = rxRequired,
+                playbackToTelephonyTx = txRequired,
+                requireTelephonyTx = txRequired,
+                allowMicFallback = micFallback,
+                requireSpeakerMode = if (genericRouting) micFallback else base.requireSpeakerMode,
+                useGenericRouting = genericRouting,
+            )
         }
 
         // ── Known device profiles ──
@@ -1022,9 +1063,14 @@ data class DeviceProfile(
             noiseGateThreshold = 300,
             echoGateThreshold = 300,
             doubleTalkRatio = 1.5f,
-            requireSpeakerMode = true,
-            incallMusicParam = "incall_music_enabled",
-            voiceDownlinkWorks = true,
+            requireSpeakerMode = false,
+            incallMusicParam = "",
+            voiceDownlinkWorks = false,
+            captureFromTelephonyRx = true,
+            requireTelephonyRx = false,
+            playbackToTelephonyTx = true,
+            requireTelephonyTx = true,
+            useGenericRouting = true,
             routeChangeDelayMs = 500,
             appopsPropagationMs = 300,
         )

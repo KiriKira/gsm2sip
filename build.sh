@@ -73,7 +73,7 @@ check_gradle_wrapper() {
         echo "Downloading Gradle wrapper..."
         mkdir -p "$SCRIPT_DIR/gradle/wrapper"
 
-        local GRADLE_VER="8.5"
+        local GRADLE_VER="8.9"
         local GRADLE_URL="https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip"
 
         curl -fsSL "$GRADLE_URL" -o /tmp/gradle-dist.zip
@@ -109,12 +109,12 @@ build_apk() {
 
     if [ "$BUILD_TYPE" = "release" ]; then
         ./gradlew assembleRelease --no-daemon
-        # Signed via the "shared" signingConfig, so the output is app-release.apk
-        # rather than app-release-unsigned.apk.  An unsigned APK is rejected by
-        # PackageManager with INSTALL_PARSE_FAILED_NO_CERTIFICATES and is
-        # useless in the priv-app module, which is what the old path produced.
         APK_PATH="app/build/outputs/apk/release/app-release.apk"
-        [ -f "$APK_PATH" ] || APK_PATH="app/build/outputs/apk/release/app-release-unsigned.apk"
+        if [ ! -f "$APK_PATH" ]; then
+            echo "ERROR: Release packaging requires GSM_RELEASE_STORE_FILE, GSM_RELEASE_STORE_PASSWORD, GSM_RELEASE_KEY_ALIAS and GSM_RELEASE_KEY_PASSWORD."
+            echo "Unsigned release APKs are for inspection only and cannot be packaged as a Magisk module."
+            exit 1
+        fi
     else
         ./gradlew assembleDebug --no-daemon
         APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
@@ -167,12 +167,14 @@ build_tinymix() {
     echo "=== Building tinymix (static, one per ABI) ==="
     echo ""
 
-    # Two builds, because the ALSA control ioctls encode the size of structs
+    # One build per supported Android ABI: ALSA ioctls encode the size of structs
     # that contain `long`: an arm64 binary talks a different ioctl ABI than an
     # armeabi-v7a one, and neither works on the other's kernel.  install.sh
     # picks the matching one at flash time.
-    build_tinymix_arch arm64 "ARM aarch64" "$SCRIPT_DIR/magisk/tinymix"
-    build_tinymix_arch arm   "ELF 32-bit.*ARM" "$SCRIPT_DIR/magisk/tinymix32"
+    build_tinymix_arch arm64 "ARM aarch64" "$SCRIPT_DIR/magisk/tinymix" || true
+    build_tinymix_arch arm   "ELF 32-bit.*ARM" "$SCRIPT_DIR/magisk/tinymix32" || true
+    build_tinymix_arch amd64 "ELF 64-bit.*x86-64" "$SCRIPT_DIR/magisk/tinymix-x86_64" || true
+    build_tinymix_arch 386   "ELF 32-bit.*Intel 80386" "$SCRIPT_DIR/magisk/tinymix-x86" || true
 }
 
 build_magisk() {
@@ -180,7 +182,7 @@ build_magisk() {
     echo "=== Building Magisk module ==="
     echo ""
 
-    # Build tinymix binary for ABOX mixer control (required on Samsung Exynos)
+    # Optional vendor mixer tooling; generic Android Rx/Tx routing needs no mixer writes.
     build_tinymix
 
     # Copy the APK into the Magisk module as a system priv-app.
@@ -190,10 +192,23 @@ build_magisk() {
     cp "$SCRIPT_DIR/gateway.apk" "$SCRIPT_DIR/magisk/system/priv-app/Gateway/Gateway.apk"
     echo "Included APK as priv-app in Magisk module"
 
+    if [ ! -f "$SCRIPT_DIR/magisk/bin/gsm2sipctl" ]; then
+        echo "ERROR: Missing Magisk runtime entry point."
+        exit 1
+    fi
+    chmod 755 "$SCRIPT_DIR/magisk/bin/gsm2sipctl"
+    bash -n "$SCRIPT_DIR/magisk/bin/gsm2sipctl"
+
     cd "$SCRIPT_DIR/magisk"
     rm -f "$SCRIPT_DIR/gateway-magisk.zip"
     zip -r "$SCRIPT_DIR/gateway-magisk.zip" . \
-        -x "*.DS_Store" -x "__MACOSX/*"
+        -x "*.DS_Store" -x "__MACOSX/*" \
+        -x "system/priv-app/PermissionController/*" \
+        -x "system/priv-app/GooglePermissionController/*" \
+        -x "system/product/priv-app/PermissionController/*" \
+        -x "system/product/priv-app/GooglePermissionController/*" \
+        -x "system/system_ext/priv-app/PermissionController/*" \
+        -x "system/system_ext/priv-app/GooglePermissionController/*"
     echo "Magisk module: $SCRIPT_DIR/gateway-magisk.zip"
     cd "$SCRIPT_DIR"
 }
@@ -255,12 +270,14 @@ echo "=== Build complete ==="
 echo "  APK:    $SCRIPT_DIR/gateway.apk"
 echo "  Magisk: $SCRIPT_DIR/gateway-magisk.zip"
 echo ""
-echo "Deploy to device:"
-echo "  1. adb push gateway-magisk.zip /sdcard/"
-echo "     Install via Magisk Manager -> Modules, then reboot"
-echo "     (APK is included in the module as a priv-app)"
-echo "  2. After reboot: open app, grant permissions, set as default phone app"
-echo "  3. Enter SIP credentials, tap START"
+echo "SMS-only installation (no root/Magisk required):"
+echo "  adb -s <serial> install -r gateway.apk"
+echo "  Open app, grant SIM/SMS permissions, pair HTTPS server and confirm each SIM."
+echo "  Enable background sync and notifications if required."
 echo ""
-echo "NOTE: Do NOT also 'adb install' — the Magisk module installs the APK"
-echo "      as a privileged system app with CAPTURE_AUDIO_OUTPUT permission."
+echo "Optional privileged voice installation:"
+echo "  Push gateway-magisk.zip and install via Magisk Manager, then reboot."
+echo "  The module includes the APK; avoid a second APK installation/signature conflict."
+echo "  Voice diagnostics request microphone/phone permissions and the default phone role."
+echo "  Root probe: su -c '/data/adb/modules/sip-gsm-gateway/bin/gsm2sipctl probe'"
+echo "  Calling requires configured server/host SIP and ARI plus validated cellular audio."

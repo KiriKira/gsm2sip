@@ -1,0 +1,14 @@
+{
+  "format": 1,
+  "shared_source_sha256": {
+    "main/java/com/callagent/backup/SmsArchiveCodec.kt": "aeda97042f64cbdd3d7f71ea079761aa735d5f22d1457abd7e4e6670df59dc1b",
+    "main/java/com/callagent/backup/SmsArchiveRecord.kt": "11e47cca9966b2a8e395003fc87040194dcd8638a2e9e7b02811fffd6f042466",
+    "main/java/com/callagent/backup/SmsArchiveStore.kt": "feb9784436e1dd86bd64fde9f5d6c7e5c090505d26400c1bdbe4c74694f52c79",
+    "main/java/com/callagent/backup/SmsBackupActivity.kt": "bfd7c40f7f6c1fbcdf9a40dac4c724ee780cf325158d56ffcac13eaee5ad057b",
+    "main/java/com/callagent/backup/SmsBackupViewModel.kt": "aeca03896d6d25fb79c6b9dfd95e99067c5645ad68c38c1747f413192595bf5b",
+    "test/java/com/callagent/backup/SmsArchiveCodecTest.kt": "586521aead6876def1118790b1e781d8dd0d2d4e4e50cc3622f4e245f0df739e",
+    "test/java/com/callagent/backup/SmsArchiveStoreTest.kt": "36bb5ea0beb4af31523b21da07926196c4fa078d64583c1837a0af7f5faa47e3",
+    "test/java/com/callagent/backup/SmsBackupActivityTest.kt": "d66b51f5f3ae9bee879a9189e80f98c06cf1ad2a7e40ddf4103aeb9714626ab3",
+    "test/java/com/callagent/backup/SmsBackupViewModelTest.kt": "d93bd7384421a9ecbd1ba8beb554094e95cb5a725a4e9c8fddb8fad04ab5b724"
+  }
+}

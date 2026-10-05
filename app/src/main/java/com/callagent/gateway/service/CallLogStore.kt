@@ -68,6 +68,10 @@ object CallLogStore {
     fun addEntry(context: Context, entry: CallLogEntry) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val arr = JSONArray(prefs.getString(KEY, "[]"))
+        if (entry.type == TYPE_SMS && entry.smsId.isNotEmpty() &&
+            (0 until arr.length()).any { arr.optJSONObject(it)?.optString("smsId") == entry.smsId }) {
+            return
+        }
         val obj = JSONObject().apply {
             put("dir", entry.direction)
             put("num", entry.number)
@@ -161,6 +165,27 @@ object CallLogStore {
             return true
         }
         return false
+    }
+
+    /** Remove message content and addresses after the HTTPS journal is durably
+     * acknowledged. Status and part count remain useful in recent activity. */
+    @Synchronized
+    fun redactSms(context: Context, smsId: String): Boolean {
+        if (smsId.isEmpty()) return false
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val arr = JSONArray(prefs.getString(KEY, "[]"))
+        var changed = false
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            if (obj.optString("smsId") != smsId) continue
+            obj.put("num", "").put("text", "").put("smsc", "")
+            changed = true
+        }
+        if (changed) {
+            check(prefs.edit().putString(KEY, arr.toString()).commit()) { "Could not persist SMS redaction" }
+            cachedEntries = null
+        }
+        return changed
     }
 
     data class Totals(

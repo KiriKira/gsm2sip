@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">gsm2sip</string>
-    <string name="activity_title">gsm2sip</string>
-    <string name="channel_name">gsm2sip Service</string>
-    <string name="channel_description">Keeps SIP registration active</string>
-    <string name="channel_name_quiet">gsm2sip Service (silent)</string>
-    <string name="channel_description_quiet">Keeps SIP registration active, without a status bar icon</string>
+    <string name="activity_title">gsm2sip 网关</string>
+    <string name="channel_name">gsm2sip 后台网关</string>
+    <string name="channel_description">显示用户启用的网关连接状态</string>
+    <string name="channel_name_quiet">gsm2sip 后台服务（静默）</string>
+    <string name="channel_description_quiet">后台运行时不显示状态栏图标</string>
     <string name="notification_title">gsm2sip</string>
-    <string name="notification_text_registered">Registered — Ready</string>
-    <string name="notification_text_unregistered">Connecting…</string>
-    <string name="notification_text_call">Call active</string>
+    <string name="notification_text_registered">已注册，待命</string>
+    <string name="notification_text_unregistered">正在连接…</string>
+    <string name="notification_text_call">通话进行中</string>
 </resources>

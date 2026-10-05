@@ -1,13 +1,15 @@
 # Build outputs
 *.apk
 gateway-magisk.zip
+magisk/tinymix-x86
+magisk/tinymix-x86_64
 magisk/system/priv-app/Gateway/
-!magisk/system/priv-app/PermissionController/
 local.properties
 .env.build
 
 # Gradle
 .gradle/
+.kotlin/
 build/
 app/build/
 
@@ -16,3 +18,12 @@ app/build/
 .idea/
 *.iml
 .vscode/
+
+# Local signing material
+*.keystore
+*.jks
+
+# Android runtime verification artifacts
+/artifacts/
+__pycache__/
+*.pyc

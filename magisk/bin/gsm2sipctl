@@ -1,0 +1,451 @@
+#!/system/bin/sh
+# Fixed, local Magisk control surface. No shell or command passthrough.
+
+MODULE_ID=sip-gsm-gateway
+ADB_ROOT=/data/adb
+MODULE_DIR="$ADB_ROOT/modules/$MODULE_ID"
+SYSTEM_BIN=/system/bin
+SYSTEM_XBIN=/system/xbin
+DATA_TMP=/data/local/tmp
+DATA_APP=/data/app
+VENDOR_BIN=/vendor/bin
+SYSTEM_PRIV_APP=/system/priv-app
+SYSTEM_EXT_PRIV_APP=/system_ext/priv-app
+PRODUCT_PRIV_APP=/product/priv-app
+
+PACKAGE=com.callagent.gateway
+BROKER_CLASS=com.callagent.gateway.root.RootTelephonyBroker
+MODULE_APK="$MODULE_DIR/system/priv-app/Gateway/Gateway.apk"
+AUDIO_PROFILE="$ADB_ROOT/gsm2sip/audio-profile.json"
+APP_PROCESS="$SYSTEM_BIN/app_process"
+ID_BIN="$SYSTEM_BIN/id"
+GETPROP_BIN="$SYSTEM_BIN/getprop"
+PM_BIN="$SYSTEM_BIN/pm"
+CMD_BIN="$SYSTEM_BIN/cmd"
+OUTPUT_CAPPER="$SYSTEM_BIN/head"
+
+usage() {
+    echo "usage: gsm2sipctl probe|status|accounts 0" >&2
+    exit 64
+}
+
+emit_error() {
+    echo "$1" >&2
+    exit "$2"
+}
+
+is_decimal() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+normalize_decimal() {
+    DECIMAL_VALUE=$1
+    while [ "${DECIMAL_VALUE#0}" != "$DECIMAL_VALUE" ]; do
+        DECIMAL_VALUE=${DECIMAL_VALUE#0}
+    done
+    [ -n "$DECIMAL_VALUE" ] || DECIMAL_VALUE=0
+}
+
+valid_sub_id() {
+    is_decimal "$1" || return 1
+    normalize_decimal "$1"
+    [ "${#DECIMAL_VALUE}" -le 10 ] || return 1
+    [ "$DECIMAL_VALUE" -le 2147483647 ] 2>/dev/null
+}
+
+check_root() {
+    [ -x "$ID_BIN" ] || return 1
+    ROOT_UID=$("$ID_BIN" -u 2>/dev/null) || return 1
+    [ "$ROOT_UID" = 0 ]
+}
+
+find_executable() {
+    for candidate in "$@"; do
+        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    printf '%s' none
+}
+
+permission_state() {
+    permission_name=$1
+    if [ ! -x "$PM_BIN" ]; then
+        printf unknown
+        return
+    fi
+    permission_result=$("$PM_BIN" check-permission "$permission_name" "$PACKAGE" 2>/dev/null)
+    case "$permission_result" in
+        granted) printf granted ;;
+        denied) printf denied ;;
+        *) printf unknown ;;
+    esac
+}
+
+boot_state() {
+    if [ ! -x "$GETPROP_BIN" ]; then
+        printf unknown
+        return
+    fi
+    boot_value=$("$GETPROP_BIN" sys.boot_completed 2>/dev/null)
+    case "$boot_value" in
+        1) printf true ;;
+        '') printf unknown ;;
+        *) printf false ;;
+    esac
+}
+
+module_state() {
+    MODULE_PRESENT=false
+    MODULE_DISABLED=false
+    MODULE_REMOVE_MARKER=false
+    if [ -d "$MODULE_DIR" ]; then MODULE_PRESENT=true; fi
+    if [ -e "$MODULE_DIR/disable" ]; then MODULE_DISABLED=true; fi
+    if [ -e "$MODULE_DIR/remove" ]; then MODULE_REMOVE_MARKER=true; fi
+
+    if [ "$MODULE_PRESENT" != true ]; then
+        MODULE_STATE=missing
+        MODULE_ENABLED=false
+    elif [ "$MODULE_REMOVE_MARKER" = true ]; then
+        MODULE_STATE=removed
+        MODULE_ENABLED=false
+    elif [ "$MODULE_DISABLED" = true ]; then
+        MODULE_STATE=disabled
+        MODULE_ENABLED=false
+    else
+        MODULE_STATE=active
+        MODULE_ENABLED=true
+    fi
+}
+
+module_version() {
+    MODULE_VERSION=unknown
+    [ -f "$MODULE_DIR/module.prop" ] || return
+    while IFS='=' read -r prop_key prop_value; do
+        if [ "$prop_key" = version ]; then
+            case "$prop_value" in
+                ''|*[!A-Za-z0-9._+-]*) MODULE_VERSION=unknown ;;
+                *)
+                    if [ "${#prop_value}" -le 64 ]; then MODULE_VERSION=$prop_value; fi
+                    ;;
+            esac
+            return
+        fi
+    done < "$MODULE_DIR/module.prop"
+}
+
+find_magisk() {
+    find_executable "$ADB_ROOT/magisk/magisk" /sbin/magisk /debug_ramdisk/magisk "$SYSTEM_BIN/magisk" "$SYSTEM_XBIN/magisk"
+}
+
+find_su() {
+    find_executable "$ADB_ROOT/magisk/su" /sbin/su /debug_ramdisk/su "$SYSTEM_BIN/su" "$SYSTEM_XBIN/su"
+}
+
+find_tinymix() {
+    find_executable "$DATA_TMP/tinymix" "$VENDOR_BIN/tinymix" "$SYSTEM_BIN/tinymix" "$SYSTEM_XBIN/tinymix"
+}
+
+find_tinycap() {
+    find_executable "$DATA_TMP/tinycap" "$VENDOR_BIN/tinycap" "$SYSTEM_BIN/tinycap" "$SYSTEM_XBIN/tinycap"
+}
+
+find_timeout() {
+    if [ -x "$SYSTEM_BIN/timeout" ]; then
+        TIMEOUT_KIND=standalone
+        TIMEOUT_BIN="$SYSTEM_BIN/timeout"
+    elif [ -x "$SYSTEM_BIN/toybox" ]; then
+        TIMEOUT_KIND=toybox
+        TIMEOUT_BIN="$SYSTEM_BIN/toybox"
+    else
+        TIMEOUT_KIND=none
+        TIMEOUT_BIN=none
+    fi
+}
+
+package_apk_path() {
+    PACKAGE_APK=none
+    [ -x "$CMD_BIN" ] || return 1
+    package_line=$("$CMD_BIN" package path "$PACKAGE" 2>/dev/null | sed -n '1p')
+    case "$package_line" in package:*) package_path=${package_line#package:} ;; *) return 1 ;; esac
+    case "$package_path" in
+        *..*|*//*|*' '*|*:*|*[!A-Za-z0-9_./~+=@-]*) return 1 ;;
+        /*) ;;
+        *) return 1 ;;
+    esac
+    case "$package_path" in
+        "$DATA_APP"/*/base.apk|"$SYSTEM_PRIV_APP"/Gateway/Gateway.apk|"$SYSTEM_EXT_PRIV_APP"/Gateway/Gateway.apk|"$PRODUCT_PRIV_APP"/Gateway/Gateway.apk) ;;
+        *) return 1 ;;
+    esac
+    [ -f "$package_path" ] || return 1
+    PACKAGE_APK=$package_path
+    return 0
+}
+
+audio_profile_size() {
+    AUDIO_PROFILE_SIZE=unknown
+    [ -f "$AUDIO_PROFILE" ] || return
+    size_value=$(wc -c < "$AUDIO_PROFILE" 2>/dev/null | tr -d '[:space:]')
+    if is_decimal "$size_value"; then
+        normalize_decimal "$size_value"
+        if [ "$DECIMAL_VALUE" -le 8192 ] 2>/dev/null; then AUDIO_PROFILE_SIZE=$DECIMAL_VALUE; else AUDIO_PROFILE_SIZE=oversize; fi
+    fi
+}
+
+print_status() {
+    module_state
+    module_version
+    find_timeout
+    magisk_path=$(find_magisk)
+    su_path=$(find_su)
+    tinymix_path=$(find_tinymix)
+    tinycap_path=$(find_tinycap)
+    if package_apk_path; then package_apk_present=true; else package_apk_present=false; fi
+    if [ -f "$MODULE_APK" ]; then module_apk_present=true; else module_apk_present=false; fi
+    if [ -x "$APP_PROCESS" ]; then app_process_present=true; else app_process_present=false; fi
+    if [ "$TIMEOUT_KIND" = none ]; then timeout_present=false; else timeout_present=true; fi
+    if [ -x "$OUTPUT_CAPPER" ]; then output_capper_present=true; else output_capper_present=false; fi
+    if [ "$magisk_path" = none ]; then magisk_present=false; else magisk_present=true; fi
+    if [ "$su_path" = none ]; then su_present=false; else su_present=true; fi
+    if [ "$tinymix_path" = none ]; then tinymix_present=false; else tinymix_present=true; fi
+    if [ "$tinycap_path" = none ]; then tinycap_present=false; else tinycap_present=true; fi
+    if [ -f "$AUDIO_PROFILE" ]; then audio_profile_present=true; else audio_profile_present=false; fi
+    audio_profile_size
+
+    printf 'protocol=1\n'
+    printf 'command=%s\n' "$COMMAND"
+    printf 'module.id=%s\n' "$MODULE_ID"
+    printf 'module.state=%s\n' "$MODULE_STATE"
+    printf 'module.enabled=%s\n' "$MODULE_ENABLED"
+    printf 'module.disable_marker=%s\n' "$MODULE_DISABLED"
+    printf 'module.remove_marker=%s\n' "$MODULE_REMOVE_MARKER"
+    printf 'module.version=%s\n' "$MODULE_VERSION"
+    printf 'root.uid=0\n'
+    printf 'boot.completed=%s\n' "$(boot_state)"
+    printf 'magisk.present=%s\n' "$magisk_present"
+    printf 'su.present=%s\n' "$su_present"
+    printf 'app_process.present=%s\n' "$app_process_present"
+    printf 'broker.timeout.present=%s\n' "$timeout_present"
+    printf 'broker.output_capper.present=%s\n' "$output_capper_present"
+    printf 'privapp.module_apk.present=%s\n' "$module_apk_present"
+    printf 'package.base_apk.present=%s\n' "$package_apk_present"
+    printf 'audio.permission.record_audio=%s\n' "$(permission_state android.permission.RECORD_AUDIO)"
+    printf 'audio.permission.capture_audio_output=%s\n' "$(permission_state android.permission.CAPTURE_AUDIO_OUTPUT)"
+    printf 'audio.permission.modify_audio_settings=%s\n' "$(permission_state android.permission.MODIFY_AUDIO_SETTINGS)"
+    printf 'audio-profile.present=%s\n' "$audio_profile_present"
+    printf 'audio-profile.bytes=%s\n' "$AUDIO_PROFILE_SIZE"
+    printf 'mixer.tinymix.present=%s\n' "$tinymix_present"
+    printf 'mixer.tinycap.present=%s\n' "$tinycap_present"
+    printf 'voice.call_acceptance=not_tested\n'
+}
+
+next_broker_line() {
+    [ -n "$BROKER_REST" ] || return 1
+    BROKER_LINE=${BROKER_REST%%"$NL"*}
+    if [ "$BROKER_REST" = "$BROKER_LINE" ]; then BROKER_REST=; else BROKER_REST=${BROKER_REST#*"$NL"}; fi
+    return 0
+}
+
+emit_broker_output() {
+    broker_output=$1
+    broker_exit=$2
+    [ "${#broker_output}" -le 32768 ] || emit_error broker_output_too_large 20
+
+    NL='
+'
+    BROKER_REST=$broker_output
+    next_broker_line || emit_error broker_empty_output 20
+    [ "$BROKER_LINE" = protocol=1 ] || emit_error broker_protocol_mismatch 20
+    next_broker_line || emit_error broker_incomplete_output 20
+    [ "$BROKER_LINE" = broker_version=1 ] || emit_error broker_version_mismatch 20
+    next_broker_line || emit_error broker_incomplete_output 20
+    case "$BROKER_LINE" in
+        app_version=*)
+            app_version=${BROKER_LINE#app_version=}
+            is_decimal "$app_version" || emit_error broker_invalid_app_version 20
+            normalize_decimal "$app_version"
+            [ "${#DECIMAL_VALUE}" -le 10 ] || emit_error broker_invalid_app_version 20
+            app_version=$DECIMAL_VALUE
+            ;;
+        *) emit_error broker_missing_app_version 20 ;;
+    esac
+    next_broker_line || emit_error broker_incomplete_output 20
+    [ "$BROKER_LINE" = broker_uid=1000 ] || emit_error broker_uid_mismatch 20
+    next_broker_line || emit_error broker_incomplete_output 20
+    [ "$BROKER_LINE" = source=magisk-system-telephony ] || emit_error broker_source_mismatch 20
+    next_broker_line || emit_error broker_incomplete_output 20
+    case "$BROKER_LINE" in
+        status=ok) broker_status=ok ;;
+        status=unavailable) broker_status=unavailable ;;
+        status=error) broker_status=error ;;
+        *) emit_error broker_invalid_status 20 ;;
+    esac
+    next_broker_line || emit_error broker_incomplete_output 20
+    case "$BROKER_LINE" in
+        user_id=*)
+            broker_user=${BROKER_LINE#user_id=}
+            is_decimal "$broker_user" || emit_error broker_invalid_user_id 20
+            normalize_decimal "$broker_user"
+            [ "$DECIMAL_VALUE" = 0 ] || emit_error broker_user_mismatch 20
+            ;;
+        *) emit_error broker_missing_user_id 20 ;;
+    esac
+    next_broker_line || emit_error broker_incomplete_output 20
+    case "$BROKER_LINE" in
+        count=*)
+            broker_count=${BROKER_LINE#count=}
+            is_decimal "$broker_count" || emit_error broker_invalid_count 20
+            normalize_decimal "$broker_count"
+            [ "${#DECIMAL_VALUE}" -le 2 ] || emit_error broker_invalid_count 20
+            [ "$DECIMAL_VALUE" -le 32 ] || emit_error broker_invalid_count 20
+            broker_count=$DECIMAL_VALUE
+            ;;
+        *) emit_error broker_missing_count 20 ;;
+    esac
+    if [ "$broker_status" != ok ] && [ "$broker_count" -ne 0 ]; then emit_error broker_invalid_count 20; fi
+
+    NL='
+'
+    validated_rows=
+    seen_sub_ids=,
+    i=0
+    while [ "$i" -lt "$broker_count" ]; do
+        expected_key="account.$i.sub_id="
+        next_broker_line || emit_error broker_missing_account 20
+        case "$BROKER_LINE" in "$expected_key"*) account_sub=${BROKER_LINE#*=} ;; *) emit_error broker_account_order_invalid 20 ;; esac
+        valid_sub_id "$account_sub" || emit_error broker_invalid_sub_id 20
+        normalize_decimal "$account_sub"
+        account_sub=$DECIMAL_VALUE
+        case "$seen_sub_ids" in *",$account_sub,"*) emit_error broker_duplicate_sub_id 20 ;; esac
+        seen_sub_ids="$seen_sub_ids$account_sub,"
+
+        expected_key="account.$i.component_b64="
+        next_broker_line || emit_error broker_missing_component 20
+        case "$BROKER_LINE" in "$expected_key"*) account_component=${BROKER_LINE#*=} ;; *) emit_error broker_account_order_invalid 20 ;; esac
+        case "$account_component" in ''|*[!A-Za-z0-9_-]*) emit_error broker_invalid_component 20 ;; esac
+
+        expected_key="account.$i.id_b64="
+        next_broker_line || emit_error broker_missing_account_id 20
+        case "$BROKER_LINE" in "$expected_key"*) account_id=${BROKER_LINE#*=} ;; *) emit_error broker_account_order_invalid 20 ;; esac
+        case "$account_id" in ''|*[!A-Za-z0-9_-]*) emit_error broker_invalid_account_id 20 ;; esac
+
+        expected_key="account.$i.user_id="
+        next_broker_line || emit_error broker_missing_account_user 20
+        case "$BROKER_LINE" in "$expected_key"*) account_user=${BROKER_LINE#*=} ;; *) emit_error broker_account_order_invalid 20 ;; esac
+        is_decimal "$account_user" || emit_error broker_invalid_account_user 20
+        normalize_decimal "$account_user"
+        [ "$DECIMAL_VALUE" = 0 ] || emit_error broker_account_user_mismatch 20
+
+        validated_rows="${validated_rows}account.$i.sub_id=$account_sub${NL}account.$i.component_b64=$account_component${NL}account.$i.id_b64=$account_id${NL}account.$i.user_id=0${NL}"
+        i=$((i + 1))
+    done
+
+    broker_error=
+    if [ -n "$BROKER_REST" ]; then
+        next_broker_line || emit_error broker_extra_output 20
+        case "$BROKER_LINE" in
+            error=permission|error=capability|error=service|error=api|error=context|error=subscription|error=telecom|error=telephony|error=user|error=limit|error=uid|error=arguments)
+                broker_error=${BROKER_LINE#error=}
+                ;;
+            *) emit_error broker_invalid_error_code 20 ;;
+        esac
+    fi
+    [ -z "$BROKER_REST" ] || emit_error broker_extra_output 20
+    if [ "$broker_status" = ok ] && [ -n "$broker_error" ]; then emit_error broker_error_on_success 20; fi
+    if [ "$broker_status" != ok ] && [ -z "$broker_error" ]; then emit_error broker_missing_error_code 20; fi
+    case "$broker_status:$broker_exit" in ok:0|unavailable:10|error:20) ;; *) emit_error broker_exit_status_mismatch 20 ;; esac
+
+    printf 'protocol=1\n'
+    printf 'broker_version=1\n'
+    printf 'app_version=%s\n' "$app_version"
+    printf 'broker_uid=1000\n'
+    printf 'source=magisk-system-telephony\n'
+    printf 'status=%s\n' "$broker_status"
+    printf 'user_id=0\n'
+    printf 'count=%s\n' "$broker_count"
+    [ -z "$validated_rows" ] || printf '%s' "$validated_rows"
+    [ -z "$broker_error" ] || printf 'error=%s\n' "$broker_error"
+    exit "$broker_exit"
+}
+
+write_broker_script() {
+    printf "CLASSPATH='%s'\n" "$PACKAGE_APK"
+    printf 'export CLASSPATH\n'
+    if [ "$TIMEOUT_KIND" = standalone ]; then
+        printf '%s -s KILL 8 %s /system/bin %s accounts 0\n' "$SYSTEM_BIN/timeout" "$APP_PROCESS" "$BROKER_CLASS"
+    else
+        printf '%s timeout -s KILL 8 %s /system/bin %s accounts 0\n' "$SYSTEM_BIN/toybox" "$APP_PROCESS" "$BROKER_CLASS"
+    fi
+    printf '%s\n' 'broker_exit=$?'
+    printf '%s\n' 'printf "__GSM2SIP_EXIT=%s\n" "$broker_exit"'
+    printf 'exit 0\n'
+}
+
+run_accounts() {
+    input_user=$1
+    is_decimal "$input_user" || emit_error invalid_user_id 64
+    normalize_decimal "$input_user"
+    [ "$DECIMAL_VALUE" = 0 ] || emit_error unsupported_user_id 64
+
+    check_root || emit_error root_required 77
+    module_state
+    [ "$MODULE_STATE" = active ] || emit_error module_not_active 10
+    [ -f "$MODULE_APK" ] || emit_error module_apk_unavailable 10
+    [ -x "$APP_PROCESS" ] || emit_error app_process_unavailable 10
+    find_timeout
+    [ "$TIMEOUT_KIND" != none ] || emit_error timeout_unavailable 10
+    [ -x "$OUTPUT_CAPPER" ] || emit_error output_capper_unavailable 10
+    SU_BIN=$(find_su)
+    [ "$SU_BIN" != none ] || emit_error su_unavailable 10
+    package_apk_path || emit_error package_apk_unavailable 10
+
+    if [ "$TIMEOUT_KIND" = standalone ]; then
+        broker_capture=$(write_broker_script | "$TIMEOUT_BIN" -s KILL 10 "$SU_BIN" -s "$SYSTEM_BIN/sh" 1000 2>/dev/null | "$OUTPUT_CAPPER" -c 32769 2>/dev/null)
+    else
+        broker_capture=$(write_broker_script | "$TIMEOUT_BIN" timeout -s KILL 10 "$SU_BIN" -s "$SYSTEM_BIN/sh" 1000 2>/dev/null | "$OUTPUT_CAPPER" -c 32769 2>/dev/null)
+    fi
+
+    NL='
+'
+    exit_line=${broker_capture##*"$NL"}
+    case "$exit_line" in
+        __GSM2SIP_EXIT=*)
+            broker_exit=${exit_line#__GSM2SIP_EXIT=}
+            is_decimal "$broker_exit" || emit_error broker_invalid_exit_marker 20
+            if [ "$broker_capture" = "$exit_line" ]; then
+                broker_output=
+            else
+                broker_output=${broker_capture%"$NL$exit_line"}
+            fi
+            ;;
+        *)
+            if [ "${#broker_capture}" -ge 32769 ]; then emit_error broker_output_too_large 20; fi
+            if [ -z "$broker_capture" ]; then emit_error broker_timeout 20; fi
+            emit_error broker_exit_marker_missing 20
+            ;;
+    esac
+    if [ -z "$broker_output" ] && { [ "$broker_exit" -eq 124 ] 2>/dev/null || [ "$broker_exit" -eq 137 ] 2>/dev/null; }; then
+        emit_error broker_timeout 20
+    fi
+    emit_broker_output "$broker_output" "$broker_exit"
+}
+
+if [ "$#" -lt 1 ]; then usage; fi
+COMMAND=$1
+case "$COMMAND" in
+    probe|status)
+        [ "$#" -eq 1 ] || usage
+        check_root || emit_error root_required 77
+        print_status
+        exit 0
+        ;;
+    accounts)
+        [ "$#" -eq 2 ] || usage
+        run_accounts "$2"
+        ;;
+    *) usage ;;
+esac

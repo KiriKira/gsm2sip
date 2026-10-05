@@ -2,6 +2,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- This gateway requires a phone with real cellular subscriptions. -->
+    <uses-feature android:name="android.hardware.telephony" android:required="true" />
+
     <!-- Network -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -36,6 +39,7 @@
 
     <!-- Foreground service -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -46,6 +50,8 @@
          which a gateway has no reason to do. -->
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.SEND_SMS" />
+    <!-- Optional system-inbox recovery. Requested only after visible opt-in. -->
+    <uses-permission android:name="android.permission.READ_SMS" />
 
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -56,20 +62,22 @@
     <application
         android:name=".GatewayApp"
         android:allowBackup="false"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
         android:supportsRtl="true"
-        android:resizeableActivity="false"
+        android:resizeableActivity="true"
         android:theme="@style/Theme.SipGsmGateway"
-        tools:targetApi="34">
+        tools:targetApi="35">
 
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:label="@string/activity_title"
-            android:screenOrientation="portrait"
-            android:resizeableActivity="false"
+            android:resizeableActivity="true"
+            android:windowSoftInputMode="adjustResize"
             android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -86,6 +94,12 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".backup.GatewaySmsBackupActivity"
+            android:exported="false"
+            android:label="短信备份与归档"
+            android:resizeableActivity="true" />
 
         <!-- InCallService: intercepts and controls GSM calls -->
         <service
@@ -113,11 +127,15 @@
             </intent-filter>
         </service>
 
-        <!-- Gateway foreground service: keeps SIP registered 24/7 -->
+        <!-- User-enabled relay; idle uses specialUse, actual calls add their types. -->
         <service
             android:name=".service.GatewayService"
-            android:foregroundServiceType="phoneCall|microphone"
-            android:exported="false" />
+            android:foregroundServiceType="specialUse|phoneCall|microphone"
+            android:exported="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User-enabled persistent remote SIM relay: authenticated SMS events, command polling and gateway health." />
+        </service>
 
         <!-- Incoming SMS on any SIM.  android:permission restricts the sender
              to the system, so nothing else can inject a fake message. -->

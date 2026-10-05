@@ -262,24 +262,63 @@ probe_gateway() {
     printf '%s\n' "$PROBE_OUTPUT" | grep -qx 'privapp.module_apk.present=true' || fail gateway_probe_module_apk
     printf '%s\n' "$PROBE_OUTPUT" | grep -qx 'package.base_apk.present=true' || fail gateway_probe_package_apk
 
+    BROKER_STDERR_FILE=/data/local/tmp/gsm2sip-broker-stderr-$$.log
+    rm -f "$BROKER_STDERR_FILE"
     set +e
-    ACCOUNTS_OUTPUT=$("$CTL" accounts 0 2>/dev/null)
+    ACCOUNTS_OUTPUT=$("$CTL" accounts 0 2>"$BROKER_STDERR_FILE")
     ACCOUNTS_RC=$?
     set -e
     BROKER_STATUS=$(printf '%s\n' "$ACCOUNTS_OUTPUT" | sed -n 's/^status=//p' | sed -n '1p')
     BROKER_COUNT=$(printf '%s\n' "$ACCOUNTS_OUTPUT" | sed -n 's/^count=//p' | sed -n '1p')
     BROKER_ERROR=$(printf '%s\n' "$ACCOUNTS_OUTPUT" | sed -n 's/^error=//p' | sed -n '1p')
+    case "$BROKER_STATUS" in ok|unavailable|error) BROKER_STATUS_SAFE=$BROKER_STATUS ;; *) BROKER_STATUS_SAFE=invalid ;; esac
+    case "$BROKER_COUNT" in
+        ''|*[!0-9]*) BROKER_COUNT_SAFE=unknown ;;
+        *)
+            if [ "${#BROKER_COUNT}" -le 2 ] && [ "$BROKER_COUNT" -le 32 ]; then
+                BROKER_COUNT_SAFE=$BROKER_COUNT
+            else
+                BROKER_COUNT_SAFE=unknown
+            fi
+            ;;
+    esac
+    case "$BROKER_ERROR" in
+        '') BROKER_ERROR_SAFE=none ;;
+        permission|capability|service|api|context|subscription|telecom|telephony|user|limit|uid|arguments)
+            BROKER_ERROR_SAFE=$BROKER_ERROR ;;
+        *) BROKER_ERROR_SAFE=invalid ;;
+    esac
+    BROKER_STDERR_PRESENT=false
+    BROKER_STDERR_CLASS=none
+    if [ -s "$BROKER_STDERR_FILE" ]; then
+        BROKER_STDERR_PRESENT=true
+        BROKER_STDERR_LINE=$(sed -n '1p' "$BROKER_STDERR_FILE" | tr -cd 'A-Za-z0-9_:-')
+        case "$BROKER_STDERR_LINE" in
+            unavailable:permission|unavailable:capability|unavailable:service|unavailable:api|unavailable:context|unavailable:subscription|unavailable:telecom|unavailable:telephony|unavailable:user|unavailable:limit|unavailable:uid|unavailable:arguments|broker_timeout|broker_exit_marker_missing|broker_output_too_large|broker_exit_status_mismatch|broker_invalid_exit_marker)
+                BROKER_STDERR_CLASS=$BROKER_STDERR_LINE
+                ;;
+            *) BROKER_STDERR_CLASS=unclassified ;;
+        esac
+    fi
+    rm -f "$BROKER_STDERR_FILE"
+    echo "broker.query_exit_code=$ACCOUNTS_RC"
+    echo "broker.query_status=$BROKER_STATUS_SAFE"
+    echo "broker.query_count=$BROKER_COUNT_SAFE"
+    echo "broker.query_error=$BROKER_ERROR_SAFE"
+    echo "broker.stderr_present=$BROKER_STDERR_PRESENT"
+    echo "broker.stderr_class=$BROKER_STDERR_CLASS"
     # This API 34 image has framework Telephony/Telecom services. A successful
     # empty query is valid without real SIMs; setup/attribution errors are not.
+    [ "$BROKER_COUNT_SAFE" != unknown ] || fail gateway_broker_invalid_count
     case "$ACCOUNTS_RC:$BROKER_STATUS" in
         0:ok) ;;
-        10:unavailable) fail "gateway_broker_query_unavailable_${BROKER_ERROR:-unknown}" ;;
+        10:unavailable) fail "gateway_broker_query_unavailable_$BROKER_ERROR_SAFE" ;;
         *) fail gateway_broker_unexpected_result ;;
     esac
     echo "broker.query_completed=true"
-    echo "broker.status=$BROKER_STATUS"
-    echo "broker.count=${BROKER_COUNT:-unknown}"
-    echo "broker.error=${BROKER_ERROR:-none}"
+    echo "broker.status=$BROKER_STATUS_SAFE"
+    echo "broker.count=$BROKER_COUNT_SAFE"
+    echo "broker.error=$BROKER_ERROR_SAFE"
     echo "voice.call_acceptance=not_tested"
 }
 

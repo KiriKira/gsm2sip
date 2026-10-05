@@ -34,6 +34,14 @@ broker 主类。外层必须是 root；通过 Magisk `su -s /system/bin/sh 1000`
 启动短生命周期 system-UID 子进程，将 Binder 调用归因到真实的 `android`
 系统包。Magisk 没有 `su -u` 选项；也不能用 UID 0 假冒该系统包。
 
+独立 `app_process` 不会执行普通 App 的 `ActivityThread.main()`。Android 11
+及之后的 broker 先调用框架的进程内 `initializeMainlineModules()`，再创建
+`systemMain()` 的系统 context，使 Telephony 的服务管理器正常初始化；
+Android 8–10 保留旧的查询路径。身份检查使用实际进程 UID 1000 和系统
+包名，不能将 synthetic `ApplicationInfo.uid` 默认值当作运行身份。初始化
+或服务查询失败仍返回 unavailable；诊断仅记录固定调用阶段与异常类，
+不记录异常消息、栈或账户标识，也不改全局 framework/hidden-API 配置。
+
 子进程只查询 Telephony/Telecom：当前 active subscription、call-capable
 PhoneAccount、框架注册的 SIM capability、精确 account→subId 关联及可用
 时的正向关联。映射必须唯一且属于相同 Android user。handle.id 保持

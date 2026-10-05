@@ -719,6 +719,43 @@ class MagiskAvdSmoke:
         else:
             return_code = 0
         finally:
+            broker_log_path = self.artifacts / "broker-diagnostic-logcat.txt"
+            broker_log_status_path = self.artifacts / "broker-diagnostic-logcat-status.txt"
+            try:
+                if self.emulator_process is None:
+                    self.summary["broker_diagnostic_logcat"] = "skipped_no_emulator_process"
+                    broker_log_status_path.write_text(
+                        "collection=skipped\nreason=no_emulator_process\n", encoding="utf-8"
+                    )
+                else:
+                    broker_log = self.adb_run(
+                        "logcat", "-d", "-v", "brief", "-s", "RootTelephonyBroker",
+                        name="broker-diagnostic-logcat", timeout=30, check=False, log=False,
+                    )
+                    broker_log_text = str(broker_log.stdout)
+                    broker_log_path.write_text(broker_log_text, encoding="utf-8")
+                    broker_log_status = "collected" if broker_log.returncode == 0 else "adb_failed"
+                    self.summary["broker_diagnostic_logcat"] = broker_log_status
+                    broker_log_status_path.write_text(
+                        f"collection={broker_log_status}\n"
+                        f"exit_code={broker_log.returncode}\n"
+                        f"line_count={len(broker_log_text.splitlines())}\n",
+                        encoding="utf-8",
+                    )
+            except Exception as exc:
+                self.summary["broker_diagnostic_logcat"] = "collection_failed"
+                try:
+                    broker_log_path.write_text("", encoding="utf-8")
+                    broker_log_status_path.write_text(
+                        f"collection=failed\nerror_type={type(exc).__name__}\n", encoding="utf-8"
+                    )
+                except OSError:
+                    pass
+                print(
+                    f"Broker diagnostic logcat collection failed ({type(exc).__name__})",
+                    file=sys.stderr,
+                    flush=True,
+                )
             try:
                 self.stop_emulator()
             except Exception as exc:

@@ -12,8 +12,10 @@ import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
+import android.util.Log
 import com.callagent.gateway.BuildConfig
 import java.nio.charset.StandardCharsets
+import java.lang.reflect.InvocationTargetException
 import java.util.Base64
 
 /**
@@ -33,6 +35,7 @@ object RootTelephonyBroker {
     private const val MAX_ACCOUNT_TEXT_BYTES = 256
     private const val MAX_USER_ID = 21474
     private const val SOURCE = "magisk-system-telephony"
+    private const val LOG_TAG = "RootTelephonyBroker"
 
     private data class Candidate(val subscriptionId: Int, val handle: PhoneAccountHandle)
 
@@ -43,17 +46,24 @@ object RootTelephonyBroker {
         val errorCode: String? = null
     )
 
+    private class DiagnosticState(var stage: String = "entry")
+
     @JvmStatic
     fun main(args: Array<String>) {
+        val diagnostic = DiagnosticState()
         val (result, exitCode) = try {
-            execute(args)
-        } catch (_: SecurityException) {
+            execute(args, diagnostic)
+        } catch (failure: SecurityException) {
+            logDiagnostic(diagnostic.stage, failure)
             Result("unavailable", 0, errorCode = "permission") to 10
-        } catch (_: ReflectiveOperationException) {
+        } catch (failure: ReflectiveOperationException) {
+            logDiagnostic(diagnostic.stage, failure)
             Result("unavailable", 0, errorCode = "capability") to 10
-        } catch (_: RuntimeException) {
+        } catch (failure: RuntimeException) {
+            logDiagnostic(diagnostic.stage, failure)
             Result("unavailable", 0, errorCode = "service") to 10
-        } catch (_: LinkageError) {
+        } catch (failure: LinkageError) {
+            logDiagnostic(diagnostic.stage, failure)
             Result("unavailable", 0, errorCode = "api") to 10
         }
 
@@ -61,12 +71,14 @@ object RootTelephonyBroker {
         System.exit(exitCode)
     }
 
-    private fun execute(args: Array<String>): Pair<Result, Int> {
+    private fun execute(args: Array<String>, diagnostic: DiagnosticState): Pair<Result, Int> {
+        diagnostic.stage = "process_uid"
         val processUid = Process.myUid()
         if (processUid != Process.SYSTEM_UID) {
             return Result("error", 0, errorCode = "uid") to 20
         }
 
+        diagnostic.stage = "argument_validation"
         if (args.size !in 2..3) {
             return Result("error", 0, errorCode = "arguments") to 20
         }
@@ -86,28 +98,40 @@ object RootTelephonyBroker {
         val userArg = if (action == "accounts") args[1] else args[2]
         val expectedUserId = parseDecimal(userArg, MAX_USER_ID)
             ?: return Result("error", 0, errorCode = "arguments") to 20
+        diagnostic.stage = "user_guard"
         if (expectedUserId != 0) {
             return Result("unavailable", expectedUserId, errorCode = "user") to 10
         }
 
+        diagnostic.stage = "hidden_api_setup"
         enableProcessLocalHiddenApiAccess()
+        diagnostic.stage = "mainline_module_initialization"
+        initializeMainlineModules()
+        diagnostic.stage = "system_context_setup"
         val context = systemContext()
+        diagnostic.stage = "system_context_guard"
         if (!isTrustedSystemContext(context, processUid)) {
             return Result("unavailable", expectedUserId, errorCode = "context") to 10
         }
+        diagnostic.stage = "account_user_handle"
         val expectedHandleUser = UserHandle.getUserHandleForUid(Process.SYSTEM_UID)
 
+        diagnostic.stage = "subscription_service_lookup"
         val subscriptionManager = context.getSystemService(SubscriptionManager::class.java)
             ?: return Result("unavailable", expectedUserId, errorCode = "subscription") to 10
+        diagnostic.stage = "telecom_service_lookup"
         val telecom = context.getSystemService(TelecomManager::class.java)
             ?: return Result("unavailable", expectedUserId, errorCode = "telecom") to 10
+        diagnostic.stage = "telephony_service_lookup"
         val telephony = context.getSystemService(TelephonyManager::class.java)
             ?: return Result("unavailable", expectedUserId, errorCode = "telephony") to 10
 
+        diagnostic.stage = "phone_permission_check"
         if (context.checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
             return Result("unavailable", expectedUserId, errorCode = "permission") to 10
         }
 
+        diagnostic.stage = "active_subscription_query"
         val activeSubscriptions = subscriptionManager.activeSubscriptionInfoList.orEmpty()
         if (activeSubscriptions.size > MAX_ACCOUNTS) {
             return Result("unavailable", expectedUserId, errorCode = "limit") to 10
@@ -116,6 +140,7 @@ object RootTelephonyBroker {
         val activeIdCounts = activeIds.groupingBy { it }.eachCount()
         val uniqueActiveIds = activeIdCounts.filterValues { it == 1 }.keys
 
+        diagnostic.stage = "call_capable_account_query"
         val callCapable = telecom.callCapablePhoneAccounts.orEmpty().distinct()
         if (callCapable.size > MAX_CALL_CAPABLE_HANDLES) {
             return Result("unavailable", expectedUserId, errorCode = "limit") to 10
@@ -123,20 +148,25 @@ object RootTelephonyBroker {
 
         val candidates = ArrayList<Candidate>()
         for (handle in callCapable) {
+            diagnostic.stage = "account_filter"
             if (handle.userHandle != expectedHandleUser) continue
             if (!isWireSafe(handle)) continue
+            diagnostic.stage = "phone_account_query"
             val account = telecom.getPhoneAccount(handle) ?: continue
             if (!account.hasCapabilities(PhoneAccount.CAPABILITY_SIM_SUBSCRIPTION)) continue
 
+            diagnostic.stage = "subscription_mapping"
             val subscriptionId = subscriptionIdForAccount(telephony, account, handle)
                 ?: continue
             if (subscriptionId < 0 || subscriptionId !in uniqueActiveIds) continue
+            diagnostic.stage = "forward_mapping"
             if (!forwardMappingMatches(telephony, subscriptionId, handle)) continue
             candidates += Candidate(subscriptionId, handle)
         }
 
         // A subId or opaque PhoneAccountHandle that has more than one inverse
         // is ambiguous. Omit every affected row rather than selecting one.
+        diagnostic.stage = "account_deduplication"
         val subCounts = candidates.groupingBy { it.subscriptionId }.eachCount()
         val handleCounts = candidates.groupingBy { it.handle }.eachCount()
         val uniqueCandidates = candidates.filter {
@@ -150,6 +180,23 @@ object RootTelephonyBroker {
             uniqueCandidates.filter { it.subscriptionId == requestedSubscriptionId }
         }
         return Result("ok", expectedUserId, selected) to 0
+    }
+
+    /** Log only fixed stage labels and an exception class; never messages or stacks. */
+    private fun logDiagnostic(stage: String, failure: Throwable) {
+        val reportedFailure = if (failure is InvocationTargetException) {
+            failure.targetException ?: failure
+        } else {
+            failure
+        }
+        val exceptionClass = reportedFailure.javaClass.name
+            .takeIf { it.length <= 128 && it.all { char -> char.isLetterOrDigit() || char in "._$" } }
+            ?: "unknown"
+        try {
+            Log.e(LOG_TAG, "stage=$stage exception=$exceptionClass")
+        } catch (_: Throwable) {
+            // Diagnostics must not replace the original broker failure.
+        }
     }
 
     /**
@@ -220,6 +267,21 @@ object RootTelephonyBroker {
         val activityThread = systemMain.invoke(null)
         val getSystemContext = activityThreadClass.getDeclaredMethod("getSystemContext")
         return getSystemContext.invoke(activityThread) as Context
+    }
+
+    /**
+     * A custom app_process entry point bypasses ActivityThread.main(), which
+     * performs this per-process initialization before attaching the process.
+     * TelephonyManager's subscription binder lookup depends on the telephony
+     * service manager installed here.
+     */
+    @Suppress("BlockedPrivateApi")
+    private fun initializeMainlineModules() {
+        // The initializer and the TelephonyServiceManager dependency were
+        // introduced with Android 11; older releases use the legacy lookup.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        val activityThreadClass = Class.forName("android.app.ActivityThread")
+        activityThreadClass.getDeclaredMethod("initializeMainlineModules").invoke(null)
     }
 
     /** Hidden API exemptions apply only to this short-lived isolated child. */

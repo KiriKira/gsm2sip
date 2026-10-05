@@ -1175,7 +1175,8 @@ class Smoke:
         return " | ".join(messages) if messages else None
 
     def open_smsbr_import_preview(self, root: ET.Element, filename: str, *, stage: str) -> ET.Element:
-        root = self.tap_text(root, "选择备份文件并预览", stage=f"{stage}_open_picker")
+        root = self.tap_text(root, "选择备份文件并预览", stage=f"{stage}_open_picker",
+                             direction_hint="earlier")
         root = self.choose_smsbr_fixture_in_documents_ui(root, filename, stage=stage)
         for label in ("导入预览", "记录 2 条", "来源：sms-backup-restore+xml 2 条", "确认导入", "取消导入"):
             try:
@@ -1192,13 +1193,22 @@ class Smoke:
         screenshot = "backup-import-preview" if stage == "backup_import_first" else "backup-import-repeat-preview"
         return self.capture(screenshot)
 
-    def wait_for_import_completion(self, name: str) -> ET.Element:
-        return self.wait_for_app_tree(
-            lambda tree: self.find_text_containing(tree, "已导入归档") is not None and
+    def wait_for_import_completion(self, name: str, expected_status: str) -> ET.Element:
+        root = self.wait_for_app_tree(
+            lambda tree: any(node.attrib.get("package", "") == self.package for node in self.nodes(tree)) and
+            self.find_text_node(tree, expected_status) is not None and
             self.find_text_node(tree, "导入预览") is None and
             self.find_text_node(tree, "确认导入") is None,
             name,
         )
+        root = self.ensure_text_visible(root, expected_status, stage=f"{name}_status",
+                                        direction_hint="earlier")
+        root = self.capture(f"{name}_status")
+        status_node = self.find_text_node(root, expected_status)
+        if status_node is None or not self.node_has_positive_visible_bounds(status_node):
+            raise RuntimeError(f"Import result status is not visible: {expected_status}")
+        return self.ensure_text_visible(root, "已导入归档 2 条", stage=f"{name}_count",
+                                        direction_hint="later")
 
     def test_backup_import_flow(self) -> None:
         filename = f"gsm2sip-ui-smoke-{self.args.scenario}-{time.time_ns()}.xml"
@@ -1242,13 +1252,12 @@ class Smoke:
 
             active_check = "backup_import_confirm"
             root = self.tap_text(root, "确认导入", stage="confirm_synthetic_import")
-            root = self.wait_for_import_completion("backup_import_first_complete")
-            root = self.ensure_text_visible(root, "已导入归档 2 条", stage="first_imported_count",
-                                            direction_hint="later")
+            root = self.wait_for_import_completion("backup_import_first_complete",
+                                                   "导入完成：新增 2，更新 0，重复 0。")
             imported_count = self.find_text_node(root, "已导入归档 2 条")
             confirmed = imported_count is not None and self.node_has_positive_visible_bounds(imported_count)
             self.record("backup_import_confirm", "pass" if confirmed else "fail",
-                        f"confirmed archive count shows 2 imported rows: {confirmed}; "
+                        f"completion=新增 2，更新 0，重复 0; count shows 2 imported rows={confirmed}; "
                         f"bounds={imported_count.attrib.get('bounds') if imported_count is not None else None}")
             if not confirmed:
                 raise RuntimeError("Confirming import did not update the independent archive count to two")
@@ -1257,21 +1266,35 @@ class Smoke:
             root = self.tap_text(root, "查看归档", stage="open_imported_archive_history")
             root = self.wait_for_app_tree(
                 lambda tree: self.find_text_node(tree, "隐藏归档") is not None and
-                self.find_text_node(tree, bodies[0]) is not None and
-                self.find_text_node(tree, bodies[1]) is not None,
-                "backup_imported_archive_rows"
+                self.node_has_positive_visible_bounds(self.find_text_node(tree, "隐藏归档")),
+                "backup_imported_archive_expanded"
             )
+            root = self.ensure_text_visible(root, "已导入归档 2 条", stage="imported_archive_count",
+                                            direction_hint="earlier")
+            root = self.capture("backup-imported-history-count")
+            count_node = self.find_text_node(root, "已导入归档 2 条")
+            hide_node = self.find_text_node(root, "隐藏归档")
+            history_count_ok = (count_node is not None and self.node_has_positive_visible_bounds(count_node) and
+                                hide_node is not None and self.node_has_positive_visible_bounds(hide_node))
+            if not history_count_ok:
+                raise RuntimeError("Expanded archive did not show count=2 and the hide control with positive bounds")
+            history_body_occurrences: list[int] = []
+            history_body_visible: list[bool] = []
             for index, body in enumerate(bodies):
                 root = self.ensure_text_visible(root, body, stage=f"imported_sms_body_{index}")
+                root = self.capture("backup-imported-history-inbound" if index == 0
+                                    else "backup-imported-history-outbound")
+                body_node = self.find_text_node(root, body)
+                body_occurrences = sum(1 for node in self.nodes(root) if node.attrib.get("text", "") == body)
+                history_body_occurrences.append(body_occurrences)
+                history_body_visible.append(body_node is not None and
+                                            self.node_has_positive_visible_bounds(body_node) and
+                                            body_occurrences == 1)
             root = self.capture("backup-imported-history")
-            incoming = self.find_text_node(root, bodies[0])
-            outgoing = self.find_text_node(root, bodies[1])
-            history_ok = (self.find_text_node(root, "已导入归档 2 条") is not None and
-                          self.find_text_node(root, "隐藏归档") is not None and
-                          incoming is not None and self.node_has_positive_visible_bounds(incoming) and
-                          outgoing is not None and self.node_has_positive_visible_bounds(outgoing))
+            history_ok = history_count_ok and all(history_body_visible)
             self.record("backup_import_history", "pass" if history_ok else "fail",
-                        f"read-only imported archive exposes both synthetic Unicode bodies and count=2: {history_ok}")
+                        f"read-only imported archive count and hide control visible={history_count_ok}; "
+                        f"body bounds visible={history_body_visible}; body occurrences={history_body_occurrences}")
             if not history_ok:
                 raise RuntimeError("Imported archive history did not show both synthetic SMS bodies")
 
@@ -1283,15 +1306,42 @@ class Smoke:
                 self.record("backup_import_dedup", "fail", "Repeat fixture import did not preview its two stable records")
                 raise RuntimeError("Could not preview the same fixture a second time")
             root = self.tap_text(root, "确认导入", stage="confirm_repeat_synthetic_import")
-            root = self.wait_for_import_completion("backup_import_repeat_complete")
-            root = self.ensure_text_visible(root, "已导入归档 2 条", stage="reimported_archive_count",
-                                            direction_hint="later")
+            root = self.wait_for_import_completion("backup_import_repeat_complete",
+                                                   "导入完成：新增 0，更新 0，重复 2。")
             count_node = self.find_text_node(root, "已导入归档 2 条")
-            body_occurrences = [sum(1 for node in self.nodes(root) if node.attrib.get("text", "") == body)
-                                for body in bodies]
-            dedup_ok = count_node is not None and body_occurrences == [1, 1]
+            repeat_count_ok = count_node is not None and self.node_has_positive_visible_bounds(count_node)
+            if not repeat_count_ok:
+                self.record("backup_import_dedup", "fail",
+                            "Reimport completed without a visible archive count of two")
+                raise RuntimeError("Reimport did not leave the imported archive count at two")
+            hide_node = self.find_text_node(root, "隐藏归档")
+            if hide_node is not None:
+                root = self.ensure_text_visible(root, "隐藏归档", stage="reimported_archive_already_expanded",
+                                                direction_hint="earlier")
+            else:
+                root = self.tap_text(root, "查看归档", stage="open_reimported_archive_history")
+                root = self.wait_for_app_tree(
+                    lambda tree: self.find_text_node(tree, "隐藏归档") is not None and
+                    self.node_has_positive_visible_bounds(self.find_text_node(tree, "隐藏归档")),
+                    "backup_reimported_archive_expanded"
+                )
+            body_occurrences: list[int] = []
+            repeat_bodies_ok: list[bool] = []
+            for index, body in enumerate(bodies):
+                root = self.ensure_text_visible(root, body, stage=f"reimported_sms_body_{index}")
+                root = self.capture("backup-reimported-history-inbound" if index == 0
+                                    else "backup-reimported-history-outbound")
+                body_node = self.find_text_node(root, body)
+                occurrence_count = sum(1 for node in self.nodes(root) if node.attrib.get("text", "") == body)
+                body_occurrences.append(occurrence_count)
+                repeat_bodies_ok.append(body_node is not None and
+                                        self.node_has_positive_visible_bounds(body_node) and
+                                        occurrence_count == 1)
+            root = self.capture("backup-reimported-history")
+            dedup_ok = repeat_count_ok and all(repeat_bodies_ok)
             self.record("backup_import_dedup", "pass" if dedup_ok else "fail",
-                        f"reimporting the same stable XML leaves archive count=2 and body row occurrences={body_occurrences}")
+                        f"completion=新增 0，更新 0，重复 2; visible archive count=2={repeat_count_ok}; "
+                        f"body bounds visible={repeat_bodies_ok}; body occurrences={body_occurrences}")
             if not dedup_ok:
                 raise RuntimeError("Reimporting the same XML duplicated records or changed the imported count")
         except Exception as exc:

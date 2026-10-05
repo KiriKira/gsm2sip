@@ -393,39 +393,58 @@ class Smoke:
 
     def refuse_system_prompts(self) -> None:
         denied: list[str] = []
+        back_cancelled = 0
+        empty_tree_retries = 0
         deny_labels = {"don't allow", "dont allow", "deny", "cancel", "not now", "no thanks"}
+
+        def has_system_prompt(root: ET.Element) -> bool:
+            return any(
+                package and package != self.package and
+                ("permissioncontroller" in package.lower() or "rolecontroller" in package.lower())
+                for package in (node.attrib.get("package", "") for node in self.nodes(root))
+            )
+
         for attempt in range(8):
             root = self.capture(f"permission_prompt_{attempt}")
             nodes = self.nodes(root)
-            foreign_packages = {n.attrib.get("package", "") for n in nodes
-                                if n.attrib.get("package", "") and n.attrib.get("package", "") != self.package}
-            promptish = any(
-                "permissioncontroller" in p.lower() or "rolecontroller" in p.lower()
-                for p in foreign_packages
-            )
-            if not promptish:
+            if not has_system_prompt(root):
                 break
             denial = next((n for n in nodes
-                           if self.node_value(n).strip().lower().replace("’", "'") in deny_labels), None)
-            if denial is None:
-                # A system prompt without an explicit refusal button cannot be
-                # safely handled automatically; leave it untouched and report it.
-                self.record("system_permission_prompts", "blocked",
-                            "system prompt was visible but no explicit deny/cancel control was exposed")
-                return
-            text = self.node_value(denial).strip()
-            self.tap_node(denial, "refuse_system_prompt")
-            denied.append(text)
+                           if self.node_value(n).strip().lower().replace("’", "'") in deny_labels
+                           and self.node_has_positive_visible_bounds(n)), None)
+            if denial is not None:
+                text = self.node_value(denial).strip()
+                self.tap_node(denial, "refuse_system_prompt")
+                denied.append(text)
+                empty_tree_retries = 0
+            else:
+                has_accessible_content = any(self.node_value(n).strip() for n in nodes)
+                if not has_accessible_content and empty_tree_retries < 2:
+                    # Some platform permission sheets briefly expose an empty
+                    # accessibility root. Re-capture twice before safe BACK.
+                    empty_tree_retries += 1
+                    self.wait(1)
+                    continue
+                self.shell("input", "keyevent", "KEYCODE_BACK", check=True,
+                           label=f"cancel_system_prompt_{attempt}")
+                back_cancelled += 1
+                empty_tree_retries = 0
             self.wait(2)
+            after_action = self.capture(f"permission_prompt_after_action_{attempt}")
+            if not has_system_prompt(after_action):
+                break
         final = self.capture("after_permission_refusal")
-        if any(self.node_value(n).strip().lower() in {"allow", "while using the app", "only this time"}
-               for n in self.nodes(final)) and any(
-                   "permissioncontroller" in n.attrib.get("package", "").lower() for n in self.nodes(final)
-               ):
-            self.record("system_permission_prompts", "blocked", "permission controller remains visible")
+        if has_system_prompt(final):
+            self.record("system_permission_prompts", "blocked",
+                        "permission or role controller remained visible after 8 safe refusal attempts")
             return
+        paths = []
+        if denied:
+            paths.append("explicitly refused by visible control(s): " + ", ".join(denied))
+        if back_cancelled:
+            paths.append(f"cancelled with KEYCODE_BACK {back_cancelled} time(s)")
         self.record("system_permission_prompts", "pass",
-                    "explicitly refused: " + ", ".join(denied) if denied
+                    "; ".join(paths) if paths
                     else "no permission or default-role prompt was visible; none was accepted")
 
     def verify_app_foreground(self) -> None:

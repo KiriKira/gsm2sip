@@ -60,6 +60,11 @@ dependencies {
     testImplementation("org.robolectric:robolectric:4.12.2")
     implementation("androidx.core:core-ktx:1.16.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.lifecycle:lifecycle-livedata-core:2.8.7") {
+        version { strictly("2.8.7") }
+    }
+    implementation("androidx.window:window:1.5.1")
+    implementation("androidx.window:window-java:1.5.1")
     implementation("com.google.android.material:material:1.14.0")
     implementation("androidx.constraintlayout:constraintlayout:2.2.1")
 }

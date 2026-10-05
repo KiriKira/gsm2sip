@@ -27,6 +27,10 @@ Android 安装器可能限制短信权限授予；没有 SEND_SMS/RECEIVE_SMS �
 [功能缺口与弱网恢复审查](https://github.com/KiriKira/gsm2sip-server/blob/codex/control-plane-foundation/docs/network-and-feature-status.md)
 区分短信补齐、提醒投递、通话续接限制、主机弱网音质策略及待验收项。
 
+## 短信备份与归档
+
+两端支持密码加密备份、JSON 与 SMS Backup & Restore XML 导出/导入；导入仅进入独立归档，不恢复发送任务。网关可选择开启本机长期保留，服务器确认后仍保留归档副本。详见 [短信备份说明](docs/sms-backup.md) 与 [两端 KVM 验证与关键界面截图](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/ui-verification/README.md)。
+
 ## 开发与初次连接
 
 需要 JDK 17+、Android SDK 35；本机调试 APK：

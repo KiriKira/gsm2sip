@@ -2,10 +2,16 @@ package com.callagent.gateway.data
 
 import android.content.ContentValues
 import android.content.Context
+import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import android.net.Uri
+import android.util.Log
 import org.json.JSONObject
+import com.callagent.backup.SmsArchiveCodec
+import com.callagent.backup.SmsArchiveRecord
 import com.callagent.gateway.sms.SmsProviderRecovery
+import java.io.Closeable
 import java.security.MessageDigest
 import java.util.UUID
 
@@ -37,7 +43,10 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         val expiresAt: Long,
         val state: String,
         val payloadHash: String,
-        val ownerGatewayId: String? = null
+        val ownerGatewayId: String? = null,
+        val createdAt: Long = 0L,
+        /** Immutable API-origin label captured when the server command was claimed. */
+        val archiveSource: String = "gsm2sip:server-api:unknown"
     )
 
     enum class InsertCommandResult { INSERTED, DUPLICATE, CONFLICT }
@@ -55,7 +64,9 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         val recipient: String = "",
         val simId: String? = null,
         val mappingRevision: Long? = null,
-        val resolution: String = "unknown"
+        val resolution: String = "unknown",
+        /** Historical recovery cannot safely infer the name of the SIM that was present then. */
+        val simLabel: String? = null
     )
 
     data class SmsProviderCheckpoint(
@@ -111,7 +122,8 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             received_at INTEGER NOT NULL, parts INTEGER NOT NULL,
             sim_id TEXT, mapping_revision INTEGER, sub_id INTEGER NOT NULL,
             slot_index INTEGER NOT NULL, resolution TEXT NOT NULL,
-            source TEXT NOT NULL DEFAULT 'broadcast',
+            source TEXT NOT NULL DEFAULT 'broadcast', archive_gateway_id TEXT,
+            archive_source TEXT NOT NULL DEFAULT 'gsm2sip:server-api:unknown', archive_sim_label TEXT,
             FOREIGN KEY(event_id) REFERENCES events(event_id)
         )""")
         db.execSQL("""CREATE TABLE commands (
@@ -120,6 +132,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             recipient TEXT, body TEXT, part_count INTEGER NOT NULL,
             expires_at INTEGER NOT NULL, state TEXT NOT NULL,
             payload_hash TEXT NOT NULL, owner_gateway_id TEXT,
+            archive_source TEXT NOT NULL DEFAULT 'gsm2sip:server-api:unknown',
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL, last_error TEXT NOT NULL DEFAULT ''
         )""")
@@ -139,6 +152,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         db.execSQL("CREATE TABLE sms_dispatch_budget (command_id TEXT PRIMARY KEY, owner_gateway_id TEXT NOT NULL, sim_id TEXT NOT NULL, dispatched_at INTEGER NOT NULL)")
         db.execSQL("CREATE INDEX sms_dispatch_budget_window ON sms_dispatch_budget(owner_gateway_id,sim_id,dispatched_at)")
         db.execSQL("CREATE TABLE sms_redactions (message_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL)")
+        createSmsArchiveTables(db)
         db.execSQL("""CREATE TABLE call_ledger (
             call_id TEXT PRIMARY KEY, sim_id TEXT NOT NULL, mapping_revision INTEGER NOT NULL,
             direction TEXT NOT NULL, state TEXT NOT NULL, owner_gateway_id TEXT,
@@ -172,6 +186,27 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             db.execSQL("ALTER TABLE inbox ADD COLUMN source TEXT NOT NULL DEFAULT 'broadcast'")
             createSmsProviderRecoveryTables(db)
         }
+        if (oldVersion < 6) {
+            db.execSQL("ALTER TABLE inbox ADD COLUMN archive_gateway_id TEXT")
+            db.execSQL("ALTER TABLE inbox ADD COLUMN archive_source TEXT NOT NULL DEFAULT 'gsm2sip:server-api:unknown'")
+            db.execSQL("ALTER TABLE inbox ADD COLUMN archive_sim_label TEXT")
+            db.execSQL("ALTER TABLE commands ADD COLUMN archive_source TEXT NOT NULL DEFAULT 'gsm2sip:server-api:unknown'")
+            createSmsArchiveTables(db)
+        }
+    }
+
+    private fun createSmsArchiveTables(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS sms_archive_options (singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1), enabled INTEGER NOT NULL DEFAULT 0)")
+        db.execSQL("INSERT OR IGNORE INTO sms_archive_options(singleton_id,enabled) VALUES(1,0)")
+        db.execSQL("""CREATE TABLE IF NOT EXISTS sms_archive_history (
+            id TEXT PRIMARY KEY, source TEXT NOT NULL, owner_id TEXT, gateway_id TEXT,
+            owner_gateway_id TEXT,
+            message_id TEXT, sim_id TEXT, sim_label TEXT, direction TEXT NOT NULL,
+            from_address TEXT, to_address TEXT, body TEXT NOT NULL,
+            created_at INTEGER NOT NULL, status TEXT NOT NULL, observed_at INTEGER NOT NULL,
+            slot_index INTEGER, subscription_id INTEGER, part_count INTEGER
+        )""")
+        db.execSQL("CREATE INDEX IF NOT EXISTS sms_archive_history_message ON sms_archive_history(owner_gateway_id,message_id,direction)")
     }
 
     private fun createSmsProviderRecoveryTables(db: SQLiteDatabase) {
@@ -214,9 +249,13 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         simId: String?,
         mappingRevision: Long?,
         resolution: String,
-        source: String = "broadcast"
+        source: String = "broadcast",
+        simLabel: String? = null
     ): Event {
         require(source == "broadcast" || source == "recovered")
+        // Read credentials before taking SQLite's write lock. Other ingestion
+        // paths hold the credential identity monitor before opening this DB.
+        val archiveIdentity = archiveIdentity(appContext)
         fun persistForCurrentDatabaseOwner(): Event {
             val db = writableDatabase
             db.beginTransaction()
@@ -226,6 +265,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                     val event = getEvent(db, prior.getString(0))
                     prior.close()
                     if (event != null) {
+                        archiveExistingInbox(db, archiveIdentity, event.eventId)
                         db.setTransactionSuccessful()
                         return event
                     }
@@ -236,6 +276,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                     .put("text", body).put("parts", partCount).toString()
                 val event = insertEvent(db, eventId, receivedAt, "sms.received", simId,
                     mappingRevision, payload)
+                val archiveSource = archiveSourceFor(archiveIdentity, event.ownerGatewayId, activeOwnerFor(db))
                 val values = ContentValues().apply {
                     put("message_id", messageId); put("event_id", eventId)
                     put("sender", sender); put("recipient", recipient); put("body", body)
@@ -244,8 +285,17 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                     if (simId == null) putNull("sim_id") else put("sim_id", simId)
                     if (mappingRevision == null) putNull("mapping_revision") else put("mapping_revision", mappingRevision)
                     put("sub_id", subId); put("slot_index", slotIndex); put("resolution", resolution)
+                    if (event.ownerGatewayId == null) putNull("archive_gateway_id")
+                    else put("archive_gateway_id", event.ownerGatewayId)
+                    put("archive_source", archiveSource)
+                    if (simLabel == null) putNull("archive_sim_label") else put("archive_sim_label", simLabel)
                 }
                 db.insertOrThrow("inbox", null, values)
+                archiveInbound(
+                    db, archiveIdentity, event.ownerGatewayId, messageId, sender, recipient,
+                    body, receivedAt, partCount, simId, simLabel, subId, slotIndex,
+                    "received", System.currentTimeMillis(), archiveSource
+                )
                 db.setTransactionSuccessful()
                 return event
             } finally { db.endTransaction() }
@@ -413,6 +463,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         require(expectedCursor >= 0)
         require(rows.size <= SmsProviderRecovery.MAX_PAGE_SIZE)
         require(rows.all { it.rowId > expectedCursor && it.providerIdentity.matches(Regex("[0-9a-f]{64}")) })
+        val archiveIdentity = archiveIdentity(appContext)
         val db = writableDatabase
         db.beginTransaction()
         try {
@@ -453,10 +504,12 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                     eventId = broadcast.first
                     messageId = broadcast.second
                     matched++
+                    archiveExistingInbox(db, archiveIdentity, eventId)
                 } else {
                     messageId = providerMessageId(ownerGatewayId, sessionScope, row.providerIdentity)
                     eventId = UUID.randomUUID().toString()
                     val at = row.receivedAt.takeIf { it > 0 } ?: now
+                    val archiveSource = archiveSourceFor(archiveIdentity, ownerGatewayId, activeOwnerFor(db))
                     val payload = JSONObject().put("message_id", messageId).put("from", row.sender)
                         .put("text", row.body).put("parts", 1).toString()
                     insertEvent(db, eventId, at, "sms.received", row.simId, row.mappingRevision,
@@ -470,7 +523,16 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                         else put("mapping_revision", row.mappingRevision)
                         put("sub_id", row.subscriptionId); put("slot_index", row.slotIndex)
                         put("resolution", row.resolution); put("source", "recovered")
+                        put("archive_gateway_id", ownerGatewayId)
+                        put("archive_source", archiveSource)
+                        if (row.simLabel == null) putNull("archive_sim_label")
+                        else put("archive_sim_label", row.simLabel)
                     })
+                    archiveInbound(
+                        db, archiveIdentity, ownerGatewayId, messageId, row.sender, row.recipient,
+                        row.body, at, 1, row.simId, row.simLabel, row.subscriptionId,
+                        row.slotIndex, "received", now, archiveSource
+                    )
                     imported++
                 }
                 db.insertOrThrow("sms_provider_imports", null, ContentValues().apply {
@@ -627,18 +689,37 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
      * content so retries can never resurrect a delivered message. */
     fun acknowledgeEvents(eventIds: Collection<String>) {
         if (eventIds.isEmpty()) return
+        val archiveIdentity = archiveIdentity(appContext)
         val db = writableDatabase
         db.beginTransaction()
         try {
             eventIds.forEach { id ->
-                val messageId = db.rawQuery("SELECT type,payload FROM events WHERE event_id=?", arrayOf(id)).use { c ->
-                    if (!c.moveToFirst()) null else {
-                        val type = c.getString(0)
-                        val payload = runCatching { JSONObject(c.getString(1)) }.getOrNull()
-                        if (type in setOf("sms.received", "sms.dispatching", "sms.command_state", "sms.part_state"))
-                            payload?.optString("message_id")?.takeIf { it.isNotBlank() }
-                        else null
-                    }
+                val event = db.rawQuery(
+                    "SELECT type,payload,owner_gateway_id,occurred_at,sim_id FROM events WHERE event_id=?",
+                    arrayOf(id)
+                ).use { c -> if (!c.moveToFirst()) null else Event(
+                    id, 0L, c.getLong(3), c.getString(0), c.getStringOrNull(4), null,
+                    c.getString(1), c.getStringOrNull(2)
+                ) }
+                val payload = event?.let { runCatching { JSONObject(it.payload) }.getOrNull() }
+                val messageId = payload?.optString("message_id")?.takeIf { it.isNotBlank() }
+                if (event?.type == "sms.received" && messageId != null) {
+                    // A user may enable retention after receipt but before the server ACK.
+                    // Preserve the still-present body just before normal redaction.
+                    val inbox = db.rawQuery(
+                        """SELECT sender,recipient,body,received_at,parts,sim_id,sub_id,slot_index,
+                            archive_gateway_id,archive_source,archive_sim_label FROM inbox WHERE event_id=?""",
+                        arrayOf(id)
+                    ).use { c -> if (!c.moveToFirst()) null else IncomingArchiveData(
+                        c.getString(0), c.getString(1), c.getString(2), c.getLong(3), c.getInt(4),
+                        c.getStringOrNull(5), c.getInt(6), c.getInt(7), c.getStringOrNull(8),
+                        c.getString(9), c.getStringOrNull(10)
+                    ) }
+                    if (inbox != null && inbox.body.isNotEmpty()) archiveInbound(
+                        db, archiveIdentity, inbox.archiveGatewayId, messageId, inbox.sender, inbox.recipient,
+                        inbox.body, inbox.receivedAt, inbox.parts, inbox.simId, inbox.simLabel,
+                        inbox.subscriptionId, inbox.slotIndex, "received", System.currentTimeMillis(), inbox.archiveSource
+                    )
                 }
                 if (messageId != null) db.insertWithOnConflict("sms_redactions", null, ContentValues().apply {
                     put("message_id", messageId); put("created_at", System.currentTimeMillis())
@@ -657,6 +738,330 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
     fun completeSmsRedaction(messageId: String) {
         writableDatabase.delete("sms_redactions", "message_id=?", arrayOf(messageId))
     }
+
+    /** The opt-in is persisted beside the archive table and defaults to off on every install. */
+    fun smsArchiveRetentionEnabled(): Boolean = readableDatabase.rawQuery(
+        "SELECT enabled FROM sms_archive_options WHERE singleton_id=1", null
+    ).use { it.moveToFirst() && it.getInt(0) != 0 }
+
+    fun setSmsArchiveRetentionEnabled(enabled: Boolean) {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            db.execSQL("UPDATE sms_archive_options SET enabled=? WHERE singleton_id=1", arrayOf(if (enabled) 1 else 0))
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
+
+    /** Stream one consistent, read-only snapshot without holding SQLite's writer transaction. */
+    fun smsArchiveSnapshot(): Sequence<SmsArchiveRecord> {
+        // Ensure first-install creation/migrations have run before opening the independent reader.
+        readableDatabase
+        val identity = archiveIdentity(appContext)
+        val readOnly = SQLiteDatabase.openDatabase(
+            appContext.getDatabasePath("gateway-data.db").absolutePath,
+            null,
+            SQLiteDatabase.OPEN_READONLY or SQLiteDatabase.NO_LOCALIZED_COLLATORS
+        )
+        return SmsArchiveSnapshotSequence(readOnly, identity)
+    }
+
+    private data class ArchiveIdentity(val currentOwner: String?, val currentSource: String)
+    private data class IncomingArchiveData(
+        val sender: String, val recipient: String, val body: String, val receivedAt: Long,
+        val parts: Int, val simId: String?, val subscriptionId: Int, val slotIndex: Int,
+        val archiveGatewayId: String?, val archiveSource: String, val simLabel: String?
+    )
+
+    private inner class SmsArchiveSnapshotSequence(
+        private val db: SQLiteDatabase,
+        private val identity: ArchiveIdentity
+    ) : Sequence<SmsArchiveRecord>, Closeable {
+        private var iteratorCreated = false
+        private var cursor: Cursor? = null
+        private var closed = false
+        private var prefetched: SmsArchiveRecord? = null
+        private var hasPrefetched = false
+
+        override fun iterator(): Iterator<SmsArchiveRecord> {
+            check(!iteratorCreated) { "Gateway archive snapshot is a one-shot sequence" }
+            check(!closed) { "Gateway archive snapshot is closed" }
+            iteratorCreated = true
+            try {
+                cursor = db.rawQuery(ARCHIVE_SNAPSHOT_QUERY, null)
+            } catch (error: Throwable) {
+                close()
+                throw error
+            }
+            return object : Iterator<SmsArchiveRecord> {
+                override fun hasNext(): Boolean = advance()
+                override fun next(): SmsArchiveRecord {
+                    if (!advance()) throw NoSuchElementException()
+                    hasPrefetched = false
+                    return checkNotNull(prefetched).also { prefetched = null }
+                }
+            }
+        }
+
+        private fun advance(): Boolean {
+            if (hasPrefetched) return true
+            if (closed) return false
+            try {
+                if (Thread.currentThread().isInterrupted) {
+                    throw java.util.concurrent.CancellationException("Archive snapshot cancelled")
+                }
+                val current = checkNotNull(cursor)
+                if (!current.moveToNext()) {
+                    close()
+                    return false
+                }
+                prefetched = when (current.getInt(18)) {
+                    0 -> current.toSmsArchiveRecord()
+                    1 -> archiveRecord(
+                        identity, current.getStringOrNull(3), current.getStringOrNull(20),
+                        current.getString(5), "inbound", current.getStringOrNull(9),
+                        current.getStringOrNull(10), current.getString(11), current.getLong(12),
+                        current.getString(13), current.getIntOrNull(17), current.getStringOrNull(6),
+                        current.getStringOrNull(7), current.getIntOrNull(16), current.getIntOrNull(15),
+                        current.getLong(14), current.getStringOrNull(1)
+                    )
+                    else -> archiveRecord(
+                        identity, current.getStringOrNull(3), current.getStringOrNull(20),
+                        current.getString(5), "outbound", null, current.getStringOrNull(10),
+                        current.getString(11), current.getLong(12), current.getString(13),
+                        current.getIntOrNull(17), current.getStringOrNull(6), null, null, null,
+                        current.getLong(14), current.getStringOrNull(1)
+                    )
+                }
+                hasPrefetched = true
+                return true
+            } catch (error: Throwable) {
+                close()
+                throw error
+            }
+        }
+
+        override fun close() {
+            if (closed) return
+            closed = true
+            runCatching { cursor?.close() }
+            cursor = null
+            runCatching { db.close() }
+        }
+    }
+
+    /** Capture identity before opening a DB transaction to avoid a credential-lock/DB-lock cycle. */
+    private fun archiveIdentity(context: Context): ArchiveIdentity {
+        val session = runCatching { CredentialStore.load(context) }.getOrNull()
+        return ArchiveIdentity(session?.gatewayId, session?.let { sanitizedApiSource(it.controlBaseUrl) }
+            ?: "gsm2sip:server-api:unknown")
+    }
+
+    private fun archiveSourceFor(
+        identity: ArchiveIdentity,
+        ownerGatewayId: String?,
+        activeDatabaseOwner: String?
+    ): String = if (ownerGatewayId != null && ownerGatewayId == identity.currentOwner &&
+        ownerGatewayId == activeDatabaseOwner) identity.currentSource
+    else "gsm2sip:server-api:unknown"
+
+    /** Only the API origin is source metadata. Userinfo, paths, queries, and fragments are omitted. */
+    private fun sanitizedApiSource(raw: String): String {
+        val uri = runCatching { Uri.parse(raw) }.getOrNull()
+            ?: return "gsm2sip:server-api:unknown"
+        val scheme = uri.scheme?.lowercase()?.takeIf { it == "https" || it == "http" }
+            ?: return "gsm2sip:server-api:unknown"
+        val host = uri.host?.takeIf { it.isNotBlank() }?.lowercase()
+            ?: return "gsm2sip:server-api:unknown"
+        val authority = buildString {
+            if (host.contains(':') && !host.startsWith("[")) append('[').append(host).append(']') else append(host)
+            if (uri.port >= 0) append(":${uri.port}")
+        }
+        return "gsm2sip:server-api:$scheme://$authority"
+    }
+
+    private fun archiveRecord(
+        identity: ArchiveIdentity,
+        ownerGatewayId: String?,
+        activeDatabaseOwner: String?,
+        messageId: String,
+        direction: String,
+        from: String?,
+        to: String?,
+        body: String,
+        createdAt: Long,
+        status: String,
+        partCount: Int?,
+        simId: String?,
+        simLabel: String?,
+        subscriptionId: Int?,
+        slotIndex: Int?,
+        observedAt: Long,
+        sourceOverride: String? = null,
+    ): SmsArchiveRecord {
+        val source = sourceOverride ?: archiveSourceFor(identity, ownerGatewayId, activeDatabaseOwner)
+        return SmsArchiveRecord(
+            id = SmsArchiveCodec.stableId(source, null, ownerGatewayId, "$direction:$messageId"),
+            source = source,
+            ownerId = null,
+            gatewayId = ownerGatewayId,
+            messageId = messageId,
+            simId = simId,
+            simLabel = simLabel,
+            direction = direction,
+            from = from,
+            to = to,
+            body = body,
+            createdAt = createdAt,
+            status = status,
+            observedAt = observedAt,
+            slotIndex = slotIndex?.takeIf { it >= 0 },
+            subscriptionId = subscriptionId?.takeIf { it >= 0 },
+            partCount = partCount,
+        )
+    }
+
+    private fun archiveInbound(
+        db: SQLiteDatabase,
+        identity: ArchiveIdentity,
+        ownerId: String?,
+        messageId: String,
+        sender: String,
+        recipient: String,
+        body: String,
+        receivedAt: Long,
+        partCount: Int,
+        simId: String?,
+        simLabel: String?,
+        subscriptionId: Int?,
+        slotIndex: Int?,
+        status: String,
+        observedAt: Long,
+        sourceOverride: String? = null,
+    ) = bestEffortArchive {
+        upsertArchiveRecord(db, archiveRecord(
+            identity, ownerId, activeOwnerFor(db), messageId, "inbound", sender, recipient, body, receivedAt, status,
+            partCount, simId, simLabel, subscriptionId, slotIndex, observedAt, sourceOverride
+        ))
+    }
+
+    private fun archiveOutbound(
+        db: SQLiteDatabase,
+        identity: ArchiveIdentity,
+        ownerId: String?,
+        messageId: String,
+        sender: String?,
+        recipient: String,
+        body: String,
+        createdAt: Long,
+        status: String,
+        partCount: Int,
+        simId: String?,
+        simLabel: String?,
+        subscriptionId: Int?,
+        slotIndex: Int?,
+        observedAt: Long,
+        sourceOverride: String? = null,
+    ) = bestEffortArchive {
+        upsertArchiveRecord(db, archiveRecord(
+            identity, ownerId, activeOwnerFor(db), messageId, "outbound", sender, recipient, body, createdAt, status,
+            partCount, simId, simLabel, subscriptionId, slotIndex, observedAt, sourceOverride
+        ))
+    }
+
+    private inline fun bestEffortArchive(write: () -> Unit) {
+        try {
+            write()
+        } catch (error: Exception) {
+            // Retention is a side archive. It must not hold up ACK handling or command dispatch.
+            Log.w(TAG, "Could not update retained SMS archive", error)
+        }
+    }
+
+    /** Existing rows keep their first body and immutable origin; later transitions only advance status. */
+    private fun upsertArchiveRecord(db: SQLiteDatabase, record: SmsArchiveRecord) {
+        val priorQuery = if (record.gatewayId == null) {
+            db.rawQuery(
+                "SELECT id,observed_at FROM sms_archive_history WHERE owner_gateway_id IS NULL AND message_id=? AND direction=? LIMIT 1",
+                arrayOf(record.messageId, record.direction)
+            )
+        } else {
+            db.rawQuery(
+                "SELECT id,observed_at FROM sms_archive_history WHERE owner_gateway_id=? AND message_id=? AND direction=? LIMIT 1",
+                arrayOf(record.gatewayId, record.messageId, record.direction)
+            )
+        }
+        val prior = priorQuery.use { c -> if (c.moveToFirst()) c.getString(0) to c.getLong(1) else null }
+            ?: if (record.gatewayId != null) db.rawQuery(
+                "SELECT id,observed_at FROM sms_archive_history WHERE owner_gateway_id IS NULL AND source='gsm2sip:server-api:unknown' AND message_id=? AND direction=? LIMIT 1",
+                arrayOf(record.messageId, record.direction)
+            ).use { c -> if (c.moveToFirst()) c.getString(0) to c.getLong(1) else null } else null
+        if (prior != null) {
+            if (record.observedAt >= prior.second) db.update("sms_archive_history", ContentValues().apply {
+                put("status", record.status); put("observed_at", record.observedAt)
+                put("part_count", record.partCount)
+            }, "id=?", arrayOf(prior.first))
+            return
+        }
+        // A blank Command.text from a body already cleared by the legacy retention boundary is
+        // not recoverable. Never create a misleading empty archive row for it.
+        if (record.direction == "outbound" && record.body.isEmpty()) return
+        val enabled = db.rawQuery(
+            "SELECT enabled FROM sms_archive_options WHERE singleton_id=1", null
+        ).use { it.moveToFirst() && it.getInt(0) != 0 }
+        if (!enabled) return
+        db.insertOrThrow("sms_archive_history", null, record.toContentValues())
+    }
+
+    private fun archiveExistingInbox(db: SQLiteDatabase, identity: ArchiveIdentity, eventId: String) {
+        try {
+            val data = db.rawQuery(
+                """SELECT i.message_id,i.sender,i.recipient,i.body,i.received_at,i.parts,i.sim_id,
+                    i.sub_id,i.slot_index,i.archive_gateway_id,i.archive_source,i.archive_sim_label
+                    FROM inbox i JOIN events e ON e.event_id=i.event_id
+                    WHERE i.event_id=?""", arrayOf(eventId)
+            ).use { c -> if (!c.moveToFirst()) null else ExistingInboxArchive(
+                c.getString(0), c.getString(1), c.getString(2), c.getString(3), c.getLong(4),
+                c.getInt(5), c.getStringOrNull(6), c.getInt(7), c.getInt(8), c.getStringOrNull(9),
+                c.getString(10), c.getStringOrNull(11)
+            ) } ?: return
+            if (data.body.isNotEmpty()) archiveInbound(
+                db, identity, data.archiveGatewayId, data.messageId, data.sender, data.recipient, data.body,
+                data.receivedAt, data.parts, data.simId, data.simLabel, data.subscriptionId, data.slotIndex,
+                "received", System.currentTimeMillis(), data.archiveSource
+            )
+        } catch (error: Exception) {
+            Log.w(TAG, "Could not archive recovered SMS", error)
+        }
+    }
+
+    private data class ExistingInboxArchive(
+        val messageId: String, val sender: String, val recipient: String, val body: String,
+        val receivedAt: Long, val parts: Int, val simId: String?, val subscriptionId: Int,
+        val slotIndex: Int, val archiveGatewayId: String?, val archiveSource: String, val simLabel: String?
+    )
+
+    private fun SmsArchiveRecord.toContentValues() = ContentValues().apply {
+        put("id", id); put("source", source); putNull("owner_id"); put("gateway_id", gatewayId)
+        put("owner_gateway_id", gatewayId)
+        put("message_id", messageId); put("sim_id", simId); put("sim_label", simLabel)
+        put("direction", direction); put("from_address", from); put("to_address", to); put("body", body)
+        put("created_at", createdAt); put("status", status); put("observed_at", observedAt)
+        if (slotIndex == null) putNull("slot_index") else put("slot_index", slotIndex)
+        if (subscriptionId == null) putNull("subscription_id") else put("subscription_id", subscriptionId)
+        if (partCount == null) putNull("part_count") else put("part_count", partCount)
+    }
+
+    private fun Cursor.toSmsArchiveRecord() = SmsArchiveRecord(
+        id = getString(0), source = getString(1), ownerId = getStringOrNull(2),
+        gatewayId = getStringOrNull(3), messageId = getStringOrNull(5), simId = getStringOrNull(6),
+        simLabel = getStringOrNull(7), direction = getString(8), from = getStringOrNull(9),
+        to = getStringOrNull(10), body = getString(11), createdAt = getLong(12),
+        status = getString(13), observedAt = getLong(14), slotIndex = getIntOrNull(15),
+        subscriptionId = getIntOrNull(16), partCount = getIntOrNull(17)
+    )
+
+    private fun Cursor.getIntOrNull(index: Int): Int? = if (isNull(index)) null else getInt(index)
 
     fun nextSequence(): Long = readableDatabase.rawQuery(
         "SELECT value FROM meta WHERE key='sequence'", null
@@ -758,6 +1163,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         if (command.ownerGatewayId != requiredGatewayId || !isActiveGateway(requiredGatewayId)) {
             return InsertCommandResult.CONFLICT
         }
+        val archiveIdentity = archiveIdentity(appContext)
         val db = writableDatabase
         db.beginTransaction()
         try {
@@ -774,6 +1180,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             }
             prior.close()
             val now = System.currentTimeMillis()
+            val archiveSource = archiveSourceFor(archiveIdentity, requiredGatewayId, activeOwnerFor(db))
             val values = ContentValues().apply {
                 put("command_id", command.commandId); put("message_id", command.messageId)
                 put("sim_id", command.simId); put("mapping_revision", command.mappingRevision)
@@ -781,32 +1188,38 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                 put("part_count", command.partCount); put("expires_at", command.expiresAt)
                 put("state", "claimed"); put("payload_hash", command.payloadHash)
                 put("owner_gateway_id", requiredGatewayId)
+                put("archive_source", archiveSource)
                 put("created_at", now); put("updated_at", now)
             }
             db.insertOrThrow("commands", null, values)
+            archiveOutbound(
+                db, archiveIdentity, requiredGatewayId, command.messageId, null, command.to,
+                command.text, now, "claimed", command.partCount, command.simId, null,
+                null, null, now, archiveSource
+            )
             db.setTransactionSuccessful()
             return InsertCommandResult.INSERTED
         } finally { db.endTransaction() }
     }
 
     fun command(commandId: String, requiredGatewayId: String? = null): Command? = readableDatabase.rawQuery(
-        "SELECT command_id,message_id,sim_id,mapping_revision,recipient,body,part_count,expires_at,state,payload_hash,owner_gateway_id FROM commands WHERE command_id=?" +
+        "SELECT command_id,message_id,sim_id,mapping_revision,recipient,body,part_count,expires_at,state,payload_hash,owner_gateway_id,created_at,archive_source FROM commands WHERE command_id=?" +
             if (requiredGatewayId == null) "" else " AND owner_gateway_id=?",
         if (requiredGatewayId == null) arrayOf(commandId) else arrayOf(commandId, requiredGatewayId)
     ).use { c -> if (!c.moveToFirst()) null else Command(
         c.getString(0), c.getString(1), c.getString(2), c.getLong(3),
         c.getString(4).orEmpty(), c.getString(5).orEmpty(), c.getInt(6),
-        c.getLong(7), c.getString(8), c.getString(9), c.getStringOrNull(10)
+        c.getLong(7), c.getString(8), c.getString(9), c.getStringOrNull(10), c.getLong(11), c.getString(12)
     ) }
 
     fun commandForMessage(messageId: String, requiredGatewayId: String? = null): Command? = readableDatabase.rawQuery(
-        "SELECT command_id,message_id,sim_id,mapping_revision,recipient,body,part_count,expires_at,state,payload_hash,owner_gateway_id FROM commands WHERE message_id=?" +
+        "SELECT command_id,message_id,sim_id,mapping_revision,recipient,body,part_count,expires_at,state,payload_hash,owner_gateway_id,created_at,archive_source FROM commands WHERE message_id=?" +
             if (requiredGatewayId == null) "" else " AND owner_gateway_id=?",
         if (requiredGatewayId == null) arrayOf(messageId) else arrayOf(messageId, requiredGatewayId)
     ).use { c -> if (!c.moveToFirst()) null else Command(
         c.getString(0), c.getString(1), c.getString(2), c.getLong(3),
         c.getString(4).orEmpty(), c.getString(5).orEmpty(), c.getInt(6), c.getLong(7),
-        c.getString(8), c.getString(9), c.getStringOrNull(10)
+        c.getString(8), c.getString(9), c.getStringOrNull(10), c.getLong(11), c.getString(12)
     ) }
 
     /** Set SmsManager.divideMessage's count before crossing the durable
@@ -825,6 +1238,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
     /** Atomic one-way transition. Once dispatching is committed, reboot
      * recovery marks the result unknown and never submits the same SMS again. */
     fun beginDispatch(commandId: String): DispatchStartResult {
+        val archiveIdentity = archiveIdentity(appContext)
         val db = writableDatabase
         db.beginTransaction()
         try {
@@ -864,6 +1278,11 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                 .put("command_id", command.commandId).put("part_count", command.partCount).toString()
             insertEvent(db, UUID.randomUUID().toString(), System.currentTimeMillis(),
                 "sms.dispatching", command.simId, command.mappingRevision, dispatchPayload, command.ownerGatewayId)
+            archiveOutbound(
+                db, archiveIdentity, command.ownerGatewayId, command.messageId, null, command.to,
+                command.text, command.createdAt, "dispatching",
+                command.partCount, command.simId, null, null, null, now, command.archiveSource
+            )
             db.setTransactionSuccessful()
             return DispatchStartResult.STARTED
         } finally { db.endTransaction() }
@@ -887,6 +1306,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
     ): Boolean {
         val allowed = setOf("submitted", "delivered", "failed", "unknown", "expired")
         require(state in allowed)
+        val archiveIdentity = archiveIdentity(appContext)
         val db = writableDatabase
         db.beginTransaction()
         try {
@@ -920,6 +1340,11 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                 // Body may be removed after callbacks are durably represented by journal events.
                 db.execSQL("UPDATE commands SET recipient=NULL,body=NULL WHERE command_id=?", arrayOf(commandId))
             }
+            archiveOutbound(
+                db, archiveIdentity, command.ownerGatewayId, command.messageId, null, command.to,
+                command.text, command.createdAt, terminal, command.partCount, command.simId,
+                null, null, null, System.currentTimeMillis(), command.archiveSource
+            )
             db.setTransactionSuccessful()
             return true
         } finally { db.endTransaction() }
@@ -928,6 +1353,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
     /** At process startup, any dispatching command has crossed the durable
      * handoff boundary. Whether binder reached the modem cannot be known. */
     fun recoverUnknownDispatches(): Int {
+        val archiveIdentity = archiveIdentity(appContext)
         val db = writableDatabase
         db.beginTransaction()
         try {
@@ -946,6 +1372,11 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                 unresolved.forEach { addPartEvent(db, cmd, it, "unknown", null, "process_restarted_during_dispatch") }
                 db.execSQL("INSERT OR REPLACE INTO tombstones(entity_id,kind,final_state,created_at) VALUES(?,?,?,?)",
                     arrayOf(cmd.messageId, "sms.command", "unknown", System.currentTimeMillis()))
+                archiveOutbound(
+                    db, archiveIdentity, cmd.ownerGatewayId, cmd.messageId, null, cmd.to,
+                    cmd.text, cmd.createdAt, "unknown", cmd.partCount, cmd.simId,
+                    null, null, null, System.currentTimeMillis(), cmd.archiveSource
+                )
             }
             db.setTransactionSuccessful()
             return rows.size
@@ -954,6 +1385,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
 
     fun markCommandTerminal(commandId: String, state: String, error: String = ""): Boolean {
         require(state in setOf("failed", "expired", "unknown"))
+        val archiveIdentity = archiveIdentity(appContext)
         val db = writableDatabase
         db.beginTransaction()
         try {
@@ -967,6 +1399,11 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                 .put("state", state).apply { if (error.isNotEmpty()) put("error", error) }.toString()
             insertEvent(db, UUID.randomUUID().toString(), System.currentTimeMillis(), "sms.command_state",
                 c.simId, c.mappingRevision, payload, c.ownerGatewayId)
+            archiveOutbound(
+                db, archiveIdentity, c.ownerGatewayId, c.messageId, null, c.to,
+                c.text, c.createdAt, state, c.partCount, c.simId, null,
+                null, null, System.currentTimeMillis(), c.archiveSource
+            )
             db.setTransactionSuccessful()
             return true
         } finally { db.endTransaction() }
@@ -1038,7 +1475,42 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
     companion object {
         private const val SMS_PER_MINUTE_LIMIT = 5
         private const val SMS_PER_HOUR_LIMIT = 30
-        private const val VERSION = 5
+        private const val TAG = "GatewayDatabase"
+        private const val VERSION = 6
+        private const val ARCHIVE_COLUMNS = "id,source,owner_id,gateway_id,owner_gateway_id,message_id,sim_id,sim_label," +
+            "direction,from_address,to_address,body,created_at,status,observed_at,slot_index,subscription_id,part_count"
+        private val ARCHIVE_SNAPSHOT_QUERY = """
+            SELECT id,source,owner_id,gateway_id,owner_gateway_id,message_id,sim_id,sim_label,
+                direction,from_address,to_address,body,created_at,status,observed_at,slot_index,
+                subscription_id,part_count,0 AS row_kind,owner_gateway_id AS row_owner,
+                (SELECT value FROM gateway_identity WHERE key='gateway_id') AS database_owner
+            FROM sms_archive_history
+            UNION ALL
+            SELECT NULL,i.archive_source,NULL,i.archive_gateway_id,i.archive_gateway_id,
+                i.message_id,i.sim_id,i.archive_sim_label,
+                'inbound',i.sender,i.recipient,i.body,i.received_at,'received',e.created_at,
+                CASE WHEN i.slot_index>=0 THEN i.slot_index ELSE NULL END,
+                CASE WHEN i.sub_id>=0 THEN i.sub_id ELSE NULL END,
+                i.parts,1 AS row_kind,i.archive_gateway_id AS row_owner,
+                (SELECT value FROM gateway_identity WHERE key='gateway_id') AS database_owner
+            FROM inbox i JOIN events e ON e.event_id=i.event_id
+            WHERE e.acked=0 AND i.body!=''
+                AND NOT EXISTS (SELECT 1 FROM sms_archive_history h
+                    WHERE h.message_id=i.message_id AND h.direction='inbound'
+                    AND (h.owner_gateway_id IS i.archive_gateway_id OR
+                        (h.owner_gateway_id IS NULL AND h.source='gsm2sip:server-api:unknown')))
+            UNION ALL
+            SELECT NULL,c.archive_source,NULL,c.owner_gateway_id,c.owner_gateway_id,c.message_id,c.sim_id,NULL,
+                'outbound',NULL,c.recipient,c.body,c.created_at,c.state,c.updated_at,
+                NULL,NULL,c.part_count,2 AS row_kind,c.owner_gateway_id AS row_owner,
+                (SELECT value FROM gateway_identity WHERE key='gateway_id') AS database_owner
+            FROM commands c WHERE c.recipient IS NOT NULL AND c.body IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM sms_archive_history h
+                    WHERE h.message_id=c.message_id AND h.direction='outbound'
+                    AND (h.owner_gateway_id IS c.owner_gateway_id OR
+                        (h.owner_gateway_id IS NULL AND h.source='gsm2sip:server-api:unknown')))
+            ORDER BY created_at,message_id,id
+        """.trimIndent()
         @Volatile private var instance: GatewayDatabase? = null
         fun get(context: Context): GatewayDatabase = instance ?: synchronized(this) {
             instance ?: GatewayDatabase(context).also { instance = it }

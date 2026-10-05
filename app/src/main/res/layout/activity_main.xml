@@ -157,6 +157,15 @@
                     android:paddingTop="8dp"
                     android:paddingBottom="2dp" />
 
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnHomeSmsBackup"
+                    style="?attr/materialButtonOutlinedStyle"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:text="短信备份与归档"
+                    android:textAllCaps="false"
+                    android:layout_marginTop="8dp" />
+
                 <!-- Filter chips -->
                 <LinearLayout
                     android:layout_width="match_parent"
@@ -633,6 +642,15 @@
                             android:textColor="?attr/colorOnSurfaceVariant"
                             android:paddingTop="2dp"
                             android:paddingBottom="14dp" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnCfgSmsBackup"
+                            style="?attr/materialButtonOutlinedStyle"
+                            android:layout_width="match_parent"
+                            android:layout_height="48dp"
+                            android:text="短信备份与归档"
+                            android:textAllCaps="false"
+                            android:layout_marginBottom="12dp" />
 
                         <TextView
                             android:layout_width="match_parent"

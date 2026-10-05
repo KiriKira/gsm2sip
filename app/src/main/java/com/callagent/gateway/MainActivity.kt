@@ -409,6 +409,7 @@ class MainActivity : AppCompatActivity() {
         }
         findViewById<View>(R.id.btnConfigBack).setOnClickListener { switchTab("home") }
         findViewById<View>(R.id.btnCfgSave).setOnClickListener { saveConfigFromView() }
+        findViewById<View>(R.id.btnCfgSmsBackup).setOnClickListener { openSmsBackup() }
         findViewById<MaterialButton>(R.id.btnStartGatewayDiagnostics)
             .setOnClickListener { openGatewayDiagnostics() }
         findViewById<View>(R.id.btnCfgClearRecents).setOnClickListener { confirmClearRecents() }
@@ -475,6 +476,7 @@ class MainActivity : AppCompatActivity() {
         tvNetMobile.setOnClickListener { showLinkDetails(mobile = true) }
         tvNetWifi.setOnClickListener { showLinkDetails(mobile = false) }
         findViewById<View>(R.id.btnHomeMenu).setOnClickListener { openConfigView() }
+        findViewById<View>(R.id.btnHomeSmsBackup).setOnClickListener { openSmsBackup() }
         // Tapping the status pill retries the connection, the way the old
         // settings screen's reconnect button did.
         tvHomeStatusPill.setOnClickListener {
@@ -1584,6 +1586,10 @@ class MainActivity : AppCompatActivity() {
         })
 
         switchTab("config")
+    }
+
+    private fun openSmsBackup() {
+        startActivity(Intent(this, com.callagent.gateway.backup.GatewaySmsBackupActivity::class.java))
     }
 
     /**

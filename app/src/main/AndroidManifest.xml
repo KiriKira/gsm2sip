@@ -62,6 +62,8 @@
     <application
         android:name=".GatewayApp"
         android:allowBackup="false"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
@@ -92,6 +94,12 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".backup.GatewaySmsBackupActivity"
+            android:exported="false"
+            android:label="短信备份与归档"
+            android:resizeableActivity="true" />
 
         <!-- InCallService: intercepts and controls GSM calls -->
         <service

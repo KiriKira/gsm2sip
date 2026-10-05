@@ -47,7 +47,8 @@ class SmsReceiver : BroadcastReceiver() {
         val event = GatewayDatabase.get(context).recordIncomingSms(
             messageId = now, sender = sender, recipient = ownNumber, body = text,
             receivedAt = receivedAt, partCount = messages.size, subId = subId, slotIndex = slot,
-            simId = simId, mappingRevision = revision, resolution = mappingState
+            simId = simId, mappingRevision = revision, resolution = mappingState,
+            simLabel = candidate?.displayName?.takeIf { it.isNotBlank() }
         )
         CallLogStore.addEntry(context, CallLogEntry(
             direction = "IN", number = sender, timestamp = receivedAt, durationSec = 0,

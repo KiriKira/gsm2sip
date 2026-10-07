@@ -1,5 +1,7 @@
 # Magisk 模块验证环境调研
 
+实际采用的 GitHub Actions + KVM AVD 如何启动、下载结果、停止和复用，见 [Android 虚拟机使用指南](android-virtual-machine.md)。本页保留环境比较与详细验收证据。
+
 ## 最新实测结果（2026-10-05）
 
 [GitHub Actions run 37247032002](https://github.com/KiriKira/gsm2sip/actions/runs/37247032002) 对提交 `88fbadff2b59b28f95e7e6b27fd171381b34dcd7` 完成了 40/40 项检查。环境为远端 KVM、API 34 非 Play Store `google_apis` x86_64，使用下文固定的 rootAVD 和官方 Magisk v30.7。

@@ -14,6 +14,7 @@
 按用户要求，本批后续增加 [Magisk 通用适配](docs/magisk-runtime.md)：模块探测、受限账户 broker 和本地数字音频配置，不再按机型自动选 preset 或以 API 31 作为整体语音门槛。
 
 Magisk 模块的模拟器选择与启动阶段验证见 [验证环境比较](docs/magisk-validation-options.md)。推荐使用 KVM AVD 验证模块挂载和启动脚本；Waydroid 的第三方 Magisk 集成仍需单独验收。
+实际采用方案的启动、停止、截图下载与费用说明见 [Android 虚拟机使用指南](docs/android-virtual-machine.md)。
 两端已增加 [Material 3 Expressive 与后台运行设置](docs/android-ui-and-background.md)，WSS 唤醒配合 HTTPS 补齐；ARI、主机内置 SIP SDK 和 Telecom 已落代码；FCM、完整切网续话及真机持续运行仍待完成。
 短信不再以 SIP MESSAGE 作为生产执行通道。不确定发送保留 `unknown`，不能自动重发或回落默认 SIM。
 

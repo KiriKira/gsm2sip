@@ -4,6 +4,10 @@
 [wire addendum](https://github.com/KiriKira/gsm2sip-server/blob/8b83ae8f613fd7f27ea8e4f3aa1b2148f22c1606/docs/server-wire-addendum.md)、
 [OpenAPI](https://github.com/KiriKira/gsm2sip-server/blob/8b83ae8f613fd7f27ea8e4f3aa1b2148f22c1606/openapi/openapi.yaml) 与
 [fixture](https://github.com/KiriKira/gsm2sip-server/tree/8b83ae8f613fd7f27ea8e4f3aa1b2148f22c1606/fixtures/api)。
+可选心跳扩展 `sim_radio` 见 server 提交 `f7a5e6fd66f6036fe09761290f97cd1b806eaad4`
+（分支 `claude/dual-sim-remote-control-82i2og`）：服务器在心跳响应 `extensions` 中声明后，
+网关才在每卡状态里附带信号格数、网络制式、运营商和漫游；旧服务器不受影响，服务器回滚后以
+`INVALID_JSON` 拒绝时网关自动忘记该扩展并改发旧格式。
 原计划仍是三个仓库的完整验收目标；首批完成 M1/M2 短信基础，后续按
 用户要求增加 [Magisk 通用能力适配](magisk-runtime.md)，继续推进通话基础。
 

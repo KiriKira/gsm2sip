@@ -559,13 +559,13 @@ class Smoke:
         else:
             status_node = self.find_node(root, "tvControlStatus")
             status_text = status_node.attrib.get("text", "").strip() if status_node is not None else ""
-            if status_text != "Not paired":
+            if status_text != "未配对":
                 self.record("unpaired_scope", "fail",
-                            "gateway is not in the unpaired state; current control-pairing status was not 'Not paired'")
+                            "gateway is not in the unpaired state; current control-pairing status was not '未配对'")
                 raise RuntimeError("gateway is not on its unpaired control-pairing form")
         self.record("unpaired_scope", "pass",
                     "host HTTPS pairing form" if self.args.scenario == "host"
-                    else "gateway Control server pairing form reports Not paired")
+                    else "gateway Control server pairing form reports 未配对")
         code_id = "pairing_code" if self.args.scenario == "host" else "etControlPairingCode"
         code_node = self.find_node(root, code_id)
         code_hint = "一次性配对码" if self.args.scenario == "host" else "Paste code from server CLI"

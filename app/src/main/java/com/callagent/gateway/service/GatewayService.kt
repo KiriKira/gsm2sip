@@ -26,11 +26,13 @@ import com.callagent.gateway.background.GatewayBackgroundPolicy
 import com.callagent.gateway.background.GatewayBackgroundRuntime
 import com.callagent.gateway.net.ControlApiClient
 import com.callagent.gateway.net.ControlApiException
+import com.callagent.gateway.net.ControlExtensions
 import com.callagent.gateway.net.HeartbeatSim
 import com.callagent.gateway.net.ServerCommand
 import com.callagent.gateway.net.WakeConnection
 import com.callagent.gateway.net.WakeConnectionPolicy
 import com.callagent.gateway.net.WakeSessionIdentity
+import com.callagent.gateway.sim.RadioTelemetry
 import com.callagent.gateway.sim.SimRegistry
 import com.callagent.gateway.sms.LegacySmsMigration
 import com.callagent.gateway.sms.SmsSender
@@ -940,11 +942,16 @@ class GatewayService : Service() {
         // bounded page per round prevents a large inbox delaying heartbeat.
         runCatching { com.callagent.gateway.sms.SmsProviderRecovery.scan(this) }
         val snapshot = SimRegistry.snapshot(this)
+        val radioAccepted = ControlExtensions.accepts(this, session.gatewayId, session.controlBaseUrl,
+            RadioTelemetry.EXTENSION)
         val sims = snapshot.mappings
             .map { mapping ->
                 HeartbeatSim(mapping.simId, mapping.mappingRevision,
                     serviceStateFor(mapping.subscriptionId),
-                    identityVerified = mapping.identityState != SimRegistry.IdentityState.UNVERIFIED)
+                    identityVerified = mapping.identityState != SimRegistry.IdentityState.UNVERIFIED,
+                    radio = if (radioAccepted) runCatching {
+                        RadioTelemetry.read(this, mapping.subscriptionId)
+                    }.getOrNull() else null)
             }
         val battery = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val level = battery?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
@@ -960,6 +967,14 @@ class GatewayService : Service() {
         val heartbeatResult = try {
             client.heartbeat(org.json.JSONObject(heartbeat.second))
         } catch (e: ControlApiException) {
+            if (e.code == "INVALID_JSON" && heartbeat.second.contains("\"radio\"")) {
+                // The server no longer accepts optional telemetry (for example
+                // after a rollback). Drop this body and send a plain one next round.
+                ControlExtensions.forget(this, session.gatewayId, session.controlBaseUrl)
+                database.discardHeartbeat(session.gatewayId, heartbeat.first)
+                throw ControlApiException("HEARTBEAT_EXTENSION_REJECTED",
+                    "Server rejected optional SIM radio telemetry; retrying without it", retryable = true)
+            }
             if (e.code == "SIM_MAPPING_CHANGED") {
                 val remote = client.serverSimSnapshot()
                 SimRegistry.invalidateAllAtServerRevision(this, remote.mappingRevision)
@@ -970,6 +985,7 @@ class GatewayService : Service() {
         SimRegistry.applyHeartbeatInvalidation(this, heartbeatResult.mappingRevision,
             heartbeatResult.invalidatedSimIds)
         database.completeHeartbeat(session.gatewayId, heartbeat.first)
+        ControlExtensions.record(this, session.gatewayId, session.controlBaseUrl, heartbeatResult.extensions)
 
         val events = database.pendingEvents(session.gatewayId, 50)
         if (events.isNotEmpty()) {

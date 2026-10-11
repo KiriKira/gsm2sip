@@ -232,6 +232,41 @@
                         android:layout_height="wrap_content"
                         android:orientation="vertical">
 
+                    <!-- Guided setup: pairing, SIM binding, background and the
+                         optional voice path, each with one next action. -->
+                    <com.google.android.material.card.MaterialCardView
+                        android:id="@+id/setupChecklistCard"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginBottom="12dp"
+                        app:cardBackgroundColor="?attr/colorSurfaceContainerLow"
+                        app:cardElevation="0dp"
+                        app:strokeColor="?attr/colorOutlineVariant"
+                        app:strokeWidth="1dp">
+
+                        <LinearLayout
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:orientation="vertical"
+                            android:padding="16dp">
+
+                            <TextView
+                                android:id="@+id/tvSetupHeadline"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:text="完成设置"
+                                android:textAppearance="?attr/textAppearanceTitleMedium"
+                                android:textColor="?attr/colorOnSurface" />
+
+                            <LinearLayout
+                                android:id="@+id/llSetupSteps"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:layout_marginTop="4dp"
+                                android:orientation="vertical" />
+                        </LinearLayout>
+                    </com.google.android.material.card.MaterialCardView>
+
                     <com.google.android.material.card.MaterialCardView
                         android:id="@+id/backgroundStatusCard"
                         android:layout_width="match_parent"
@@ -576,13 +611,13 @@
                         android:src="@drawable/ic_arrow_back"
                         android:scaleType="centerInside"
                         android:background="@drawable/input_bg"
-                        android:contentDescription="Back" />
+                        android:contentDescription="返回" />
 
                     <TextView
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
                         android:layout_weight="1"
-                        android:text="Settings"
+                        android:text="设置"
                         android:textSize="20sp"
                         android:textStyle="bold"
                         android:textColor="?attr/colorOnSurface"
@@ -598,7 +633,7 @@
                         android:src="@drawable/ic_logs"
                         android:scaleType="centerInside"
                         android:background="@drawable/input_bg"
-                        android:contentDescription="Logs" />
+                        android:contentDescription="日志" />
                 </LinearLayout>
 
                 <ScrollView
@@ -653,33 +688,29 @@
                             android:layout_marginBottom="12dp" />
 
                         <TextView
-                            android:layout_width="match_parent"
-                            android:layout_height="wrap_content"
-                            android:text="Control server pairing"
-                            android:textColor="?attr/colorOnSurface"
-                            android:textStyle="bold"
-                            android:textSize="16sp"
-                            android:paddingTop="8dp" />
+                            style="@style/CfgSection"
+                            android:layout_marginTop="8dp"
+                            android:text="中转服务器" />
 
-                        <TextView style="@style/CfgLabel" android:text="HTTPS control server" />
+                        <TextView style="@style/CfgLabel" android:text="服务器地址（HTTPS）" />
                         <com.google.android.material.textfield.TextInputEditText
                             android:id="@+id/etControlUrl"
                             style="@style/CfgField"
                             android:hint="https://your-server.example"
                             android:inputType="textUri" />
 
-                        <TextView style="@style/CfgLabel" android:text="Device name" />
+                        <TextView style="@style/CfgLabel" android:text="设备名称" />
                         <com.google.android.material.textfield.TextInputEditText
                             android:id="@+id/etControlDeviceName"
                             style="@style/CfgField"
-                            android:hint="Old Android phone"
+                            android:hint="旧手机"
                             android:inputType="textCapWords" />
 
-                        <TextView style="@style/CfgLabel" android:text="One-time pairing code" />
+                        <TextView style="@style/CfgLabel" android:text="一次性配对码" />
                         <com.google.android.material.textfield.TextInputEditText
                             android:id="@+id/etControlPairingCode"
                             style="@style/CfgField"
-                            android:hint="Paste code from server CLI"
+                            android:hint="粘贴服务器生成的 gateway 配对码"
                             android:saveEnabled="false"
                             android:inputType="textPassword" />
 
@@ -687,7 +718,7 @@
                             android:id="@+id/btnControlPair"
                             android:layout_width="match_parent"
                             android:layout_height="48dp"
-                            android:text="PAIR GATEWAY"
+                            android:text="配对网关"
                             android:textStyle="bold"
                             android:textColor="?attr/colorOnPrimaryContainer"
                             app:backgroundTint="?attr/colorPrimaryContainer"
@@ -700,45 +731,19 @@
                             android:id="@+id/tvControlStatus"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="Not paired"
+                            android:text="未配对"
                             android:textColor="?attr/colorOnSurfaceVariant"
                             android:textSize="12sp"
                             android:paddingTop="8dp" />
 
                         <TextView
-                            android:id="@+id/tvSmsRecoveryStatus"
-                            android:layout_width="match_parent"
-                            android:layout_height="wrap_content"
-                            android:text="短信补收：未启用。允许读取系统收件箱后，可补回应用未运行时已存入系统的短信。"
-                            android:textColor="?attr/colorOnSurfaceVariant"
-                            android:textSize="13sp"
-                            android:paddingTop="12dp" />
-                        <com.google.android.material.button.MaterialButton
-                            android:id="@+id/btnConfigureServerSip"
-                            style="?attr/materialButtonOutlinedStyle"
-                            android:layout_width="match_parent"
-                            android:layout_height="wrap_content"
-                            android:text="从服务器配置 SIP 语音"
-                            android:textAllCaps="false" />
-                        <com.google.android.material.button.MaterialButton
-                            android:id="@+id/btnEnableSmsRecovery"
-                            style="?attr/materialButtonOutlinedStyle"
-                            android:layout_width="match_parent"
-                            android:layout_height="wrap_content"
-                            android:text="启用短信补收"
-                            android:textAllCaps="false" />
-                        <com.google.android.material.button.MaterialButton
-                            android:id="@+id/btnScanSmsRecovery"
-                            style="?attr/materialButtonOutlinedStyle"
-                            android:layout_width="match_parent"
-                            android:layout_height="wrap_content"
-                            android:text="立即补收并同步"
-                            android:textAllCaps="false" />
-
+                            style="@style/CfgSection"
+                            android:layout_marginTop="20dp"
+                            android:text="SIM 卡" />
                         <TextView
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="SIM UUIDs come from the server. Each SIM is activated only after you confirm its local slot here. ICCID and IMSI values are never uploaded."
+                            android:text="SIM 身份由服务器分配。每张卡只有在这里核对卡槽并确认后才会启用；ICCID 与 IMSI 不会上传。"
                             android:textSize="12sp"
                             android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
@@ -747,7 +752,7 @@
                             android:id="@+id/btnSimPropose"
                             android:layout_width="match_parent"
                             android:layout_height="48dp"
-                            android:text="SYNC SIM LIST"
+                            android:text="同步 SIM 列表"
                             android:textAllCaps="false"
                             android:textColor="?attr/colorOnSurface"
                             app:backgroundTint="?attr/colorSurfaceContainerHigh"
@@ -767,7 +772,7 @@
                             android:id="@+id/btnSimConfirm"
                             android:layout_width="match_parent"
                             android:layout_height="48dp"
-                            android:text="CONFIRM SELECTED SIMS"
+                            android:text="确认所选 SIM"
                             android:textAllCaps="false"
                             android:textColor="?attr/colorOnSurface"
                             app:backgroundTint="?attr/colorSurfaceContainerHigh"
@@ -777,30 +782,87 @@
                             android:insetTop="0dp"
                             android:insetBottom="0dp" />
 
+                        <TextView
+                            style="@style/CfgSection"
+                            android:layout_marginTop="20dp"
+                            android:text="远程通话" />
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnConfigureServerSip"
+                            style="?attr/materialButtonOutlinedStyle"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="从服务器配置 SIP 语音"
+                            android:textAllCaps="false" />
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="通话需要 root/Magisk 与可用的通话音频路由。配置后请在首页运行设备诊断再启动；仅收发短信可跳过。"
+                            android:textSize="12sp"
+                            android:textColor="?attr/colorOutline"
+                            android:paddingTop="6dp" />
+                        <TextView
+                            style="@style/CfgSection"
+                            android:layout_marginTop="20dp"
+                            android:text="短信" />
+                        <TextView
+                            android:id="@+id/tvSmsRecoveryStatus"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="短信补收：未启用。允许读取系统收件箱后，可补回应用未运行时已存入系统的短信。"
+                            android:textColor="?attr/colorOnSurfaceVariant"
+                            android:textSize="13sp"
+                            android:paddingTop="12dp" />
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnEnableSmsRecovery"
+                            style="?attr/materialButtonOutlinedStyle"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="启用短信补收"
+                            android:textAllCaps="false" />
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnScanSmsRecovery"
+                            style="?attr/materialButtonOutlinedStyle"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="立即补收并同步"
+                            android:textAllCaps="false" />
+
                         <View
                             android:layout_width="match_parent"
                             android:layout_height="1dp"
                             android:background="?attr/colorSurfaceContainerHigh"
                             android:layout_marginTop="18dp"
                             android:layout_marginBottom="10dp" />
+                        <TextView
+                            style="@style/CfgSection"
+                            android:layout_marginTop="24dp"
+                            android:text="高级：SIP 与通话音频" />
 
-                        <TextView style="@style/CfgLabel" android:text="SIP Server" />
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="通常由“从服务器配置 SIP 语音”自动填写。仅在调试或自建非标准 SIP 服务器时手动修改。"
+                            android:textSize="12sp"
+                            android:textColor="?attr/colorOutline"
+                            android:paddingTop="4dp" />
+
+                        <TextView style="@style/CfgLabel" android:text="SIP 服务器" />
                         <com.google.android.material.textfield.TextInputEditText android:id="@+id/etCfgServer" style="@style/CfgField"
-                            android:hint="SIP host (optional)" android:inputType="textUri" />
+                            android:hint="SIP 主机（可选）" android:inputType="textUri" />
 
-                        <TextView style="@style/CfgLabel" android:text="SIP Port" />
+                        <TextView style="@style/CfgLabel" android:text="SIP 端口" />
                         <com.google.android.material.textfield.TextInputEditText android:id="@+id/etCfgPort" style="@style/CfgField"
                             android:hint="5061" android:inputType="number" />
 
-                        <TextView style="@style/CfgLabel" android:text="SIP Username" />
+                        <TextView style="@style/CfgLabel" android:text="SIP 用户名" />
                         <com.google.android.material.textfield.TextInputEditText android:id="@+id/etCfgUser" style="@style/CfgField"
-                            android:hint="extension" android:inputType="text" />
+                            android:hint="分机号" android:inputType="text" />
 
-                        <TextView style="@style/CfgLabel" android:text="SIP Password" />
+                        <TextView style="@style/CfgLabel" android:text="SIP 密码" />
                         <com.google.android.material.textfield.TextInputEditText android:id="@+id/etCfgPass" style="@style/CfgField"
-                            android:hint="password" android:saveEnabled="false" android:inputType="textPassword" />
+                            android:hint="密码" android:saveEnabled="false" android:inputType="textPassword" />
 
-                        <TextView style="@style/CfgLabel" android:text="Own Number (SIM)" />
+                        <TextView style="@style/CfgLabel" android:text="本机号码（每张 SIM）" />
                         <!-- One field per active SIM, built at runtime: the
                              slots a device has, and which of them hold a live
                              SIM, are only knowable on the device. -->
@@ -813,12 +875,12 @@
                         <TextView
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="Sent as the SIP destination so the server can map the call to an assistant. Without it the gateway addresses its own extension and the call loops back."
+                            android:text="呼入时作为 SIP 目标号码，让服务器识别是哪张卡接到的电话。留空时网关会呼叫自己的分机，可能形成回环。"
                             android:textSize="12sp"
                             android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
 
-                        <TextView style="@style/CfgLabel" android:text="Audio Codec" />
+                        <TextView style="@style/CfgLabel" android:text="音频编码" />
 
                         <RadioGroup
                             android:id="@+id/rgCfgCodec"
@@ -832,7 +894,7 @@
                                 android:layout_width="match_parent"
                                 android:layout_height="wrap_content"
                                 android:minHeight="48dp"
-                                android:text="G.722 only — wideband 16 kHz (recommended)"
+                                android:text="仅 G.722 · 16 kHz 宽带（推荐）"
                                     android:textColor="?attr/colorOnSurfaceVariant" />
 
                             <com.google.android.material.radiobutton.MaterialRadioButton
@@ -840,7 +902,7 @@
                                 android:layout_width="match_parent"
                                 android:layout_height="wrap_content"
                                 android:minHeight="48dp"
-                                android:text="G.722 preferred, G.711 allowed"
+                                android:text="优先 G.722，允许 G.711"
                                     android:textColor="?attr/colorOnSurfaceVariant" />
 
                             <com.google.android.material.radiobutton.MaterialRadioButton
@@ -848,19 +910,19 @@
                                 android:layout_width="match_parent"
                                 android:layout_height="wrap_content"
                                 android:minHeight="48dp"
-                                android:text="G.711 only — narrowband 8 kHz"
+                                android:text="仅 G.711 · 8 kHz 窄带"
                                     android:textColor="?attr/colorOnSurfaceVariant" />
                         </RadioGroup>
 
                         <TextView
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="Offering G.711 alongside G.722 usually means the server picks G.711 and every call is narrowband, which is why G.722 alone is the default."
+                            android:text="同时提供 G.711 时服务器通常会选 G.711，导致通话变成窄带，因此默认只提供 G.722。"
                             android:textSize="12sp"
                             android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
 
-                        <TextView style="@style/CfgLabel" android:text="Agent Volume" />
+                        <TextView style="@style/CfgLabel" android:text="对方听到的音量" />
 
                         <LinearLayout
                             android:layout_width="match_parent"
@@ -893,7 +955,7 @@
                         <TextView
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="How loud the agent is to the GSM caller. 0 is what the detected device asks for; each step roughly a third louder or quieter. Raise it if callers say the agent is faint, lower it if the line distorts."
+                            android:text="蜂窝通话另一方听到的音量。0 为设备默认值，每一级约增减三分之一。对方说声音小就调高，出现失真就调低。"
                             android:textSize="12sp"
                             android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
@@ -912,14 +974,14 @@
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:minHeight="48dp"
-                            android:text="Use STUN"
+                            android:text="使用 STUN"
                             android:textColor="?attr/colorOnSurfaceVariant"
                             android:layout_marginTop="8dp" />
 
                         <TextView
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="Finds the public IP so SIP and RTP survive NAT. Turn off for a SIP server on the local network."
+                            android:text="探测公网地址以穿越 NAT。服务器在局域网内时关闭。"
                             android:textSize="12sp"
                             android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
@@ -929,14 +991,14 @@
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:minHeight="48dp"
-                            android:text="Enable TLS"
+                            android:text="SIP 使用 TLS"
                             android:textColor="?attr/colorOnSurfaceVariant"
                             android:layout_marginTop="8dp" />
 
                         <TextView
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="Encrypts SIP signalling — registration, calls and SMS text. Call audio (RTP) is not encrypted either way. The server must offer TLS, usually on port 5061."
+                            android:text="生产模式强制使用经证书校验的 TLS（通常为 5061 端口）加密 SIP 信令；通话音频由下方 SRTP 加密。"
                             android:textSize="12sp"
                             android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
@@ -946,7 +1008,7 @@
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:minHeight="48dp"
-                            android:text="Encrypt audio (SRTP)"
+                            android:text="通话音频加密（SRTP）"
                             android:textColor="?attr/colorOnSurfaceVariant"
                             android:layout_marginTop="8dp" />
 
@@ -954,7 +1016,7 @@
                             android:id="@+id/tvCfgSrtpHint"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="SDES-keyed SRTP (RFC 3711). Requires TLS: the keys travel inside the SIP signalling, so over plain UDP they would be readable by anyone on the path."
+                            android:text="SDES 密钥协商的 SRTP（RFC 3711）。密钥随 SIP 信令传输，因此必须配合 TLS。"
                             android:textSize="12sp"
                             android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
@@ -964,14 +1026,14 @@
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:minHeight="48dp"
-                            android:text="ASCII-only outgoing SMS"
+                            android:text="发送短信前转写为 ASCII"
                             android:textColor="?attr/colorOnSurfaceVariant"
                             android:layout_marginTop="8dp" />
 
                         <TextView
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="Rewrites accents before sending: für becomes fuer. Turn on if umlauts arrive mangled. Cyrillic, Hebrew, Arabic and other non-Latin text is never rewritten — it is sent as-is."
+                            android:text="发送前把带重音的拉丁字母转成 ASCII（如 für → fuer），用于对方收到乱码的情况。中文、西里尔文等非拉丁文字不会被改写。"
                             android:textSize="12sp"
                             android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
@@ -981,7 +1043,7 @@
                             android:layout_width="wrap_content"
                             android:layout_gravity="center_horizontal"
                             android:layout_height="48dp"
-                            android:text="CLEAR RECENTS"
+                            android:text="清除最近记录"
                             android:textSize="12sp"
                             android:paddingStart="20dp"
                             android:paddingEnd="20dp"
@@ -998,7 +1060,7 @@
                             android:id="@+id/btnCfgSave"
                             android:layout_width="match_parent"
                             android:layout_height="52dp"
-                            android:text="SAVE"
+                            android:text="保存"
                             android:textStyle="bold"
                             android:textColor="?attr/colorOnPrimaryContainer"
                             app:backgroundTint="?attr/colorPrimaryContainer"
@@ -1033,7 +1095,7 @@
                         android:src="@drawable/ic_arrow_back"
                         android:scaleType="centerInside"
                         android:background="@drawable/input_bg"
-                        android:contentDescription="Back" />
+                        android:contentDescription="返回" />
 
                     <TextView
                         android:layout_width="0dp"

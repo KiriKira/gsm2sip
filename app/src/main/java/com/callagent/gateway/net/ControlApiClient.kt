@@ -4,6 +4,8 @@ import android.content.Context
 import com.callagent.gateway.BuildConfig
 import com.callagent.gateway.data.CredentialStore
 import com.callagent.gateway.data.GatewayDatabase
+import com.callagent.gateway.sim.RadioSnapshot
+import com.callagent.gateway.sim.RadioTelemetry
 import com.callagent.gateway.sim.SimRegistry
 import org.json.JSONArray
 import org.json.JSONObject
@@ -24,8 +26,19 @@ data class ServerCommand(
     val to: String, val text: String, val expiresAt: Long, val expiresAtWire: String,
     val payloadSha256: String, val state: String, val gatewayId: String
 )
-data class HeartbeatSim(val simId: String, val mappingRevision: Long, val serviceState: String, val identityVerified: Boolean)
-data class HeartbeatResult(val mappingRevision: Long, val invalidatedSimIds: List<String>)
+data class HeartbeatSim(
+    val simId: String,
+    val mappingRevision: Long,
+    val serviceState: String,
+    val identityVerified: Boolean,
+    /** Sent only when the server advertised [RadioTelemetry.EXTENSION]. */
+    val radio: RadioSnapshot? = null
+)
+data class HeartbeatResult(
+    val mappingRevision: Long,
+    val invalidatedSimIds: List<String>,
+    val extensions: Set<String> = emptySet()
+)
 data class ServerSimSnapshot(val mappingRevision: Long, val simIds: Set<String>)
 
 class ControlApiException(
@@ -126,9 +139,13 @@ class ControlApiClient(context: Context, baseUrl: String) {
     fun heartbeatBody(sequence: Long, root: Boolean, sipRegistered: Boolean, batteryPercent: Int?,
                       charging: Boolean, sims: List<HeartbeatSim>): JSONObject {
         val simArray = JSONArray()
-        sims.forEach { simArray.put(JSONObject().put("sim_id", it.simId)
-            .put("mapping_revision", it.mappingRevision).put("service_state", it.serviceState)
-            .put("identity_verified", it.identityVerified)) }
+        sims.forEach { sim ->
+            val item = JSONObject().put("sim_id", sim.simId)
+                .put("mapping_revision", sim.mappingRevision).put("service_state", sim.serviceState)
+                .put("identity_verified", sim.identityVerified)
+            sim.radio?.let { item.put("radio", it.toJson()) }
+            simArray.put(item)
+        }
         val body = JSONObject().put("sequence", sequence).put("protocol_version", 1)
             .put("app_version", BuildConfig.VERSION_NAME).put("root", root)
             .put("sip_registered", sipRegistered).put("charging", charging)
@@ -143,7 +160,9 @@ class ControlApiClient(context: Context, baseUrl: String) {
         val revision = response.optLong("mapping_revision", -1L)
         if (revision < 1) throw ControlApiException("INVALID_HEARTBEAT_RESPONSE", "服务器未返回有效 SIM revision")
         val invalidated = response.optJSONArray("invalidated_sim_ids") ?: JSONArray()
-        return HeartbeatResult(revision, (0 until invalidated.length()).map { invalidated.getString(it) })
+        val extensions = response.optJSONArray("extensions") ?: JSONArray()
+        return HeartbeatResult(revision, (0 until invalidated.length()).map { invalidated.getString(it) },
+            (0 until extensions.length()).mapNotNull { extensions.optString(it).takeIf(String::isNotBlank) }.toSet())
     }
 
     fun serverSimSnapshot(): ServerSimSnapshot {

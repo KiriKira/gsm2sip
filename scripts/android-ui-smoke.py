@@ -568,7 +568,7 @@ class Smoke:
                     else "gateway Control server pairing form reports 未配对")
         code_id = "pairing_code" if self.args.scenario == "host" else "etControlPairingCode"
         code_node = self.find_node(root, code_id)
-        code_hint = "一次性配对码" if self.args.scenario == "host" else "Paste code from server CLI"
+        code_hint = "一次性配对码" if self.args.scenario == "host" else "粘贴服务器生成的 gateway 配对码"
         if code_node is None:
             self.record("pairing_code_untouched", "blocked", "pairing code field is not exposed in the current UI hierarchy")
         elif (code_node.attrib.get("password", "false") != "true" or

@@ -7,7 +7,10 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import com.callagent.gateway.data.GatewayDatabase
+import com.callagent.gateway.mesh.JoinEntry
 import com.callagent.gateway.mesh.MeshPairing
+import com.callagent.gateway.mesh.MeshVoiceStatus
+import com.callagent.gateway.mesh.MeshVoiceStore
 import com.callagent.gateway.net.ControlApiException
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -49,11 +52,17 @@ class MeshNodesSection(
             }
             val column = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
             column.addView(text(node.label, secondary = false))
-            val status = when {
+            val sync = when {
                 node.lastError.isNotEmpty() -> "同步失败（${node.lastError}）"
                 node.lastSyncAt != null -> "已同步 · ${time.format(Date(node.lastSyncAt))}"
                 else -> "等待首次同步"
             }
+            val voice = when {
+                MeshVoiceStatus.registered(activity, node.gatewayId) -> "通话已注册"
+                MeshVoiceStore.account(activity, node.gatewayId) != null -> "通话已开通，未注册"
+                else -> "仅短信"
+            }
+            val status = "$sync · $voice"
             column.addView(text(status, secondary = true))
             row.addView(column, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             row.addView(MaterialButton(activity, null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply {
@@ -101,6 +110,26 @@ class MeshNodesSection(
                 }, "mesh-add").start()
             }
             .show()
+    }
+
+    /** Add several nodes from a join link; reports one line per node. */
+    fun addAll(entries: List<JoinEntry>) {
+        if (entries.isEmpty()) return
+        Toast.makeText(activity, "正在添加 ${entries.size} 个节点…", Toast.LENGTH_SHORT).show()
+        Thread({
+            val lines = entries.map { entry ->
+                runCatching { MeshPairing.add(activity, entry.serverUrl, entry.pairingCode, deviceName()) }.fold(
+                    onSuccess = { "${it.host}：已添加" },
+                    onFailure = { error -> "${entry.serverUrl}：未添加（${(error as? ControlApiException)?.message ?: "无法连接该节点"}）" }
+                )
+            }
+            activity.runOnUiThread {
+                MaterialAlertDialogBuilder(activity).setTitle("加入节点").setMessage(lines.joinToString("\n"))
+                    .setPositiveButton("好", null).show()
+                render()
+                onChanged()
+            }
+        }, "mesh-join").start()
     }
 
     private fun confirmRemove(node: GatewayDatabase.MeshNode) {

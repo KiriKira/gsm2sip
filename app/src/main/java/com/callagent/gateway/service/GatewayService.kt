@@ -28,6 +28,7 @@ import com.callagent.gateway.net.ControlApiClient
 import com.callagent.gateway.net.ControlApiException
 import com.callagent.gateway.net.ControlExtensions
 import com.callagent.gateway.mesh.MeshCoordinator
+import com.callagent.gateway.mesh.MeshVoiceClients
 import com.callagent.gateway.mesh.MeshHeartbeatInputs
 import com.callagent.gateway.net.HeartbeatSim
 import com.callagent.gateway.net.ServerCommand
@@ -99,6 +100,7 @@ class GatewayService : Service() {
     private var cfgUser = ""
     private var cfgPass = ""
     private var currentLocalIp = ""
+    private var currentPublicIp = ""
 
     // ── Call tracking ───────────────────────────────────
     private var onlineSince = 0L
@@ -311,6 +313,7 @@ class GatewayService : Service() {
         updateNotification(NotifState.WARN, "Connecting")
 
         // Tear down existing client
+        meshVoice.stopAll(orchestrator)
         orchestrator?.stop()
         sipClient?.stop()
         orchestrator = null
@@ -566,6 +569,7 @@ class GatewayService : Service() {
             initializing.set(false)
             voiceRuntimeStarted = false
             refreshVoicePowerLease()
+            meshVoice.stopAll(orchestrator)
             orchestrator?.stop()
             sipClient?.stop()
             orchestrator = null
@@ -641,6 +645,12 @@ class GatewayService : Service() {
                     // Secondary nodes are served even when the primary is unreachable.
                     try {
                         withNetworkSyncWakeLock { meshCoordinator.syncAll(meshHeartbeatInputs()) }
+                        // Nodes added, removed or newly provisioned for voice.
+                        orchestrator?.let { orch ->
+                            if (voiceRuntimeStarted && currentLocalIp.isNotEmpty()) {
+                                meshVoice.reconcile(orch, currentLocalIp, currentPublicIp.ifEmpty { currentLocalIp })
+                            }
+                        }
                     } catch (_: Exception) {
                         broadcastLog("MESH: node sync failed; retrying next round")
                     }
@@ -1021,13 +1031,17 @@ class GatewayService : Service() {
         return percent to (status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL)
     }
 
+    private val meshVoice by lazy { MeshVoiceClients(this) { line -> broadcastLog(line) } }
+
     private val meshCoordinator by lazy {
         MeshCoordinator(this, ::processCommands) { line -> broadcastLog(line) }
     }
 
     private fun meshHeartbeatInputs(): MeshHeartbeatInputs {
         val (percent, charging) = batteryState()
-        return MeshHeartbeatInputs(RootShell.rootState() == "ok", percent, charging, ::serviceStateFor)
+        return MeshHeartbeatInputs(RootShell.rootState() == "ok", percent, charging, ::serviceStateFor,
+            voiceConfigured = voiceRuntimeStarted && cfgPass.isNotEmpty(),
+            sipRegisteredFor = { node -> meshVoice.registered(node) })
     }
 
     private fun serviceStateFor(subscriptionId: Int): String {
@@ -1313,6 +1327,7 @@ class GatewayService : Service() {
         }
 
         // Clean up any existing client before starting a new one
+        meshVoice.stopAll(orchestrator)
         orchestrator?.stop()
         sipClient?.stop()
         orchestrator = null
@@ -1423,6 +1438,7 @@ class GatewayService : Service() {
         sipClient?.let {
             Log.w(TAG, "initSipClient: stopping previous SIP client")
             broadcastLog("SIP: stopping previous client before rebind")
+            meshVoice.stopAll(orchestrator)
             orchestrator?.stop()
             it.stop()
             orchestrator = null
@@ -1453,6 +1469,7 @@ class GatewayService : Service() {
             null
         }
         val publicIp = stunResult?.publicIp ?: localIp
+        currentPublicIp = publicIp
         when {
             !useStun ->
                 broadcastLog("STUN off — direct SIP, advertising $localIp")
@@ -1600,6 +1617,8 @@ class GatewayService : Service() {
         }
         orchestrator = orch
         orch.start()
+        // Register with every mesh node that has a SIP endpoint for this gateway.
+        meshVoice.reconcile(orch, localIp, publicIp)
 
         sip.logListener = { msg -> broadcastLog("SIP: $msg") }
         // Production SMS commands are claimed only over HTTPS. SIP MESSAGE is migration-only.
@@ -1650,6 +1669,7 @@ class GatewayService : Service() {
         }
         onlineSince = 0L
         Log.i(TAG, "Stopping gateway")
+        meshVoice.stopAll(orchestrator)
         orchestrator?.stop()
         sipClient?.stop()
         orchestrator = null

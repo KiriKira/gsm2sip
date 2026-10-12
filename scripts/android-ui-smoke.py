@@ -99,25 +99,31 @@ class Smoke:
         time.sleep(seconds)
 
     def dismiss_foreign_anr(self, root: ET.Element, name: str) -> bool:
-        """Tap "Wait" on a system ANR dialog that belongs to another app.
+        """Close a system ANR dialog that belongs to another app.
 
         A cold emulator sometimes reports its own launcher as not
         responding; that dialog covers the app under test and is not this
-        app's failure. A dialog naming this app is never dismissed.
+        app's failure. "Wait" leaves a hung launcher hung and the dialog
+        returns, so "Close app" restarts that other app instead. A dialog
+        naming this app is never dismissed.
         """
-        wait_button = next((node for node in self.nodes(root)
-                            if node.attrib.get("resource-id", "") == "android:id/aerr_wait"), None)
+        buttons = {node.attrib.get("resource-id", ""): node for node in self.nodes(root)
+                   if node.attrib.get("resource-id", "") in ("android:id/aerr_close", "android:id/aerr_wait")}
+        # Element truthiness means "has children", so test for None explicitly.
+        wait_button = buttons.get("android:id/aerr_close")
+        if wait_button is None:
+            wait_button = buttons.get("android:id/aerr_wait")
         if wait_button is None:
             return False
         title = " ".join(node.attrib.get("text", "") for node in self.nodes(root)
                          if node.attrib.get("resource-id", "") in ("android:id/alertTitle", "android:id/message"))
         dismissed = getattr(self, "foreign_anr_dismissals", 0)
-        if "gsm2sip" in title.lower() or dismissed >= 3:
+        if "gsm2sip" in title.lower() or dismissed >= 6:
             return False
         self.foreign_anr_dismissals = dismissed + 1
         with (self.artifacts / "foreign_anr_dismissals.txt").open("a", encoding="utf-8") as log:
             log.write(f"{name}: {title.strip() or 'system ANR dialog'}\n")
-        self.tap_node(wait_button, f"foreign_anr_wait_{dismissed + 1}")
+        self.tap_node(wait_button, f"foreign_anr_close_{dismissed + 1}")
         self.wait(3)
         return True
 

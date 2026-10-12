@@ -131,7 +131,7 @@ class GatewayDatabaseTest {
             if (i < 5) assertEquals("minute allowance $i", GatewayDatabase.DispatchStartResult.STARTED, result)
             else assertEquals("sixth send inside one minute", GatewayDatabase.DispatchStartResult.RATE_LIMITED, result)
         }
-        insertClaimed(id("other-sim"), id("other-sim-msg"), parts = 1, simId = "sim-B")
+        insertClaimed(id("other-sim"), id("other-sim-msg"), parts = 1, simId = "sim-B-$runId")
         assertEquals("rate limits are independent for each SIM", GatewayDatabase.DispatchStartResult.STARTED,
             db.beginDispatch(id("other-sim")))
 
@@ -184,7 +184,7 @@ class GatewayDatabaseTest {
         assertEquals("WAL journal mode", "wal", journal.lowercase())
     }
 
-    private fun insertClaimed(commandId: String, messageId: String, parts: Int, simId: String = "sim-A") {
+    private fun insertClaimed(commandId: String, messageId: String, parts: Int, simId: String = "sim-A-$runId") {
         val command = GatewayDatabase.Command(
             commandId = commandId,
             messageId = messageId,

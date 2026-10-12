@@ -18,6 +18,10 @@ Magisk 模块的模拟器选择与启动阶段验证见 [验证环境比较](doc
 两端已增加 [Material 3 Expressive 与后台运行设置](docs/android-ui-and-background.md)，WSS 唤醒配合 HTTPS 补齐；ARI、主机内置 SIP SDK 和 Telecom 已落代码；FCM、完整切网续话及真机持续运行仍待完成。
 短信不再以 SIP MESSAGE 作为生产执行通道。不确定发送保留 `unknown`，不能自动重发或回落默认 SIM。
 
+## 多节点
+
+可同时连接多台独立服务器（例如家里的局域网机器和 VPS）：每条短信送到所有节点，主手机按节点优先级自动切换且不会重复收到；同一条短信无论经由哪个节点下发都只发送一次。见 [网关多节点说明](docs/mesh.md)。
+
 ## 短信模式无需 root
 
 只收发短信可直接安装普通 APK；启动只申请 `READ_PHONE_STATE`、`SEND_SMS`、

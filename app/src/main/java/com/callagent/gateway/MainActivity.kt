@@ -64,6 +64,7 @@ import com.callagent.gateway.service.GatewayService
 import com.callagent.gateway.background.GatewayBackgroundRuntime
 import com.callagent.gateway.sim.SimRegistry
 import com.callagent.gateway.ui.GatewaySetupCard
+import com.callagent.gateway.ui.MeshNodesSection
 import com.callagent.gateway.ui.GatewaySetupChecklist
 import com.callagent.gateway.sms.SmsOutbox
 import com.callagent.gateway.sms.SmsProviderRecovery
@@ -111,6 +112,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvNetWifi: TextView
     private lateinit var tvSimSummary: TextView
     private var setupCard: GatewaySetupCard? = null
+    private var meshNodesSection: MeshNodesSection? = null
     private var setupActiveSimCount = 0
     private var setupDetectedSimCount = 0
     private val netHandler = Handler(Looper.getMainLooper())
@@ -424,6 +426,13 @@ class MainActivity : AppCompatActivity() {
         findViewById<View>(R.id.btnConfigureServerSip).setOnClickListener { configureServerSip() }
         findViewById<View>(R.id.btnSimPropose).setOnClickListener { proposeSimBindings() }
         findViewById<View>(R.id.btnSimConfirm).setOnClickListener { confirmSimBindings() }
+        meshNodesSection = MeshNodesSection(this, findViewById(R.id.llMeshNodes), findViewById(R.id.btnMeshAdd),
+            deviceName = {
+                findViewById<EditText>(R.id.etControlDeviceName).text.toString().trim()
+                    .ifEmpty { android.os.Build.MODEL ?: "旧手机网关" }
+            },
+            onChanged = { GatewayService.startControl(this) }
+        ).also { it.render() }
         restoreControlUiState()
         restorePendingSimProposal()
         tvHomeStatusPill = findViewById(R.id.tvHomeStatusPill)
@@ -1672,6 +1681,7 @@ class MainActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(bar: SeekBar) {}
         })
 
+        meshNodesSection?.render()
         switchTab("config")
     }
 

@@ -27,6 +27,8 @@ import com.callagent.gateway.background.GatewayBackgroundRuntime
 import com.callagent.gateway.net.ControlApiClient
 import com.callagent.gateway.net.ControlApiException
 import com.callagent.gateway.net.ControlExtensions
+import com.callagent.gateway.mesh.MeshCoordinator
+import com.callagent.gateway.mesh.MeshHeartbeatInputs
 import com.callagent.gateway.net.HeartbeatSim
 import com.callagent.gateway.net.ServerCommand
 import com.callagent.gateway.net.WakeConnection
@@ -636,6 +638,12 @@ class GatewayService : Service() {
                             "Control sync failed; retrying in ${delaySeconds}s")
                         updateNotification(NotifState.WARN, "Gateway · retrying")
                     }
+                    // Secondary nodes are served even when the primary is unreachable.
+                    try {
+                        withNetworkSyncWakeLock { meshCoordinator.syncAll(meshHeartbeatInputs()) }
+                    } catch (_: Exception) {
+                        broadcastLog("MESH: node sync failed; retrying next round")
+                    }
                     if (!controlStop && !stopped && GatewayBackgroundRuntime.allowedRecovery(this@GatewayService)) {
                         controlWakeSignal.tryAcquire(nextRetryMs, TimeUnit.MILLISECONDS)
                     }
@@ -953,21 +961,18 @@ class GatewayService : Service() {
                         RadioTelemetry.read(this, mapping.subscriptionId)
                     }.getOrNull() else null)
             }
-        val battery = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        val level = battery?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-        val scale = battery?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
-        val batteryPercent = if (level >= 0 && scale > 0) (100 * level / scale).coerceIn(0, 100) else null
-        val status = battery?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
-        val charging = status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
+        val (batteryPercent, charging) = batteryState()
+        val installId = if (ControlExtensions.accepts(this, session.gatewayId, session.controlBaseUrl,
+                MeshCoordinator.MESH_EXTENSION)) database.installId() else null
 
         val heartbeat = database.prepareHeartbeatPayload(session.gatewayId) { sequence ->
             client.heartbeatBody(sequence, RootShell.rootState() == "ok",
-                sipClient?.registered == true, batteryPercent, charging, sims).toString()
+                sipClient?.registered == true, batteryPercent, charging, sims, installId).toString()
         }
         val heartbeatResult = try {
             client.heartbeat(org.json.JSONObject(heartbeat.second))
         } catch (e: ControlApiException) {
-            if (e.code == "INVALID_JSON" && heartbeat.second.contains("\"radio\"")) {
+            if (e.code == "INVALID_JSON" && (heartbeat.second.contains("\"radio\"") || heartbeat.second.contains("\"install_id\""))) {
                 // The server no longer accepts optional telemetry (for example
                 // after a rollback). Drop this body and send a plain one next round.
                 ControlExtensions.forget(this, session.gatewayId, session.controlBaseUrl)
@@ -987,6 +992,7 @@ class GatewayService : Service() {
         database.completeHeartbeat(session.gatewayId, heartbeat.first)
         ControlExtensions.record(this, session.gatewayId, session.controlBaseUrl, heartbeatResult.extensions)
 
+        database.emitAliasEvents(session.gatewayId)
         val events = database.pendingEvents(session.gatewayId, 50)
         if (events.isNotEmpty()) {
             val acked = client.uploadEvents(events)
@@ -1004,6 +1010,24 @@ class GatewayService : Service() {
             CallLogStore.redactSms(this, messageId)
             database.completeSmsRedaction(messageId)
         }
+    }
+
+    private fun batteryState(): Pair<Int?, Boolean> {
+        val battery = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val level = battery?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = battery?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+        val percent = if (level >= 0 && scale > 0) (100 * level / scale).coerceIn(0, 100) else null
+        val status = battery?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        return percent to (status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL)
+    }
+
+    private val meshCoordinator by lazy {
+        MeshCoordinator(this, ::processCommands) { line -> broadcastLog(line) }
+    }
+
+    private fun meshHeartbeatInputs(): MeshHeartbeatInputs {
+        val (percent, charging) = batteryState()
+        return MeshHeartbeatInputs(RootShell.rootState() == "ok", percent, charging, ::serviceStateFor)
     }
 
     private fun serviceStateFor(subscriptionId: Int): String {
@@ -1028,10 +1052,12 @@ class GatewayService : Service() {
 
     private fun processCommands(client: ControlApiClient, database: GatewayDatabase) {
         for (remote in client.listCommands()) {
-            if (!database.isActiveGateway(remote.gatewayId)) {
+            if (!database.isServingGateway(remote.gatewayId)) {
                 broadcastLog("SMS: command belongs to a previous gateway pairing; dispatch blocked")
                 continue
             }
+            // Another node already delivered this message_id: this command only mirrors it.
+            if (database.alias(remote.commandId)) continue
             var local = database.command(remote.commandId, remote.gatewayId)
                 ?: database.commandForMessage(remote.messageId, remote.gatewayId)
             if (local == null) {
@@ -1048,6 +1074,7 @@ class GatewayService : Service() {
                 } catch (e: ControlApiException) {
                     if (e.code !in setOf("COMMAND_EXPIRED", "SIM_MAPPING_CHANGED", "SIM_UNAVAILABLE")) throw e
                     val insert = database.insertClaimedCommand(remote.toLocalCommand(), remote.gatewayId)
+                    if (insert == GatewayDatabase.InsertCommandResult.ALIASED) continue
                     if (insert == GatewayDatabase.InsertCommandResult.CONFLICT) {
                         broadcastLog("SMS: command identity conflict; dispatch blocked")
                         continue
@@ -1060,6 +1087,10 @@ class GatewayService : Service() {
                     continue
                 }
                 val inserted = database.insertClaimedCommand(remote.toLocalCommand(), remote.gatewayId)
+                if (inserted == GatewayDatabase.InsertCommandResult.ALIASED) {
+                    broadcastLog("SMS: message already delivered through another node; mirroring its state only")
+                    continue
+                }
                 if (inserted == GatewayDatabase.InsertCommandResult.CONFLICT) {
                     broadcastLog("SMS: command identity conflict; dispatch blocked")
                     continue
@@ -1076,9 +1107,22 @@ class GatewayService : Service() {
         }
     }
 
+    /**
+     * Revision to resolve the command's SIM in the local registry. Primary
+     * commands use their own; a mesh node's command must match that node's
+     * current binding, and then resolves the same physical SIM at the
+     * primary revision. Null means the node binding is stale: fail closed.
+     */
+    private fun localResolveRevision(command: GatewayDatabase.Command, database: GatewayDatabase): Long? {
+        val owner = command.ownerGatewayId ?: return null
+        if (database.isActiveGateway(owner)) return command.mappingRevision
+        if (!database.meshRevisionIsCurrent(owner, command.simId, command.mappingRevision)) return null
+        return SimRegistry.snapshot(this).mappingRevision
+    }
+
     private fun dispatchCommand(command: GatewayDatabase.Command, database: GatewayDatabase) {
         val owner = command.ownerGatewayId
-        if (owner == null || !database.isActiveGateway(owner)) return
+        if (owner == null || !database.isServingGateway(owner)) return
         if (command.expiresAt <= System.currentTimeMillis()) {
             database.markCommandTerminal(command.commandId, "expired", "COMMAND_EXPIRED")
             return
@@ -1087,8 +1131,13 @@ class GatewayService : Service() {
             database.markCommandTerminal(command.commandId, "failed", "SEND_SMS_PERMISSION_DENIED")
             return
         }
+        val resolveRevision = localResolveRevision(command, database) ?: run {
+            database.markCommandTerminal(command.commandId, "failed", "SIM_MAPPING_CHANGED")
+            broadcastLog("SMS: node SIM binding is stale; dispatch blocked")
+            return
+        }
         val mapping = try {
-            SimRegistry.resolve(this, command.simId, command.mappingRevision)
+            SimRegistry.resolve(this, command.simId, resolveRevision)
         } catch (e: SimRegistry.SimMappingException) {
             database.markCommandTerminal(command.commandId, "failed", e.code.name)
             broadcastLog("SMS: SIM mapping validation failed (${e.code.name})")
@@ -1102,7 +1151,7 @@ class GatewayService : Service() {
             return
         }
         val beforeDispatch = try {
-            SimRegistry.resolve(this, command.simId, command.mappingRevision, mapping.localRevisionBarrier)
+            SimRegistry.resolve(this, command.simId, resolveRevision, mapping.localRevisionBarrier)
         } catch (e: SimRegistry.SimMappingException) {
             database.markCommandTerminal(command.commandId, "failed", e.code.name)
             return
@@ -1150,7 +1199,7 @@ class GatewayService : Service() {
             smsId = command.messageId, parts = prepared.parts.size, status = "pending"
         ))
         val finalMapping = try {
-            SimRegistry.resolve(this, command.simId, command.mappingRevision, mapping.localRevisionBarrier)
+            SimRegistry.resolve(this, command.simId, resolveRevision, mapping.localRevisionBarrier)
         } catch (e: SimRegistry.SimMappingException) {
             for (part in prepared.parts.indices) {
                 database.recordPartState(command.commandId, part, "failed", error = e.code.name)
@@ -1169,7 +1218,7 @@ class GatewayService : Service() {
             }
             return
         }
-        if (!database.isActiveGateway(owner)) return
+        if (!database.isServingGateway(owner)) return
         val invoked = SmsSender.dispatch(this, command.commandId, command.messageId,
             command.to, prepared)
         if (!invoked) {

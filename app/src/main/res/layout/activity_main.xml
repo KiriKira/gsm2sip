@@ -739,6 +739,34 @@
                         <TextView
                             style="@style/CfgSection"
                             android:layout_marginTop="20dp"
+                            android:text="其他节点" />
+
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="可再连接几台独立服务器（如家里的局域网机器和 VPS）。每条短信都会同时送到所有节点，主手机按节点优先级自动切换且不会重复收到；从任何节点发来的同一条短信只会发送一次。SIM 只需在上方主节点确认一次。"
+                            android:textSize="12sp"
+                            android:textColor="?attr/colorOutline"
+                            android:paddingTop="4dp" />
+
+                        <LinearLayout
+                            android:id="@+id/llMeshNodes"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:orientation="vertical"
+                            android:paddingTop="4dp" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnMeshAdd"
+                            style="?attr/materialButtonOutlinedStyle"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="添加节点"
+                            android:textAllCaps="false" />
+
+                        <TextView
+                            style="@style/CfgSection"
+                            android:layout_marginTop="20dp"
                             android:text="SIM 卡" />
                         <TextView
                             android:layout_width="match_parent"

@@ -4,6 +4,7 @@ import android.content.Context
 import com.callagent.gateway.BuildConfig
 import com.callagent.gateway.data.CredentialStore
 import com.callagent.gateway.data.GatewayDatabase
+import com.callagent.gateway.data.SessionSource
 import com.callagent.gateway.sim.RadioSnapshot
 import com.callagent.gateway.sim.RadioTelemetry
 import com.callagent.gateway.sim.SimRegistry
@@ -50,7 +51,12 @@ class ControlApiException(
 
 /** HTTPS-only client for the frozen v1 control/data plane. Calls are blocking;
  * callers run them on their IO executor. It never logs request or response data. */
-class ControlApiClient(context: Context, baseUrl: String) {
+class ControlApiClient(
+    context: Context,
+    baseUrl: String,
+    /** Session store for this server; the primary pairing unless a mesh node vault is given. */
+    private val sessions: SessionSource = CredentialStore
+) {
     private val app = context.applicationContext
     private val base = normalizeBase(baseUrl)
 
@@ -78,12 +84,36 @@ class ControlApiClient(context: Context, baseUrl: String) {
             sip?.optString("reason").orEmpty())
     }
 
+    /**
+     * Claim a gateway pairing code on an additional mesh node and return its
+     * session without touching the primary pairing; the caller stores it in
+     * that node's own vault.
+     */
+    fun pairMeshNode(pairingCode: String, deviceName: String): CredentialStore.Session {
+        val response = request("POST", "/v1/pairings/claim", JSONObject()
+            .put("pairing_code", pairingCode).put("device_name", deviceName), authenticated = false)
+        if (response.optString("role") != "gateway") throw ControlApiException("PAIRING_ROLE_MISMATCH", "该配对码不是网关角色")
+        val id = response.optString("device_id").lowercase()
+        if (id.isBlank()) throw ControlApiException("INVALID_RESPONSE", "服务器未返回设备 ID")
+        return CredentialStore.Session(
+            id, base, response.getString("access_token"), response.getString("access_expires_at"),
+            response.getString("refresh_token"), response.getString("refresh_expires_at")
+        )
+    }
+
+    /** Public extension list; also the cheapest reachability probe for a node. */
+    fun capabilities(): Set<String> {
+        val response = request("GET", "/v1/capabilities", authenticated = false)
+        val array = response.optJSONArray("extensions") ?: JSONArray()
+        return (0 until array.length()).mapNotNull { array.optString(it).takeIf(String::isNotBlank) }.toSet()
+    }
+
     fun revoke() {
         synchronized(refreshLock) {
             val session = sessionOrThrow()
             request("POST", "/v1/auth/revoke", JSONObject().put("refresh_token", session.refreshToken),
                 authenticated = false, allowRefresh = false)
-            CredentialStore.clearIfCurrent(app, session)
+            sessions.clearIfCurrent(app, session)
         }
     }
 
@@ -137,7 +167,7 @@ class ControlApiClient(context: Context, baseUrl: String) {
     }
 
     fun heartbeatBody(sequence: Long, root: Boolean, sipRegistered: Boolean, batteryPercent: Int?,
-                      charging: Boolean, sims: List<HeartbeatSim>): JSONObject {
+                      charging: Boolean, sims: List<HeartbeatSim>, installId: String? = null): JSONObject {
         val simArray = JSONArray()
         sims.forEach { sim ->
             val item = JSONObject().put("sim_id", sim.simId)
@@ -151,6 +181,7 @@ class ControlApiClient(context: Context, baseUrl: String) {
             .put("sip_registered", sipRegistered).put("charging", charging)
             .put("sim_states", simArray)
         if (batteryPercent != null) body.put("battery_percent", batteryPercent)
+        if (installId != null) body.put("install_id", installId)
         return body
     }
 
@@ -274,7 +305,7 @@ class ControlApiClient(context: Context, baseUrl: String) {
     private fun gatewayId(): String = sessionOrThrow().gatewayId
 
     private fun sessionOrThrow(): CredentialStore.Session {
-        val session = CredentialStore.load(app)
+        val session = sessions.load(app)
             ?: throw ControlApiException("PAIRING_REQUIRED", "设备尚未完成服务端配对")
         if (session.controlBaseUrl != base) {
             throw ControlApiException("CONTROL_ORIGIN_MISMATCH", "控制服务器地址与加密凭据绑定地址不匹配")
@@ -346,7 +377,7 @@ class ControlApiClient(context: Context, baseUrl: String) {
             if (rejectedAccessToken != null && old.accessToken != rejectedAccessToken) return old
             val expiry = try { Instant.parse(old.accessExpiresAt).toEpochMilli() } catch (_: Exception) { 0L }
             if (rejectedAccessToken == null && expiry > System.currentTimeMillis() + 60_000) return old
-            val pending = CredentialStore.beginRefresh(app, old)
+            val pending = sessions.beginRefresh(app, old)
                 ?: throw ControlApiException("SESSION_CHANGED", "Control session changed during refresh")
             val retryKey = pending.pendingRefreshKey
                 ?: throw ControlApiException("REFRESH_RETRY_KEY_MISSING", "Could not persist refresh retry state", retryable = true)
@@ -355,7 +386,7 @@ class ControlApiClient(context: Context, baseUrl: String) {
                     authenticated = false, idempotencyKey = retryKey, allowRefresh = false)
             } catch (e: ControlApiException) {
                 if (e.httpStatus == 401 || e.code == "SESSION_REVOKED") {
-                    CredentialStore.clearIfCurrent(app, pending)
+                    sessions.clearIfCurrent(app, pending)
                 }
                 throw e
             }
@@ -363,8 +394,8 @@ class ControlApiClient(context: Context, baseUrl: String) {
                 accessExpiresAt = response.getString("access_expires_at"),
                 refreshToken = response.getString("refresh_token"),
                 refreshExpiresAt = response.getString("refresh_expires_at"), pendingRefreshKey = null)
-            if (CredentialStore.saveIfCurrent(app, pending, rotated)) return rotated
-            val latest = CredentialStore.load(app)
+            if (sessions.saveIfCurrent(app, pending, rotated)) return rotated
+            val latest = sessions.load(app)
                 ?: throw ControlApiException("SESSION_CHANGED", "Control session changed during refresh")
             if (latest.gatewayId != old.gatewayId || latest.controlBaseUrl != old.controlBaseUrl) {
                 throw ControlApiException("SESSION_CHANGED", "Control session changed during refresh")

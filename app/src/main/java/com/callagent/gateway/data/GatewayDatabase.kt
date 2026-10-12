@@ -49,7 +49,21 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         val archiveSource: String = "gsm2sip:server-api:unknown"
     )
 
-    enum class InsertCommandResult { INSERTED, DUPLICATE, CONFLICT }
+    /** ALIASED: another node already delivered this message_id; this command only mirrors its state. */
+    enum class InsertCommandResult { INSERTED, DUPLICATE, CONFLICT, ALIASED }
+
+    data class MeshNode(
+        val gatewayId: String,
+        val controlBaseUrl: String,
+        val label: String,
+        val priority: Int,
+        val mappingRevision: Long,
+        val joinedAt: Long,
+        val lastSyncAt: Long?,
+        val lastError: String
+    )
+
+    data class MeshNodeSim(val simId: String, val mappingRevision: Long, val state: String)
     enum class DispatchStartResult { STARTED, RATE_LIMITED, NOT_READY }
     data class SmsAggregate(val state: String, val partCount: Int)
 
@@ -165,6 +179,29 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             state TEXT NOT NULL, imported_at INTEGER NOT NULL
         )""")
         createSmsProviderRecoveryTables(db)
+        db.execSQL("ALTER TABLE commands ADD COLUMN content_hash TEXT")
+        createMeshTables(db)
+    }
+
+    /** Additional independent control-server nodes and cross-node command aliases (v7). */
+    private fun createMeshTables(db: SQLiteDatabase) {
+        db.execSQL("""CREATE TABLE IF NOT EXISTS mesh_nodes (
+            node_gateway_id TEXT PRIMARY KEY, control_base_url TEXT NOT NULL, label TEXT NOT NULL,
+            priority INTEGER NOT NULL, mapping_revision INTEGER NOT NULL DEFAULT 0,
+            state TEXT NOT NULL DEFAULT 'active', joined_at INTEGER NOT NULL,
+            last_sync_at INTEGER, last_error TEXT NOT NULL DEFAULT ''
+        )""")
+        db.execSQL("""CREATE TABLE IF NOT EXISTS mesh_node_sims (
+            node_gateway_id TEXT NOT NULL, sim_id TEXT NOT NULL, mapping_revision INTEGER NOT NULL,
+            state TEXT NOT NULL, PRIMARY KEY(node_gateway_id, sim_id)
+        )""")
+        db.execSQL("""CREATE TABLE IF NOT EXISTS command_aliases (
+            command_id TEXT PRIMARY KEY, message_id TEXT NOT NULL, owner_gateway_id TEXT NOT NULL,
+            sim_id TEXT NOT NULL, mapping_revision INTEGER NOT NULL,
+            reported_dispatching INTEGER NOT NULL DEFAULT 0, reported_parts TEXT NOT NULL DEFAULT '{}',
+            reported_state TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL
+        )""")
+        db.execSQL("CREATE INDEX IF NOT EXISTS command_aliases_owner ON command_aliases(owner_gateway_id)")
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -192,6 +229,10 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             db.execSQL("ALTER TABLE inbox ADD COLUMN archive_sim_label TEXT")
             db.execSQL("ALTER TABLE commands ADD COLUMN archive_source TEXT NOT NULL DEFAULT 'gsm2sip:server-api:unknown'")
             createSmsArchiveTables(db)
+        }
+        if (oldVersion < 7) {
+            db.execSQL("ALTER TABLE commands ADD COLUMN content_hash TEXT")
+            createMeshTables(db)
         }
     }
 
@@ -665,7 +706,8 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
     }
 
     fun pendingEventsForOtherGateways(): Int = readableDatabase.rawQuery(
-        "SELECT COUNT(*) FROM events WHERE acked=0 AND owner_gateway_id IS NOT NULL AND owner_gateway_id!=(SELECT value FROM gateway_identity WHERE key='gateway_id')",
+        "SELECT COUNT(*) FROM events WHERE acked=0 AND owner_gateway_id IS NOT NULL AND owner_gateway_id!=(SELECT value FROM gateway_identity WHERE key='gateway_id') " +
+            "AND owner_gateway_id NOT IN (SELECT node_gateway_id FROM mesh_nodes WHERE state='active')",
         null
     ).use { if (it.moveToFirst()) it.getInt(0) else 0 }
 
@@ -1085,7 +1127,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         val db = writableDatabase
         db.beginTransaction()
         try {
-            if (activeOwnerFor(db) != gatewayId) throw IllegalStateException("Gateway identity changed")
+            if (!servingGateway(db, gatewayId)) throw IllegalStateException("Gateway identity changed")
             val pending = db.rawQuery(
                 "SELECT sequence,payload FROM heartbeat_pending WHERE owner_gateway_id=? LIMIT 1",
                 arrayOf(gatewayId)
@@ -1146,6 +1188,206 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
 
     fun isActiveGateway(gatewayId: String): Boolean = activeGatewayId() == gatewayId
 
+    /** The primary pairing or an active mesh node: identities this gateway executes and reports for. */
+    fun isServingGateway(gatewayId: String): Boolean = servingGateway(readableDatabase, gatewayId)
+
+    private fun servingGateway(db: SQLiteDatabase, gatewayId: String): Boolean =
+        activeOwnerFor(db) == gatewayId || db.rawQuery(
+            "SELECT 1 FROM mesh_nodes WHERE node_gateway_id=? AND state='active'", arrayOf(gatewayId)
+        ).use { it.moveToFirst() }
+
+    /** Stable ID of this physical gateway install, shared with every node so clients can match them. */
+    fun installId(): String {
+        readableDatabase.rawQuery("SELECT value FROM gateway_identity WHERE key='install_id'", null)
+            .use { if (it.moveToFirst()) return it.getString(0) }
+        val created = UUID.randomUUID().toString()
+        writableDatabase.execSQL("INSERT OR IGNORE INTO gateway_identity(key,value) VALUES('install_id',?)", arrayOf(created))
+        return readableDatabase.rawQuery("SELECT value FROM gateway_identity WHERE key='install_id'", null)
+            .use { it.moveToFirst(); it.getString(0) }
+    }
+
+    // ── Mesh nodes ──────────────────────────────────────
+
+    fun addMeshNode(gatewayId: String, controlBaseUrl: String, label: String): Boolean {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            if (activeOwnerFor(db) == gatewayId) return false
+            val priority = db.rawQuery("SELECT COALESCE(MAX(priority),0)+1 FROM mesh_nodes", null)
+                .use { it.moveToFirst(); it.getInt(0) }
+            val inserted = db.insertWithOnConflict("mesh_nodes", null, ContentValues().apply {
+                put("node_gateway_id", gatewayId); put("control_base_url", controlBaseUrl)
+                put("label", label); put("priority", priority); put("joined_at", System.currentTimeMillis())
+            }, SQLiteDatabase.CONFLICT_IGNORE) != -1L
+            db.setTransactionSuccessful()
+            return inserted
+        } finally { db.endTransaction() }
+    }
+
+    /** Stop serving a node. Its unsent events stay local and are never uploaded elsewhere. */
+    fun removeMeshNode(gatewayId: String) {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            db.execSQL("UPDATE mesh_nodes SET state='removed' WHERE node_gateway_id=?", arrayOf(gatewayId))
+            db.delete("mesh_node_sims", "node_gateway_id=?", arrayOf(gatewayId))
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
+
+    fun meshNodes(): List<MeshNode> = readableDatabase.rawQuery(
+        """SELECT node_gateway_id,control_base_url,label,priority,mapping_revision,joined_at,last_sync_at,last_error
+            FROM mesh_nodes WHERE state='active' ORDER BY priority""", null
+    ).use { c -> buildList { while (c.moveToNext()) add(MeshNode(c.getString(0), c.getString(1), c.getString(2),
+        c.getInt(3), c.getLong(4), c.getLong(5), c.getLongOrNull(6), c.getString(7))) } }
+
+    fun recordMeshSync(gatewayId: String, error: String?) {
+        writableDatabase.execSQL(
+            if (error == null) "UPDATE mesh_nodes SET last_sync_at=?,last_error='' WHERE node_gateway_id=?"
+            else "UPDATE mesh_nodes SET last_error=? WHERE node_gateway_id=?",
+            arrayOf(error ?: System.currentTimeMillis(), gatewayId)
+        )
+    }
+
+    fun meshNodeSims(gatewayId: String): List<MeshNodeSim> = readableDatabase.rawQuery(
+        "SELECT sim_id,mapping_revision,state FROM mesh_node_sims WHERE node_gateway_id=? ORDER BY sim_id", arrayOf(gatewayId)
+    ).use { c -> buildList { while (c.moveToNext()) add(MeshNodeSim(c.getString(0), c.getLong(1), c.getString(2))) } }
+
+    /** Replace a node's SIM bindings with a server-confirmed set at one revision. */
+    fun replaceMeshNodeSims(gatewayId: String, revision: Long, simIds: Collection<String>) {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            if (!servingGateway(db, gatewayId)) return
+            db.delete("mesh_node_sims", "node_gateway_id=?", arrayOf(gatewayId))
+            simIds.forEach { simId ->
+                db.insertOrThrow("mesh_node_sims", null, ContentValues().apply {
+                    put("node_gateway_id", gatewayId); put("sim_id", simId)
+                    put("mapping_revision", revision); put("state", "active")
+                })
+            }
+            db.execSQL("UPDATE mesh_nodes SET mapping_revision=? WHERE node_gateway_id=?", arrayOf(revision, gatewayId))
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
+
+    /** Apply a node heartbeat: adopt its revision, mark revoked SIMs so they are re-bound. */
+    fun applyMeshHeartbeat(gatewayId: String, revision: Long, invalidatedSimIds: Collection<String>) {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            invalidatedSimIds.forEach { simId ->
+                db.execSQL("UPDATE mesh_node_sims SET state='unverified' WHERE node_gateway_id=? AND sim_id=?",
+                    arrayOf(gatewayId, simId.lowercase()))
+            }
+            db.execSQL("UPDATE mesh_node_sims SET mapping_revision=? WHERE node_gateway_id=?", arrayOf(revision, gatewayId))
+            db.execSQL("UPDATE mesh_nodes SET mapping_revision=? WHERE node_gateway_id=?", arrayOf(revision, gatewayId))
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
+
+    /**
+     * Mesh-origin commands carry their node's revision. Return the primary
+     * registry revision to resolve the same SIM locally, or null when the
+     * node binding is stale or inactive (the command must fail closed).
+     */
+    fun meshRevisionIsCurrent(gatewayId: String, simId: String, mappingRevision: Long): Boolean =
+        readableDatabase.rawQuery(
+            """SELECT 1 FROM mesh_node_sims s JOIN mesh_nodes n ON n.node_gateway_id=s.node_gateway_id
+                WHERE s.node_gateway_id=? AND s.sim_id=? AND s.state='active' AND n.state='active'
+                AND s.mapping_revision=? AND n.mapping_revision=?""",
+            arrayOf(gatewayId, simId, mappingRevision.toString(), mappingRevision.toString())
+        ).use { it.moveToFirst() }
+
+    /**
+     * Pending events for a mesh node. Inbound SMS copies get the node's SIM
+     * revision just before their first upload (frozen once set); upload stops
+     * at the first copy whose SIM is not yet bound there, keeping order.
+     */
+    fun pendingMeshEvents(gatewayId: String, limit: Int = 50): List<Event> {
+        writableDatabase.execSQL(
+            """UPDATE events SET mapping_revision=(SELECT s.mapping_revision FROM mesh_node_sims s
+                WHERE s.node_gateway_id=events.owner_gateway_id AND s.sim_id=events.sim_id AND s.state='active')
+                WHERE owner_gateway_id=? AND acked=0 AND type='sms.received' AND sim_id IS NOT NULL
+                AND mapping_revision IS NULL""", arrayOf(gatewayId)
+        )
+        return pendingEvents(gatewayId, limit).takeWhile { !(it.type == "sms.received" && it.simId != null && it.mappingRevision == null) }
+    }
+
+    fun alias(commandId: String): Boolean = readableDatabase.rawQuery(
+        "SELECT 1 FROM command_aliases WHERE command_id=?", arrayOf(commandId)
+    ).use { it.moveToFirst() }
+
+    /**
+     * Mirror the executed command's progress to every alias owned by
+     * [ownerGatewayId] as that node's own command events. Never touches the modem.
+     */
+    fun emitAliasEvents(ownerGatewayId: String): Int {
+        val db = writableDatabase
+        var emitted = 0
+        db.beginTransaction()
+        try {
+            if (!servingGateway(db, ownerGatewayId)) return 0
+            data class AliasRow(val commandId: String, val messageId: String, val simId: String, val revision: Long,
+                                val dispatching: Boolean, val parts: JSONObject, val state: String)
+            val aliases = db.rawQuery(
+                """SELECT command_id,message_id,sim_id,mapping_revision,reported_dispatching,reported_parts,reported_state
+                    FROM command_aliases WHERE owner_gateway_id=? AND reported_state NOT IN ('failed','expired','delivered')""",
+                arrayOf(ownerGatewayId)
+            ).use { c -> buildList { while (c.moveToNext()) add(AliasRow(c.getString(0), c.getString(1), c.getString(2),
+                c.getLong(3), c.getInt(4) != 0, runCatching { JSONObject(c.getString(5)) }.getOrDefault(JSONObject()),
+                c.getString(6))) } }
+            aliases.forEach { alias ->
+                val original = db.rawQuery(
+                    "SELECT command_id,state,part_count,last_error FROM commands WHERE message_id=?", arrayOf(alias.messageId)
+                ).use { if (it.moveToFirst()) listOf(it.getString(0), it.getString(1), it.getInt(2).toString(), it.getString(3)) else null }
+                    ?: return@forEach
+                val (originalId, state, partCountText, lastError) = original
+                data class Part(val index: Int, val state: String, val resultCode: Int?, val error: String)
+                val parts = db.rawQuery(
+                    "SELECT part_index,state,sent_result_code,error FROM command_parts WHERE command_id=? ORDER BY part_index",
+                    arrayOf(originalId)
+                ).use { c -> buildList { while (c.moveToNext()) add(Part(c.getInt(0), c.getString(1), c.getIntOrNull(2), c.getString(3))) } }
+                val now = System.currentTimeMillis()
+                fun emit(type: String, payload: JSONObject) {
+                    insertEvent(db, UUID.randomUUID().toString(), now, type, alias.simId, alias.revision,
+                        payload.toString(), ownerGatewayId)
+                    emitted++
+                }
+                var reportedState = alias.state
+                var dispatching = alias.dispatching
+                if (parts.isEmpty()) {
+                    if (state in setOf("failed", "expired") && alias.state != state) {
+                        emit("sms.command_state", JSONObject().put("message_id", alias.messageId)
+                            .put("command_id", alias.commandId).put("state", state)
+                            .apply { if (lastError.isNotEmpty()) put("error", lastError) })
+                        reportedState = state
+                    }
+                } else {
+                    if (!dispatching) {
+                        emit("sms.dispatching", JSONObject().put("message_id", alias.messageId)
+                            .put("command_id", alias.commandId).put("part_count", partCountText.toInt()))
+                        dispatching = true
+                    }
+                    parts.filter { it.state != "dispatching" && alias.parts.optString(it.index.toString()) != it.state }.forEach { part ->
+                        emit("sms.part_state", JSONObject().put("message_id", alias.messageId)
+                            .put("command_id", alias.commandId).put("part_index", part.index).put("state", part.state)
+                            .apply {
+                                if (part.resultCode != null) put("result_code", part.resultCode)
+                                if (part.error.isNotEmpty()) put("error", part.error)
+                            })
+                        alias.parts.put(part.index.toString(), part.state)
+                    }
+                    if (state in setOf("submitted", "delivered", "failed", "unknown")) reportedState = state
+                }
+                db.execSQL("UPDATE command_aliases SET reported_dispatching=?,reported_parts=?,reported_state=? WHERE command_id=?",
+                    arrayOf(if (dispatching) 1 else 0, alias.parts.toString(), reportedState, alias.commandId))
+            }
+            db.setTransactionSuccessful()
+            return emitted
+        } finally { db.endTransaction() }
+    }
+
     fun markCallTerminal(callId: String, state: String): Boolean {
         require(state in setOf("completed", "failed", "unknown", "cancelled"))
         val values = ContentValues().apply { put("state", state); put("updated_at", System.currentTimeMillis()) }
@@ -1160,23 +1402,44 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
 
     /** Persist an HTTP-claimed command before any modem interaction. */
     fun insertClaimedCommand(command: Command, requiredGatewayId: String): InsertCommandResult {
-        if (command.ownerGatewayId != requiredGatewayId || !isActiveGateway(requiredGatewayId)) {
+        if (command.ownerGatewayId != requiredGatewayId || !isServingGateway(requiredGatewayId)) {
             return InsertCommandResult.CONFLICT
         }
         val archiveIdentity = archiveIdentity(appContext)
+        val contentHash = contentHash(command.simId, command.to, command.text)
         val db = writableDatabase
         db.beginTransaction()
         try {
+            if (db.rawQuery("SELECT 1 FROM command_aliases WHERE command_id=?", arrayOf(command.commandId)).use { it.moveToFirst() }) {
+                db.setTransactionSuccessful()
+                return InsertCommandResult.ALIASED
+            }
             val prior = db.rawQuery(
-                "SELECT message_id,payload_hash,owner_gateway_id FROM commands WHERE command_id=? OR message_id=? LIMIT 1",
+                "SELECT message_id,payload_hash,owner_gateway_id,command_id,content_hash FROM commands WHERE command_id=? OR message_id=? LIMIT 1",
                 arrayOf(command.commandId, command.messageId)
             )
             if (prior.moveToFirst()) {
                 val same = prior.getString(0) == command.messageId && prior.getString(1) == command.payloadHash &&
                     prior.getString(2) == requiredGatewayId
+                // The same client-minted message arriving through another node:
+                // record an alias that only mirrors the existing execution.
+                val crossNode = !same && prior.getString(0) == command.messageId &&
+                    prior.getString(3) != command.commandId && prior.getString(2) != requiredGatewayId &&
+                    prior.getStringOrNull(4) == contentHash
                 prior.close()
+                if (crossNode) {
+                    db.insertOrThrow("command_aliases", null, ContentValues().apply {
+                        put("command_id", command.commandId); put("message_id", command.messageId)
+                        put("owner_gateway_id", requiredGatewayId); put("sim_id", command.simId)
+                        put("mapping_revision", command.mappingRevision); put("created_at", System.currentTimeMillis())
+                    })
+                }
                 db.setTransactionSuccessful()
-                return if (same) InsertCommandResult.DUPLICATE else InsertCommandResult.CONFLICT
+                return when {
+                    same -> InsertCommandResult.DUPLICATE
+                    crossNode -> InsertCommandResult.ALIASED
+                    else -> InsertCommandResult.CONFLICT
+                }
             }
             prior.close()
             val now = System.currentTimeMillis()
@@ -1187,7 +1450,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                 put("recipient", command.to); put("body", command.text)
                 put("part_count", command.partCount); put("expires_at", command.expiresAt)
                 put("state", "claimed"); put("payload_hash", command.payloadHash)
-                put("owner_gateway_id", requiredGatewayId)
+                put("owner_gateway_id", requiredGatewayId); put("content_hash", contentHash)
                 put("archive_source", archiveSource)
                 put("created_at", now); put("updated_at", now)
             }
@@ -1245,18 +1508,19 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             val command = command(commandId) ?: return DispatchStartResult.NOT_READY
             if (command.state != "claimed" || command.partCount < 1 || command.expiresAt <= System.currentTimeMillis()) return DispatchStartResult.NOT_READY
             val owner = command.ownerGatewayId ?: return DispatchStartResult.NOT_READY
-            if (activeOwnerFor(db) != owner) return DispatchStartResult.NOT_READY
+            if (!servingGateway(db, owner)) return DispatchStartResult.NOT_READY
             val now = System.currentTimeMillis()
             val alreadyCounted = db.rawQuery("SELECT 1 FROM sms_dispatch_budget WHERE command_id=?", arrayOf(commandId))
                 .use { it.moveToFirst() }
             if (alreadyCounted) return DispatchStartResult.NOT_READY
             val windowCount = db.rawQuery(
-                "SELECT COUNT(*) FROM sms_dispatch_budget WHERE owner_gateway_id=? AND sim_id=? AND dispatched_at>?",
-                arrayOf(owner, command.simId, (now - 60_000L).toString())
+                // SIM IDs are shared by every node, so the budget is per physical SIM, not per node.
+                "SELECT COUNT(*) FROM sms_dispatch_budget WHERE sim_id=? AND dispatched_at>?",
+                arrayOf(command.simId, (now - 60_000L).toString())
             ).use { it.moveToFirst(); it.getInt(0) }
             val hourCount = db.rawQuery(
-                "SELECT COUNT(*) FROM sms_dispatch_budget WHERE owner_gateway_id=? AND sim_id=? AND dispatched_at>?",
-                arrayOf(owner, command.simId, (now - 3_600_000L).toString())
+                "SELECT COUNT(*) FROM sms_dispatch_budget WHERE sim_id=? AND dispatched_at>?",
+                arrayOf(command.simId, (now - 3_600_000L).toString())
             ).use { it.moveToFirst(); it.getInt(0) }
             if (windowCount >= SMS_PER_MINUTE_LIMIT || hourCount >= SMS_PER_HOUR_LIMIT) {
                 db.setTransactionSuccessful()
@@ -1409,6 +1673,12 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         } finally { db.endTransaction() }
     }
 
+    /** Content identity independent of node-local IDs; kept after the body is redacted. */
+    fun contentHash(simId: String, recipient: String, text: String): String {
+        val bytes = listOf(simId.lowercase(), recipient, text).joinToString("\u0000").toByteArray(Charsets.UTF_8)
+        return MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+    }
+
     /** Hash the exact command identity fields before storing/dispatching it. */
     fun payloadHash(commandId: String, messageId: String, simId: String, mappingRevision: Long,
                     recipient: String, text: String, expiresAt: Long): String {
@@ -1452,8 +1722,36 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         val owner = ownerGatewayId
         if (owner == null) v.putNull("owner_gateway_id") else v.put("owner_gateway_id", owner)
         db.insertOrThrow("events", null, v)
+        if (type == "sms.received" && owner != null && owner == activeOwnerFor(db)) {
+            fanOutInbound(db, id, at, simId, payload)
+        }
         return Event(id, seq, at, type, simId, revision, payload, owner)
     }
+
+    /**
+     * Give every mesh node its own copy of an inbound SMS in the same
+     * transaction: same message_id (so clients dedupe), own event ID and
+     * sequence, and that node's SIM revision filled in just before upload.
+     */
+    private fun fanOutInbound(db: SQLiteDatabase, primaryEventId: String, at: Long, simId: String?, payload: String) {
+        val nodes = db.rawQuery("SELECT node_gateway_id FROM mesh_nodes WHERE state='active' ORDER BY priority", null)
+            .use { c -> buildList { while (c.moveToNext()) add(c.getString(0)) } }
+        nodes.forEach { node ->
+            db.execSQL("UPDATE meta SET value=value+1 WHERE key='sequence'")
+            val seq = db.rawQuery("SELECT value FROM meta WHERE key='sequence'", null).use { it.moveToFirst(); it.getLong(0) }
+            db.insertOrThrow("events", null, ContentValues().apply {
+                put("event_id", meshEventId(node, primaryEventId)); put("sequence", seq); put("occurred_at", at)
+                put("type", "sms.received")
+                if (simId == null) putNull("sim_id") else put("sim_id", simId)
+                putNull("mapping_revision")
+                put("payload", payload); put("created_at", System.currentTimeMillis())
+                put("owner_gateway_id", node)
+            })
+        }
+    }
+
+    private fun meshEventId(node: String, primaryEventId: String): String =
+        UUID.nameUUIDFromBytes("mesh-event\u0000$node\u0000$primaryEventId".toByteArray(Charsets.UTF_8)).toString()
 
     private fun activeOwnerFor(db: SQLiteDatabase): String? = db.rawQuery(
         "SELECT value FROM gateway_identity WHERE key='gateway_id'", null
@@ -1476,7 +1774,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         private const val SMS_PER_MINUTE_LIMIT = 5
         private const val SMS_PER_HOUR_LIMIT = 30
         private const val TAG = "GatewayDatabase"
-        private const val VERSION = 6
+        private const val VERSION = 7
         private const val ARCHIVE_COLUMNS = "id,source,owner_id,gateway_id,owner_gateway_id,message_id,sim_id,sim_label," +
             "direction,from_address,to_address,body,created_at,status,observed_at,slot_index,subscription_id,part_count"
         private val ARCHIVE_SNAPSHOT_QUERY = """

@@ -98,6 +98,29 @@ class Smoke:
     def wait(self, seconds: float = 2.0) -> None:
         time.sleep(seconds)
 
+    def dismiss_foreign_anr(self, root: ET.Element, name: str) -> bool:
+        """Tap "Wait" on a system ANR dialog that belongs to another app.
+
+        A cold emulator sometimes reports its own launcher as not
+        responding; that dialog covers the app under test and is not this
+        app's failure. A dialog naming this app is never dismissed.
+        """
+        wait_button = next((node for node in self.nodes(root)
+                            if node.attrib.get("resource-id", "") == "android:id/aerr_wait"), None)
+        if wait_button is None:
+            return False
+        title = " ".join(node.attrib.get("text", "") for node in self.nodes(root)
+                         if node.attrib.get("resource-id", "") in ("android:id/alertTitle", "android:id/message"))
+        dismissed = getattr(self, "foreign_anr_dismissals", 0)
+        if "gsm2sip" in title.lower() or dismissed >= 3:
+            return False
+        self.foreign_anr_dismissals = dismissed + 1
+        with (self.artifacts / "foreign_anr_dismissals.txt").open("a", encoding="utf-8") as log:
+            log.write(f"{name}: {title.strip() or 'system ANR dialog'}\n")
+        self.tap_node(wait_button, f"foreign_anr_wait_{dismissed + 1}")
+        self.wait(3)
+        return True
+
     def capture(self, name: str) -> ET.Element:
         device_xml = "/sdcard/ui-smoke-window.xml"
         attempts = 4
@@ -177,6 +200,9 @@ class Smoke:
                     if root.tag != "hierarchy" or not list(root):
                         root = None
                         last_error = "fresh hierarchy was empty or invalid"
+                    elif self.dismiss_foreign_anr(root, name):
+                        root = None
+                        last_error = "another app's 'isn't responding' dialog covered the screen"
                     else:
                         (self.artifacts / f"{safe_name(name)}.xml").write_text(raw, encoding="utf-8")
                         break

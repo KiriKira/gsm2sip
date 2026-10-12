@@ -73,9 +73,51 @@ class CallOrchestrator(
         { appContext, callId, simId, revision, direction ->
             GatewayDatabase.get(appContext).beginCallDispatch(callId, simId, revision, direction)
         },
+    /**
+     * A call authorized by a mesh node carries that node's SIM revision. It is
+     * accepted only while the node's binding of the SIM is current, and then
+     * resolves the same physical SIM at the primary's current revision.
+     */
+    private val nodeRevisionResolver: (Context, String, String, Long) -> Long? = { appContext, node, simId, revision ->
+        if (GatewayDatabase.get(appContext).meshRevisionIsCurrent(node, simId.lowercase(), revision)) {
+            SimRegistry.snapshot(appContext).mappingRevision
+        } else null
+    },
+    /** The node's current revision for a SIM it has bound, for an inbound leg through that node. */
+    private val nodeSimRevision: (Context, String, String) -> Long? = { appContext, node, simId ->
+        GatewayDatabase.get(appContext).meshNodeSims(node)
+            .firstOrNull { it.simId.equals(simId, ignoreCase = true) && it.state == "active" }?.mappingRevision
+    },
     private val incomingAccountResolver: (Context, PhoneAccountHandle?) -> SimRegistry.SimMapping? =
         { appContext, handle -> SimRegistry.resolvePhoneAccount(appContext, handle) }
 ) : SipClient.Listener, GsmCallManager.Listener, SipCall.Listener {
+
+    /**
+     * SIP clients registered with additional server nodes. An inbound GSM call
+     * is offered to the primary and every registered node at once; the first
+     * leg answered wins and the others are cancelled. An authorized INVITE may
+     * arrive from any of them; one call is bridged at a time either way.
+     */
+    private val nodeClients = java.util.concurrent.CopyOnWriteArrayList<SipClient>()
+    private val nodeClientListener = object : SipClient.Listener {
+        override fun onRegistered() = Unit
+        override fun onRegistrationFailed() = Unit
+        override fun onIncomingCall(call: SipCall) = this@CallOrchestrator.onIncomingCall(call)
+        override fun onCallTerminated(call: SipCall) = this@CallOrchestrator.onCallTerminated(call)
+    }
+    /** Legs of the current inbound call still racing to be answered (includes [activeSipCall]). */
+    private val inboundForkLegs = mutableListOf<SipCall>()
+
+    fun attachNodeClient(client: SipClient) {
+        require(client.nodeGatewayId != null) { "node clients carry their node ID" }
+        client.listener = nodeClientListener
+        nodeClients.addIfAbsent(client)
+    }
+
+    fun detachNodeClient(client: SipClient) {
+        nodeClients.remove(client)
+        if (client.listener === nodeClientListener) client.listener = null
+    }
 
     private var activeRtpSession: RtpSession? = null
     @Volatile private var activeSipCall: SipCall? = null
@@ -194,6 +236,8 @@ class CallOrchestrator(
         inboundWorker.shutdownNow()
         tearDown("Orchestrator stopped", ledgerStateOverride = "unknown")
         sipClient.listener = null
+        nodeClients.forEach { if (it.listener === nodeClientListener) it.listener = null }
+        nodeClients.clear()
         GsmCallManager.listener = null
         timers.shutdownNow()
     }
@@ -379,7 +423,7 @@ class CallOrchestrator(
         }
         call.originalInvite?.let { invite ->
             val ringing = com.callagent.gateway.sip.SipBuilder.ringing180(invite, call.localTag)
-            sipClient.sendTo(ringing, call.remoteContactAddress ?: sipClient.serverAddress)
+            call.client.sendTo(ringing, call.remoteContactAddress ?: call.client.serverAddress)
         }
 
         try {
@@ -398,7 +442,7 @@ class CallOrchestrator(
         try { call.reject(code, reason) } catch (e: Exception) {
             Log.w(TAG, "SIP rejection failed: ${e.javaClass.simpleName}")
         }
-        sipClient.removeCall(call.callId)
+        call.client.removeCall(call.callId)
     }
 
     /**
@@ -425,7 +469,7 @@ class CallOrchestrator(
             ?.let { invite.extractUser(it) }
             ?.trim()?.ifEmpty { null } ?: return null
 
-        if (user.equals(sipClient.username, ignoreCase = true)) return null
+        if (user.equals(call.client.username, ignoreCase = true)) return null
         if (digitsOf(user) == digitsOf(inboundSipDestination(mapping))) return null
         if (!looksDialable(user)) return null
 
@@ -460,8 +504,20 @@ class CallOrchestrator(
         callGeneration: Long
     ) {
         if (!isPendingOutbound(call, metadata, callGeneration)) return
+        val node = call.client.nodeGatewayId
+        val localRevision = if (node == null) metadata.mappingRevision else try {
+            nodeRevisionResolver(context, node, metadata.simId, metadata.mappingRevision)
+        } catch (e: Exception) {
+            Log.w(TAG, "Node SIM binding unavailable: ${e.javaClass.simpleName}")
+            null
+        }
+        if (localRevision == null) {
+            failPendingOutbound(call, metadata, callGeneration, 409, "SIM Mapping Changed",
+                "Call rejected: the node's SIM binding is stale")
+            return
+        }
         val mapping = try {
-            outboundMappingResolver(context, metadata.simId, metadata.mappingRevision)
+            outboundMappingResolver(context, metadata.simId, localRevision)
         } catch (e: SimRegistry.SimMappingException) {
             val response = if (e.code == SimRegistry.ErrorCode.SIM_MAPPING_CHANGED) 409 else 480
             failPendingOutbound(call, metadata, callGeneration, response,
@@ -503,7 +559,7 @@ class CallOrchestrator(
         if (!isPendingOutbound(call, metadata, callGeneration)) return
 
         val freshMapping = try {
-            outboundMappingResolver(context, metadata.simId, metadata.mappingRevision)
+            outboundMappingResolver(context, metadata.simId, localRevision)
         } catch (e: Exception) {
             Log.w(TAG, "Could not revalidate outbound SIM mapping: ${e.javaClass.simpleName}")
             failPendingOutbound(call, metadata, callGeneration, 409, "SIM Mapping Changed",
@@ -527,9 +583,11 @@ class CallOrchestrator(
                         if (!isPendingOutbound(call, metadata, callGeneration)) return@withPendingInvite false
 
                         val recorded = try {
+                            // Unique by call_id across every node: the same call
+                            // authorized through a second node is never dialed twice.
                             callDispatchLedger(
                                 context, metadata.callId, metadata.simId,
-                                metadata.mappingRevision, "outgoing"
+                                localRevision, "outgoing"
                             )
                         } catch (e: Exception) {
                             Log.e(TAG, "Call ledger unavailable; refusing GSM dispatch")
@@ -603,7 +661,22 @@ class CallOrchestrator(
     @Synchronized
     override fun onCallTerminated(call: SipCall) {
         Log.i(TAG, "SIP call terminated: ${call.callId} (bridge=$bridgeState, retries=$sipCallRetries)")
-        if (call != activeSipCall) return
+        if (call != activeSipCall) {
+            inboundForkLegs.remove(call)
+            return
+        }
+        // Another node's leg is still ringing: keep waiting on it instead of
+        // treating this leg's failure as the whole call's.
+        val survivors = inboundForkLegs.filter { it !== call && it.state != SipCall.State.TERMINATED }
+        if (survivors.isNotEmpty() &&
+            (bridgeState == BridgeState.SIP_CALLING || bridgeState == BridgeState.SIP_RINGING)) {
+            inboundForkLegs.remove(call)
+            call.client.removeCall(call.callId)
+            activeSipCall = survivors.first()
+            Log.i(TAG, "SIP leg failed; ${survivors.size} other node leg(s) still ringing")
+            return
+        }
+        inboundForkLegs.clear()
 
         // If GSM is still ringing and we haven't exhausted retries, try again.
         // Transient network issues or socket races can kill the first SIP attempt.
@@ -613,7 +686,7 @@ class CallOrchestrator(
             Log.w(TAG, "SIP call failed while GSM ringing — retrying ($sipCallRetries/$MAX_SIP_RETRIES)")
             listener?.onStateChanged(bridgeState, "SIP retry $sipCallRetries/$MAX_SIP_RETRIES")
             activeSipCall = null
-            sipClient.removeCall(call.callId)
+            call.client.removeCall(call.callId)
             // Retry after a short delay to let any transient issue settle
             schedule(1000) {
                 if (bridgeState != BridgeState.SIP_CALLING &&
@@ -890,7 +963,7 @@ class CallOrchestrator(
                         sipCall.listener = this
                         sipCall.accept(rtpPort)
 
-                        val addr = sipCall.remoteRtpAddress ?: sipClient.serverDomain
+                        val addr = sipCall.remoteRtpAddress ?: sipCall.client.serverDomain
                         val port = sipCall.remoteRtpPort
                         val pt = sipCall.negotiatedPayloadType
                         if (port > 0) {
@@ -960,6 +1033,32 @@ class CallOrchestrator(
         }
     }
 
+    /**
+     * The first inbound leg to answer wins: it becomes the active call and
+     * every other node's leg is cancelled (or closed, if it also answered).
+     */
+    @Synchronized
+    private fun settleInboundFork(winner: SipCall) {
+        if (inboundForkLegs.size < 2 || winner !in inboundForkLegs) return
+        if (bridgeState != BridgeState.SIP_CALLING && bridgeState != BridgeState.SIP_RINGING) return
+        if (activeSipCall !== winner) {
+            Log.i(TAG, "Inbound call answered through node ${winner.client.nodeGatewayId ?: "primary"}")
+        }
+        activeSipCall = winner
+        val losers = inboundForkLegs.filter { it !== winner }
+        inboundForkLegs.clear()
+        inboundForkLegs += winner
+        losers.forEach(::endLosingLeg)
+    }
+
+    private fun endLosingLeg(leg: SipCall) {
+        try {
+            if (!leg.cancelPendingInvite() && leg.state == SipCall.State.ANSWERED) leg.hangup()
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not end losing SIP leg: ${e.javaClass.simpleName}")
+        }
+    }
+
     // ── SipCall.Listener ────────────────────────────────
 
     override fun onCallAnswered(call: SipCall) {
@@ -969,6 +1068,7 @@ class CallOrchestrator(
     // onCallTerminated is already implemented above (shared by SipClient.Listener and SipCall.Listener)
 
     override fun onRtpReady(call: SipCall, remoteRtpAddr: String, remoteRtpPort: Int, payloadType: Int) {
+        settleInboundFork(call)
         if (call !== activeSipCall) {
             Log.d(TAG, "Ignoring RTP-ready callback from a stale SIP call")
             return
@@ -1144,16 +1244,42 @@ class CallOrchestrator(
         listener?.onStateChanged(bridgeState, "Calling Asterisk")
 
         try {
-            val sipCall = sipClient.makeCall(
-                targetExtension = sipDestination,
-                localRtpPort = rtpPort,
-                callerIdNumber = callerNumber,
-                callerIdName = callerNumber,
-                gsmMetadata = metadata
-            )
-            sipCall.listener = this
-            activeSipCall = sipCall
-            Log.i(TAG, "SIP INVITE sent to Asterisk")
+            val legs = mutableListOf<SipCall>()
+            try {
+                legs += sipClient.makeCall(
+                    targetExtension = sipDestination,
+                    localRtpPort = rtpPort,
+                    callerIdNumber = callerNumber,
+                    callerIdName = callerNumber,
+                    gsmMetadata = metadata
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Primary SIP leg could not be placed: ${e.javaClass.simpleName}")
+            }
+            // Offer the call through every node that is registered and has
+            // this SIM bound, with that node's own SIM revision.
+            for (node in nodeClients) {
+                val nodeId = node.nodeGatewayId ?: continue
+                if (!node.registered) continue
+                val revision = runCatching { nodeSimRevision(context, nodeId, metadata.simId) }.getOrNull() ?: continue
+                try {
+                    legs += node.makeCall(
+                        targetExtension = sipDestination,
+                        localRtpPort = rtpPort,
+                        callerIdNumber = callerNumber,
+                        callerIdName = callerNumber,
+                        gsmMetadata = metadata.copy(mappingRevision = revision)
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "Node SIP leg could not be placed: ${e.javaClass.simpleName}")
+                }
+            }
+            if (legs.isEmpty()) throw IllegalStateException("no SIP leg could be placed")
+            legs.forEach { it.listener = this }
+            inboundForkLegs.clear()
+            inboundForkLegs += legs
+            activeSipCall = legs.first()
+            Log.i(TAG, "SIP INVITE sent through ${legs.size} server node(s)")
 
             // Timeout: if Asterisk doesn't answer within 30s, tear down.
             schedule(SIP_CALL_TIMEOUT_MS) {
@@ -1337,8 +1463,10 @@ class CallOrchestrator(
                 } catch (e: Exception) {
                     Log.e(TAG, "Error ending SIP call: ${e.javaClass.simpleName}")
                 }
-                sipClient.removeCall(it.callId)
+                it.client.removeCall(it.callId)
             }
+            inboundForkLegs.filter { it !== activeSipCall }.forEach(::endLosingLeg)
+            inboundForkLegs.clear()
             activeSipCall = null
 
             activeGsmCall?.let { call ->
@@ -1417,9 +1545,11 @@ class CallOrchestrator(
         try {
             activeSipCall?.let {
                 if (it.state != SipCall.State.TERMINATED) it.hangup()
-                sipClient.removeCall(it.callId)
+                it.client.removeCall(it.callId)
             }
+            inboundForkLegs.filter { it !== activeSipCall }.forEach(::endLosingLeg)
         } catch (_: Exception) {}
+        inboundForkLegs.clear()
         activeSipCall = null
         try {
             activeGsmCall?.disconnect()

@@ -34,7 +34,9 @@ class SipClient(
     @Suppress("unused") private val srtpRequested: Boolean = true,
     /** Explicit development-only escape hatch. Production callers leave this false. */
     private val allowInsecureSignalling: Boolean = false,
-    private val caPem: String? = null
+    private val caPem: String? = null,
+    /** The mesh node this client registers with; null for the primary pairing. */
+    val nodeGatewayId: String? = null
 ) {
     /**
      * Whether this call leg may use SRTP at all.
@@ -309,7 +311,7 @@ class SipClient(
                     // include it in logs where it can expose phone numbers.
                     Log.w(TAG, "Unhandled SIP ${msg.method ?: "response"} for call $callId")
                 }
-                if (call.state == SipCall.State.TERMINATED) {
+                if (call.state == SipCall.State.TERMINATED && !call.awaitingCancelOutcome) {
                     activeCalls.remove(callId)
                     listener?.onCallTerminated(call)
                 }
@@ -596,6 +598,7 @@ class SipClient(
         )
 
         activeCalls[callId] = call
+        call.rememberSentInvite(invite)
         sendTo(invite, serverAddress)
         // Log both halves the server routes on: the Request-URI it turns into
         // EXTEN, and the From user it turns into caller ID.
@@ -744,6 +747,7 @@ class SipClient(
             extraHeaders = call.trustedGsmMetadata?.sipHeaders() ?: emptyList(),
             srtp = call.localSrtpKeys
         )
+        call.rememberSentInvite(invite)
         sendTo(invite, serverAddress)
     }
 

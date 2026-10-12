@@ -18,6 +18,59 @@ class SipCall(
     enum class Direction { INBOUND, OUTBOUND }
     enum class State { TRYING, RINGING, ANSWERED, TERMINATED }
 
+    /** The client (server node) this dialog belongs to. */
+    val client: SipClient get() = sipClient
+
+    // The latest INVITE transaction we sent, so a pending one can be CANCELled.
+    private var sentInviteUri: String? = null
+    private var sentInviteVia: String? = null
+    private var sentInviteCseq: Int? = null
+    @Volatile private var cancelledLocally = false
+    @Volatile private var cancelledAt = 0L
+    @Volatile private var inviteFinalSeen = false
+
+    /**
+     * A call we CANCELled stays routable until its INVITE gets a final
+     * response (487, or a 200 that crossed the CANCEL and must be closed with
+     * BYE), or until RFC 3261 Timer B (32 s) passes.
+     */
+    val awaitingCancelOutcome: Boolean
+        get() = cancelledLocally && !inviteFinalSeen && System.currentTimeMillis() - cancelledAt < 32_000L
+
+    /** Remember the INVITE just sent (first send or authenticated re-send). */
+    internal fun rememberSentInvite(invite: String) {
+        val lines = invite.split("\r\n")
+        synchronized(this) {
+            sentInviteUri = lines.firstOrNull()?.removePrefix("INVITE ")?.substringBeforeLast(" SIP/2.0")
+            sentInviteVia = lines.firstOrNull { it.startsWith("Via:", ignoreCase = true) }?.substringAfter(":")?.trim()
+            sentInviteCseq = lines.firstOrNull { it.startsWith("CSeq:", ignoreCase = true) }
+                ?.substringAfter(":")?.trim()?.substringBefore(" ")?.toIntOrNull()
+        }
+    }
+
+    /**
+     * End an outgoing INVITE that has not been answered with CANCEL (RFC 3261
+     * 9.1). Used for the legs that lost an inbound-call race across server
+     * nodes. Returns false when there is nothing pending to cancel.
+     */
+    fun cancelPendingInvite(): Boolean {
+        val cancel = synchronized(this) {
+            if (direction != Direction.OUTBOUND || state == State.ANSWERED || state == State.TERMINATED) return false
+            val uri = sentInviteUri ?: return false
+            val via = sentInviteVia ?: return false
+            val cseq = sentInviteCseq ?: return false
+            state = State.TERMINATED
+            cancelledLocally = true
+            cancelledAt = System.currentTimeMillis()
+            SipBuilder.cancel(uri, via, fromHeader, toHeader, callId, cseq,
+                sipClient.username, sipClient.publicIp, sipClient.localPort)
+        }
+        sipClient.sendResponse(cancel, sipClient.serverAddress)
+        Log.i(TAG, "Sent CANCEL for call $callId")
+        listener?.onCallTerminated(this)
+        return true
+    }
+
     @Volatile var state: State = State.TRYING
         private set
 
@@ -142,6 +195,9 @@ class SipCall(
     fun handleMessage(msg: SipMessage): Boolean {
         // Stop INVITE retransmission as soon as any response arrives
         if (msg.isResponse) responseReceived = true
+        if (msg.isResponse && (msg.statusCode ?: 0) >= 200 && msg.cseq?.contains("INVITE") == true) {
+            inviteFinalSeen = true
+        }
 
         when {
             // 200 OK to our INVITE
@@ -177,6 +233,13 @@ class SipCall(
                             0
                         }
                     }
+                }
+                if (answerTransition == 2 && cancelledLocally) {
+                    // The 200 crossed our CANCEL: the dialog exists on the
+                    // server now, so close it instead of leaving it up.
+                    synchronized(this) { state = State.ANSWERED }
+                    hangup()
+                    return true
                 }
                 if (answerTransition != 0) {
                     Log.i(

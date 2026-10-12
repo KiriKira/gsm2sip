@@ -101,6 +101,20 @@ object MeshVoiceStore {
     }
 }
 
+/** Last reported SIP registration per node, for the settings list (not a secret). */
+object MeshVoiceStatus {
+    private const val PREFS = "mesh-voice-status"
+
+    fun record(context: Context, nodeGatewayId: String, registered: Boolean) {
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(nodeGatewayId.lowercase(), registered).apply()
+    }
+
+    fun registered(context: Context, nodeGatewayId: String): Boolean =
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(nodeGatewayId.lowercase(), false)
+}
+
 /** Provision this gateway's SIP endpoint on a node, once voice is set up on the primary. */
 object MeshVoiceProvisioning {
     /** Returns true when the node has a usable SIP account afterwards. Blocking. */

@@ -65,6 +65,7 @@ import com.callagent.gateway.background.GatewayBackgroundRuntime
 import com.callagent.gateway.sim.SimRegistry
 import com.callagent.gateway.ui.GatewaySetupCard
 import com.callagent.gateway.ui.MeshNodesSection
+import com.callagent.gateway.mesh.JoinLink
 import com.callagent.gateway.ui.GatewaySetupChecklist
 import com.callagent.gateway.sms.SmsOutbox
 import com.callagent.gateway.sms.SmsProviderRecovery
@@ -433,6 +434,7 @@ class MainActivity : AppCompatActivity() {
             },
             onChanged = { GatewayService.startControl(this) }
         ).also { it.render() }
+        if (savedInstanceState == null) handleJoinLink(intent)
         restoreControlUiState()
         restorePendingSimProposal()
         tvHomeStatusPill = findViewById(R.id.tvHomeStatusPill)
@@ -1176,7 +1178,47 @@ class MainActivity : AppCompatActivity() {
         "HTTPS 同步已暂停 · 请在首页启用后台运行"
     }
 
-    private fun pairControlGateway() {
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleJoinLink(intent)
+    }
+
+    /**
+     * A gsm2sip://join link lists one-time gateway pairing codes for several
+     * server nodes. Unpaired, the first entry is the primary pairing (SIMs are
+     * then confirmed as usual) and the rest become other nodes; paired, every
+     * entry is added as another node.
+     */
+    private fun handleJoinLink(source: Intent?) {
+        val link = source?.dataString
+        if (!JoinLink.isJoinLink(link)) return
+        // One-time secrets: never keep them in the intent for a recreate.
+        source?.data = null
+        val entries = JoinLink.parse(link!!, "gateway")
+        if (entries == null) {
+            Toast.makeText(this, "这个加入链接无效，或不是给旧手机用的。", Toast.LENGTH_LONG).show()
+            return
+        }
+        val paired = CredentialStore.load(this) != null
+        val hosts = entries.joinToString("\n") { "• ${it.serverUrl}" }
+        MaterialAlertDialogBuilder(this)
+            .setTitle(if (paired) "添加 ${entries.size} 个节点？" else "加入 ${entries.size} 个服务器？")
+            .setMessage(if (paired) hosts else "先与第一个服务器配对（随后确认 SIM），其余作为其他节点：\n$hosts")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("加入") { _, _ ->
+                if (paired) {
+                    meshNodesSection?.addAll(entries)
+                } else {
+                    findViewById<EditText>(R.id.etControlUrl).setText(entries.first().serverUrl)
+                    findViewById<EditText>(R.id.etControlPairingCode).setText(entries.first().pairingCode)
+                    pairControlGateway { meshNodesSection?.addAll(entries.drop(1)) }
+                }
+            }
+            .show()
+    }
+
+    private fun pairControlGateway(onPaired: (() -> Unit)? = null) {
         val base = findViewById<EditText>(R.id.etControlUrl).text.toString().trim()
         val code = findViewById<EditText>(R.id.etControlPairingCode).text.toString().trim()
         val deviceName = findViewById<EditText>(R.id.etControlDeviceName).text.toString().trim()
@@ -1217,6 +1259,7 @@ class MainActivity : AppCompatActivity() {
                         else -> "网关已配对，但后台服务未能启动"
                     })
                     refreshBackgroundStatus()
+                    onPaired?.invoke()
                 }
             } catch (e: Exception) {
                 val detail = (e as? ControlApiException)?.code ?: "PAIRING_FAILED"

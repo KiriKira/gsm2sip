@@ -151,6 +151,7 @@ class MeshCoordinator(
                 radio = radio)
         }
         val installId = if (accepts(MESH_EXTENSION)) database.installId() else null
+        MeshVoiceStatus.record(app, node.gatewayId, inputs.sipRegisteredFor(node.gatewayId))
         val prepared = database.prepareHeartbeatPayload(node.gatewayId) { sequence ->
             client.heartbeatBody(sequence, inputs.root, sipRegistered = inputs.sipRegisteredFor(node.gatewayId),
                 batteryPercent = inputs.batteryPercent,

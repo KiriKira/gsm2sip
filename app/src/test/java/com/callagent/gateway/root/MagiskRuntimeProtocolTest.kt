@@ -129,6 +129,8 @@ class MagiskRuntimeProtocolTest {
         )
         val fixture = candidates.firstOrNull(File::isFile)
             ?: throw AssertionError("Shared module protocol fixture was not found")
+        // The fixture pins the dev versionCode; release builds use 10000 + run number.
         return fixture.readText(Charsets.UTF_8)
+            .replace(Regex("(?m)^app_version=\\d+$"), "app_version=${BuildConfig.VERSION_CODE}")
     }
 }

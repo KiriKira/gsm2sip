@@ -142,7 +142,9 @@ class MeshCoordinator(
         val sims = database.meshNodeSims(node.gatewayId).map { bound ->
             val mapping = local[bound.simId]
             val radio: RadioSnapshot? = if (mapping != null && accepts(RadioTelemetry.EXTENSION)) {
-                runCatching { RadioTelemetry.read(app, mapping.subscriptionId) }.getOrNull()
+                runCatching {
+                    RadioTelemetry.read(app, mapping.subscriptionId, accepts(RadioTelemetry.COUNTRY_EXTENSION))
+                }.getOrNull()
             } else null
             HeartbeatSim(bound.simId, revision,
                 mapping?.let { inputs.serviceStateFor(it.subscriptionId) } ?: "absent",

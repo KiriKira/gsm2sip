@@ -962,13 +962,15 @@ class GatewayService : Service() {
         val snapshot = SimRegistry.snapshot(this)
         val radioAccepted = ControlExtensions.accepts(this, session.gatewayId, session.controlBaseUrl,
             RadioTelemetry.EXTENSION)
+        val countryAccepted = ControlExtensions.accepts(this, session.gatewayId, session.controlBaseUrl,
+            RadioTelemetry.COUNTRY_EXTENSION)
         val sims = snapshot.mappings
             .map { mapping ->
                 HeartbeatSim(mapping.simId, mapping.mappingRevision,
                     serviceStateFor(mapping.subscriptionId),
                     identityVerified = mapping.identityState != SimRegistry.IdentityState.UNVERIFIED,
                     radio = if (radioAccepted) runCatching {
-                        RadioTelemetry.read(this, mapping.subscriptionId)
+                        RadioTelemetry.read(this, mapping.subscriptionId, countryAccepted)
                     }.getOrNull() else null)
             }
         val (batteryPercent, charging) = batteryState()

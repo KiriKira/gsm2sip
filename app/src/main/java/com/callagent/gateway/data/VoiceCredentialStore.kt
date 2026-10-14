@@ -62,6 +62,7 @@ object VoiceCredentialStore {
         check(CredentialStore.load(context)?.gatewayId == gatewayId) { "Pairing changed during SIP provisioning" }
         val server = config.getString("server_name")
         val user = config.getString("auth_username")
+        val transport = com.callagent.gateway.sip.ProvisionedSipTransport.from(config)
         val json = JSONObject().put("server",server).put("user",user).put("password",config.getString("password"))
             .put("gateway_id",gatewayId).put("ca_pem",config.optString("ca_pem"))
         val pending = read(context)
@@ -71,11 +72,9 @@ object VoiceCredentialStore {
         // Commit the encrypted secret first. A settings failure can be retried
         // using the same endpoint identity without exposing the password.
         write(context,json)
-        val registrar = java.net.URI(config.getString("registrar_uri").replaceFirst("sips:","https://"))
-        val port = if (registrar.port > 0) registrar.port else 5061
         check(context.getSharedPreferences("gateway",Context.MODE_PRIVATE).edit()
-            .putString("server",server).putInt("port",port).putString("user",user)
-            .putBoolean("sip_tls",true).putBoolean("srtp_enabled",true).remove("pass").commit())
+            .putString("server",server).putInt("port",transport.port).putString("user",user)
+            .putBoolean("sip_tls",transport.tls).putBoolean("srtp_enabled",transport.srtp).remove("pass").commit())
         json.remove("pending_gateway_id"); json.remove("pending_key")
         write(context,json)
     }

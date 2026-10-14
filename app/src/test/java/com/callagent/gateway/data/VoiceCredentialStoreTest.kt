@@ -2,10 +2,14 @@ package com.callagent.gateway.data
 
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
+import android.util.Base64
+import com.callagent.gateway.mesh.MeshVoiceStore
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -21,6 +25,7 @@ import java.security.Provider
 import java.security.Security
 import java.security.cert.Certificate
 import java.util.Date
+import javax.crypto.Cipher
 import javax.crypto.KeyGeneratorSpi
 import javax.crypto.SecretKey
 import javax.crypto.spec.SecretKeySpec
@@ -39,6 +44,7 @@ class VoiceCredentialStoreTest {
         context.getSharedPreferences("gateway", Context.MODE_PRIVATE).edit().clear().commit()
         context.getSharedPreferences("voice-secrets", Context.MODE_PRIVATE).edit().clear().commit()
         context.getSharedPreferences("control-session", Context.MODE_PRIVATE).edit().clear().commit()
+        context.getSharedPreferences("mesh-voice", Context.MODE_PRIVATE).edit().clear().commit()
         replacedProvider = Security.getProvider(KEYSTORE_PROVIDER)
         Security.removeProvider(KEYSTORE_PROVIDER)
         Security.insertProviderAt(TestAndroidKeyStoreProvider(), 1)
@@ -49,6 +55,7 @@ class VoiceCredentialStoreTest {
         context.getSharedPreferences("gateway", Context.MODE_PRIVATE).edit().clear().commit()
         context.getSharedPreferences("voice-secrets", Context.MODE_PRIVATE).edit().clear().commit()
         context.getSharedPreferences("control-session", Context.MODE_PRIVATE).edit().clear().commit()
+        context.getSharedPreferences("mesh-voice", Context.MODE_PRIVATE).edit().clear().commit()
         Security.removeProvider(KEYSTORE_PROVIDER)
         replacedProvider?.let { Security.insertProviderAt(it, 1) }
     }
@@ -90,6 +97,76 @@ class VoiceCredentialStoreTest {
         CredentialStore.save(context, session("gateway-B"))
         assertEquals("", VoiceCredentialStore.password(context))
         assertNull(VoiceCredentialStore.caPem(context, "sip.example.test"))
+    }
+
+    @Test
+    fun provisionedTransportSelectsTlsByDefaultAndUdpWhenTheServerSaysSo() {
+        val owner = session("gateway-A")
+        CredentialStore.save(context, owner)
+        val prefs = context.getSharedPreferences("gateway", Context.MODE_PRIVATE)
+        val legacy = JSONObject()
+            .put("server_name", "sip.example.test")
+            .put("auth_username", "gateway-user")
+            .put("password", "provisioned-password")
+            .put("registrar_uri", "sips:sip.example.test")
+        VoiceCredentialStore.saveProvisioned(context, owner.gatewayId, legacy)
+        assertTrue(prefs.getBoolean("sip_tls", false))
+        assertTrue(prefs.getBoolean("srtp_enabled", false))
+        assertEquals(5061, prefs.getInt("port", 0))
+
+        val udp = JSONObject()
+            .put("server_name", "192.168.1.10")
+            .put("auth_username", "dev_x")
+            .put("password", "lan-password")
+            .put("transport", "udp")
+            .put("media_encryption", "none")
+            .put("registrar_uri", "sip:192.168.1.10:5060")
+            .put("outbound_proxy_uri", "sip:192.168.1.10:5060;transport=udp;lr")
+            .put("aor", "sip:dev_x@192.168.1.10:5060")
+        VoiceCredentialStore.saveProvisioned(context, owner.gatewayId, udp)
+        assertFalse(prefs.getBoolean("sip_tls", true))
+        assertFalse(prefs.getBoolean("srtp_enabled", true))
+        assertEquals(5060, prefs.getInt("port", 0))
+        assertEquals("lan-password", VoiceCredentialStore.password(context))
+        assertNull(VoiceCredentialStore.caPem(context, "192.168.1.10"))
+    }
+
+    @Test
+    fun meshNodeAccountKeepsItsTransportAndOlderAccountsStayTls() {
+        MeshVoiceStore.saveProvisioned(context, "node-udp", JSONObject()
+            .put("server_name", "100.64.0.7")
+            .put("auth_username", "dev_x")
+            .put("password", "node-password")
+            .put("transport", "udp")
+            .put("media_encryption", "none")
+            .put("registrar_uri", "sip:100.64.0.7:5060;transport=udp"))
+        val udp = MeshVoiceStore.account(context, "node-udp")!!
+        assertFalse(udp.tls)
+        assertEquals(5060, udp.port)
+        assertNull(udp.caPem)
+
+        MeshVoiceStore.saveProvisioned(context, "node-tls", JSONObject()
+            .put("server_name", "vps.example.test")
+            .put("auth_username", "dev_y")
+            .put("password", "node-password")
+            .put("registrar_uri", "sips:vps.example.test")
+            .put("ca_pem", "node CA"))
+        val tls = MeshVoiceStore.account(context, "node-tls")!!
+        assertTrue(tls.tls)
+        assertEquals(5061, tls.port)
+        assertEquals("node CA", tls.caPem)
+
+        // An account stored before the tls flag existed has no such key.
+        val stored = JSONObject().put("server", "old.example.test").put("port", 5061)
+            .put("user", "dev_z").put("password", "old-password").put("ca_pem", "")
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            .apply { init(Cipher.ENCRYPT_MODE, SecretKeySpec(TEST_KEY, "AES")) }
+        val packed = cipher.iv + cipher.doFinal(stored.toString().toByteArray(Charsets.UTF_8))
+        context.getSharedPreferences("mesh-voice", Context.MODE_PRIVATE).edit()
+            .putString("node_node-old", Base64.encodeToString(packed, Base64.NO_WRAP)).commit()
+        val old = MeshVoiceStore.account(context, "node-old")!!
+        assertTrue(old.tls)
+        assertEquals("old-password", old.password)
     }
 
     @Test

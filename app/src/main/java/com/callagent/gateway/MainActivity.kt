@@ -1224,11 +1224,11 @@ class MainActivity : AppCompatActivity() {
         val deviceName = findViewById<EditText>(R.id.etControlDeviceName).text.toString().trim()
             .ifEmpty { android.os.Build.MODEL ?: "旧手机网关" }
         if (base.isEmpty() || code.isEmpty()) {
-            Toast.makeText(this, "请填写 HTTPS 服务器地址和一次性配对码", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "请填写服务器地址（http:// 或 https://）和一次性配对码", Toast.LENGTH_LONG).show()
             return
         }
         val normalizedBase = base.trimEnd('/')
-        setControlBusy(true, "正在通过 HTTPS 配对…")
+        setControlBusy(true, "正在配对…")
         Thread({
             try {
                 val result = ControlApiClient(this, normalizedBase).pair(code, deviceName)
@@ -1664,8 +1664,8 @@ class MainActivity : AppCompatActivity() {
             prefs.getBoolean("translit_ascii", false)
         val cbTls = findViewById<MaterialSwitch>(R.id.cbCfgTls)
         val cbSrtp = findViewById<MaterialSwitch>(R.id.cbCfgSrtp)
-        cbTls.isChecked = true
-        cbSrtp.isChecked = true
+        cbTls.isChecked = prefs.getBoolean("sip_tls", true)
+        cbSrtp.isChecked = cbTls.isChecked && prefs.getBoolean("srtp_enabled", true)
         cbTls.isEnabled = false
 
         // SRTP follows TLS in the UI as well as in the code.  The setting is
@@ -1678,7 +1678,8 @@ class MainActivity : AppCompatActivity() {
                 "SIP signalling uses certificate-validated TLS and calls require SRTP. " +
                     "A server that cannot negotiate SRTP will be rejected."
             } else {
-                "TLS is required for SIP calls."
+                "The server configured SIP over UDP: signalling and call audio are not encrypted. " +
+                    "Use this only on a trusted LAN or tailnet."
             }
         }
         syncSrtpEnabled()
@@ -1785,8 +1786,11 @@ class MainActivity : AppCompatActivity() {
         val backgroundEnabledBeforeSave = GatewayBackgroundRuntime.allowedRecovery(this)
         val useStun = findViewById<MaterialSwitch>(R.id.cbCfgUseStun).isChecked
         val translit = findViewById<MaterialSwitch>(R.id.cbCfgTranslit).isChecked
-        val tls = true
-        val srtp = true
+        // The transport comes from the server's SIP configuration; the editor
+        // keeps whatever was provisioned (TLS unless the server chose UDP).
+        val savedPrefs = getSharedPreferences("gateway", MODE_PRIVATE)
+        val tls = savedPrefs.getBoolean("sip_tls", true)
+        val srtp = tls && savedPrefs.getBoolean("srtp_enabled", true)
         val agentVolStep = findViewById<SeekBar>(R.id.sbCfgAgentVolume).progress - 3
         val codec = when (findViewById<RadioGroup>(R.id.rgCfgCodec).checkedRadioButtonId) {
             R.id.rbCodecG711 -> "g711"

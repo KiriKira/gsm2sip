@@ -39,7 +39,8 @@ object JoinLink {
             val code = value.substringAfterLast('#', "").trim()
             if (code.isEmpty() || code.length > MAX_CODE_LENGTH || code.any(Char::isWhitespace)) return null
             val serverUri = runCatching { URI(server) }.getOrNull() ?: return null
-            if (!serverUri.scheme.equals("https", true) || serverUri.host.isNullOrBlank() ||
+            val scheme = serverUri.scheme?.lowercase()
+            if ((scheme != "https" && scheme != "http") || serverUri.host.isNullOrBlank() ||
                 serverUri.userInfo != null || serverUri.rawQuery != null) return null
             JoinEntry(server.trimEnd('/'), code)
         }

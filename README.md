@@ -49,7 +49,9 @@ Android 安装器可能限制短信权限授予；没有 SEND_SMS/RECEIVE_SMS �
 产物为 `app/build/outputs/apk/debug/app-debug.apk`。特权系统安装还需按设备计划检查 Magisk 与应用签名；
 没有发布签名的 release 不能直接打包。不要用卸载重装解决签名冲突而丢弃未决发送账本。
 
-1. 在服务器创建 owner，分别生成 gateway/client 一次性配对码；按 server README 配置可信 HTTPS。
+1. 在服务器创建 owner，分别生成 gateway/client 一次性配对码；推荐按 server README 配置可信 HTTPS。
+   自托管在家庭局域网或 Tailscale 内的节点也可直接用 `http://` 地址（唤醒连接随之为 `ws://`），
+   服务器也可下发 UDP 上的 SIP（`sip:`、明文 RTP）；此时信令与通话音频都不加密，网络安全由部署者自行保证。
 2. 打开旧机首页的“完成设置”卡片，按顺序完成每一步；卡片会直接跳到对应设置项：
    在“中转服务器”中填写服务器地址、设备名称和一次性配对码，点击“配对网关”。
 3. 在“SIM 卡”中点击“同步 SIM 列表”，逐卡核对本机订阅与服务器 SIM 行，再点击“确认所选 SIM”。

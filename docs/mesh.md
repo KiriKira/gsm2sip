@@ -24,7 +24,8 @@
 
 - 主节点启用语音后，每个其他节点在同步时自动开通自己的 SIP 端点（`/devices/self/sip-config` +
   `sip-credentials/rotate`，重试键先落盘），凭据按节点加密保存（`MeshVoiceStore`）。语音运行时
-  为每个节点建立独立的 SIP/TLS 注册（`MeshVoiceClients`），节点心跳上报该节点自己的
+  为每个节点建立独立的 SIP 注册（`MeshVoiceClients`；默认 TLS + SRTP，节点的 SIP 配置声明
+  `transport: "udp"` 时改用 UDP 与明文 RTP，适合局域网或 Tailscale 内的节点），节点心跳上报该节点自己的
   `sip_registered`，所以主手机在哪个节点上都能看到“可通话”。
 - **来电**：GSM 来电同时经主节点和每个已注册、已绑定该 SIM 的节点发出 INVITE（相同 `call_id`，
   各带该节点的 SIM revision）。最先接通的一路胜出，其余用 CANCEL 取消；若取消与对方的 200 交叉，
@@ -44,5 +45,6 @@
 ## 当前限制
 
 - 其他节点目前只走 HTTPS 轮询（与控制循环同周期，约 30 秒）；主节点仍有 WSS 唤醒。
-- 来电在每个节点各发一路 SIP，会占用各节点的 SIP/TLS 连接；经 cloudflared 的节点无法承载 SIP。
+- 来电在每个节点各发一路 SIP，会占用各节点的 SIP 连接；经 cloudflared 的节点无法承载 SIP。
+- 节点地址推荐 HTTPS，也接受 `http://`（含加入链接），仅应在可信局域网或 Tailscale 内使用。
 - 移除节点后，尚未上传到该节点的副本保留在本地，不会转给其他节点（其他节点已各有一份）。

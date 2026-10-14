@@ -17,7 +17,6 @@ import java.net.URLEncoder
 import java.time.Instant
 import java.time.format.DateTimeFormatter
 import java.util.UUID
-import javax.net.ssl.HttpsURLConnection
 
 data class PairResult(val gatewayId: String, val role: String, val sipAvailable: Boolean, val sipReason: String)
 data class ServerMapping(val simId: String, val slotIndex: Int, val state: String, val mappingRevision: Long)
@@ -49,7 +48,8 @@ class ControlApiException(
     val httpStatus: Int = 0
 ) : Exception(message)
 
-/** HTTPS-only client for the frozen v1 control/data plane. Calls are blocking;
+/** Client for the frozen v1 control/data plane over HTTPS (recommended) or plain
+ * HTTP for a self-hosted node on a trusted LAN/tailnet. Calls are blocking;
  * callers run them on their IO executor. It never logs request or response data. */
 class ControlApiClient(
     context: Context,
@@ -324,8 +324,9 @@ class ControlApiClient(
             throw ControlApiException("SESSION_CHANGED","Control identity changed before request")
         }
         val url = URL(base + path)
-        val conn = url.openConnection() as? HttpsURLConnection
-            ?: throw ControlApiException("HTTPS_REQUIRED", "控制端点必须使用 HTTPS")
+        // HTTPS keeps the platform's default certificate and hostname checks.
+        val conn = url.openConnection() as? HttpURLConnection
+            ?: throw ControlApiException("INVALID_CONTROL_URL", "控制端点必须使用 http:// 或 https://")
         try {
             conn.instanceFollowRedirects = false
             conn.requestMethod = method
@@ -445,8 +446,9 @@ class ControlApiClient(
             val url = try { URL(value) } catch (_: Exception) {
                 throw ControlApiException("INVALID_CONTROL_URL", "控制服务器地址无效")
             }
-            if (url.protocol != "https" || url.host.isBlank() || url.userInfo != null || url.query != null || url.ref != null)
-                throw ControlApiException("HTTPS_REQUIRED", "请输入有效的 HTTPS 控制服务器地址")
+            if (url.protocol !in setOf("https", "http") || url.host.isBlank() || url.userInfo != null ||
+                url.query != null || url.ref != null)
+                throw ControlApiException("INVALID_CONTROL_URL", "请输入有效的 http:// 或 https:// 控制服务器地址")
             return value
         }
     }

@@ -59,6 +59,9 @@
     <!-- Disable battery optimization (user grants manually) -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- Cleartext is permitted so a self-hosted control server on a LAN or
+         tailnet can use http:// and ws://; https:// keeps the platform's
+         default certificate validation. -->
     <application
         android:name=".GatewayApp"
         android:allowBackup="false"
@@ -70,6 +73,7 @@
         android:supportsRtl="true"
         android:resizeableActivity="true"
         android:theme="@style/Theme.SipGsmGateway"
+        android:usesCleartextTraffic="true"
         tools:targetApi="35">
 
         <activity

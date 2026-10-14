@@ -45,19 +45,20 @@ internal object WakeConnectionPolicy {
     fun webSocketUrl(base: String): String {
         val parsed = base.toHttpUrlOrNull()
             ?: throw IllegalArgumentException("Invalid control endpoint")
-        require(parsed.scheme == "https" && parsed.username.isEmpty() && parsed.password.isEmpty() &&
-            parsed.query == null && parsed.fragment == null) { "Wake endpoint requires an HTTPS origin" }
+        require(parsed.username.isEmpty() && parsed.password.isEmpty() &&
+            parsed.query == null && parsed.fragment == null) { "Wake endpoint requires a plain http(s) origin" }
         val currentPath = parsed.encodedPath.trimEnd('/')
         val wakePath = when {
             currentPath.isEmpty() -> "/v1/ws"
             currentPath == "/v1" || currentPath.endsWith("/v1") -> "$currentPath/ws"
             else -> "$currentPath/v1/ws"
         }
-        return parsed.newBuilder()
+        // wss:// for an https base, ws:// for a plain-http LAN/tailnet node.
+        val url = parsed.newBuilder()
             .encodedPath(wakePath)
             .build()
             .toString()
-            .replaceFirst("https://", "wss://")
+        return if (parsed.isHttps) url.replaceFirst("https://", "wss://") else url.replaceFirst("http://", "ws://")
     }
 }
 

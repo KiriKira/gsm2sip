@@ -31,7 +31,10 @@ data class HeartbeatSim(
     val mappingRevision: Long,
     val serviceState: String,
     val identityVerified: Boolean,
-    /** Sent only when the server advertised [RadioTelemetry.EXTENSION]. */
+    /**
+     * Sent only when the server advertised [RadioTelemetry.EXTENSION]; its
+     * country_iso only when it also advertised [RadioTelemetry.COUNTRY_EXTENSION].
+     */
     val radio: RadioSnapshot? = null
 )
 data class HeartbeatResult(

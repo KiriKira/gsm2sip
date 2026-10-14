@@ -54,6 +54,70 @@ class RadioTelemetryTest {
     }
 
     @Test
+    fun countryIsoIsUppercasedAndInvalidValuesAreDropped() {
+        assertEquals("CN", RadioTelemetry.sanitizeCountry("cn"))
+        assertEquals("DE", RadioTelemetry.sanitizeCountry(" de "))
+        assertNull(RadioTelemetry.sanitizeCountry(""))
+        assertNull(RadioTelemetry.sanitizeCountry("  "))
+        assertNull(RadioTelemetry.sanitizeCountry(null))
+        assertNull(RadioTelemetry.sanitizeCountry("chn"))
+        assertNull(RadioTelemetry.sanitizeCountry("c1"))
+        assertNull(RadioTelemetry.sanitizeCountry("中国"))
+        // The SIM's home country wins over the serving network while roaming.
+        assertEquals("CN", RadioTelemetry.countryIso("cn", "hk"))
+        assertEquals("HK", RadioTelemetry.countryIso("", "hk"))
+        assertEquals("HK", RadioTelemetry.countryIso(null, "HK"))
+        assertNull(RadioTelemetry.countryIso(" ", ""))
+        assertNull(RadioTelemetry.countryIso(null, null))
+        assertEquals("CN", RadioTelemetry.snapshot(2, null, null, null, countryIso = "cn").countryIso)
+        assertNull(RadioTelemetry.snapshot(2, null, null, null, countryIso = "xx1").countryIso)
+        assertNull(RadioTelemetry.snapshot(2, null, null, null).countryIso)
+    }
+
+    @Test
+    fun heartbeatRadioCarriesCountryOnlyWhenSet() {
+        val client = ControlApiClient(RuntimeEnvironment.getApplication(), "https://control.invalid")
+        val sim = HeartbeatSim("sim-a", 3, "in_service", true,
+            radio = RadioTelemetry.snapshot(2, TelephonyManager.NETWORK_TYPE_LTE, "Carrier", true, countryIso = "cn"))
+        val radio = client.heartbeatBody(1, false, false, 50, true, listOf(sim))
+            .getJSONArray("sim_states").getJSONObject(0).getJSONObject("radio")
+        assertEquals("CN", radio.getString("country_iso"))
+        assertEquals(setOf("signal_level", "network_type", "network_operator", "roaming", "country_iso"),
+            radio.keys().asSequence().toSet())
+        val unknown = client.heartbeatBody(2, false, false, 50, true,
+            listOf(sim.copy(radio = sim.radio!!.copy(countryIso = null))))
+            .getJSONArray("sim_states").getJSONObject(0).getJSONObject("radio")
+        assertFalse(unknown.has("country_iso"))
+    }
+
+    @Test
+    fun readFillsCountryOnlyWhenTheServerAcceptsIt() {
+        val context = RuntimeEnvironment.getApplication()
+        val manager = context.getSystemService(TelephonyManager::class.java)
+        val shadow = org.robolectric.Shadows.shadowOf(manager)
+        shadow.setTelephonyManagerForSubscriptionId(7, manager)
+        shadow.setSimCountryIso("cn")
+        shadow.setNetworkCountryIso("hk")
+        assertNull(RadioTelemetry.read(context, 7)!!.countryIso)
+        assertFalse(RadioTelemetry.read(context, 7, includeCountry = false)!!.toJson().has("country_iso"))
+        assertEquals("CN", RadioTelemetry.read(context, 7, includeCountry = true)!!.countryIso)
+        shadow.setSimCountryIso("")
+        assertEquals("HK", RadioTelemetry.read(context, 7, includeCountry = true)!!.countryIso)
+        shadow.setNetworkCountryIso("")
+        assertNull(RadioTelemetry.read(context, 7, includeCountry = true)!!.countryIso)
+    }
+
+    @Test
+    fun countryExtensionIsTrackedPerServerNode() {
+        val context = RuntimeEnvironment.getApplication()
+        ControlExtensions.record(context, "gw-a", "https://a.example", setOf(RadioTelemetry.EXTENSION))
+        ControlExtensions.record(context, "gw-b", "https://b.example",
+            setOf(RadioTelemetry.EXTENSION, RadioTelemetry.COUNTRY_EXTENSION))
+        assertFalse(ControlExtensions.accepts(context, "gw-a", "https://a.example", RadioTelemetry.COUNTRY_EXTENSION))
+        assertTrue(ControlExtensions.accepts(context, "gw-b", "https://b.example", RadioTelemetry.COUNTRY_EXTENSION))
+    }
+
+    @Test
     fun extensionsAreScopedToGatewayAndServerAndCanBeForgotten() {
         val context = RuntimeEnvironment.getApplication()
         val url = "https://control.example/"

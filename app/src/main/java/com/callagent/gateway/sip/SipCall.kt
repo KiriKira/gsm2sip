@@ -96,6 +96,9 @@ class SipCall(
     // authenticated INVITE (CSeq N+1) which gets 491 (Request Pending)
     // because the server is already processing the first one (CSeq N).
     @Volatile var authHandled = false
+    /** CSeq of the INVITE that carried credentials; a 401/407 for it is a rejection. */
+    @Volatile var authenticatedInviteCseq = 0
+    @Volatile private var staleNonceRetried = false
 
     // RTP endpoints
     var localRtpPort: Int = 0
@@ -292,8 +295,9 @@ class SipCall(
             }
 
             // 401/407 Auth required for INVITE
-            msg.isResponse && (msg.statusCode == 401 || msg.statusCode == 407) -> {
-                if (authHandled) {
+            msg.isResponse && (msg.statusCode == 401 || msg.statusCode == 407) &&
+                !credentialsRejected(msg) -> {
+                if (authHandled && !isStaleChallengeForAuthenticatedInvite(msg)) {
                     // UDP retransmission of the original 401 — ignore it.
                     // We already sent an authenticated re-INVITE; sending another
                     // would create a duplicate CSeq that gets 491 (Request Pending).
@@ -373,7 +377,8 @@ class SipCall(
                     Log.i(TAG, "Ignoring ${msg.statusCode} — call is no longer pending (CSeq: ${msg.cseq})")
                     return true
                 }
-                sipClient.logListener?.invoke("INVITE rejected: ${msg.statusCode} (call $callId)")
+                val reason = if (msg.statusCode == 401 || msg.statusCode == 407) " — server rejected the gateway's SIP credentials" else ""
+                sipClient.logListener?.invoke("INVITE rejected: ${msg.statusCode}$reason (call $callId)")
                 listener?.onCallTerminated(this)
                 return true
             }
@@ -390,6 +395,25 @@ class SipCall(
             }
         }
     }
+
+    private fun responseCseq(msg: SipMessage): Int? =
+        msg.cseq?.trim()?.split(" ")?.firstOrNull()?.toIntOrNull()
+
+    /** A stale nonce on the authenticated INVITE is answered once more with the new nonce. */
+    private fun isStaleChallengeForAuthenticatedInvite(msg: SipMessage): Boolean {
+        if (staleNonceRetried || authenticatedInviteCseq == 0 || responseCseq(msg) != authenticatedInviteCseq) return false
+        if (SipAuth.parseChallenge(msg)?.stale != true) return false
+        staleNonceRetried = true
+        return true
+    }
+
+    /**
+     * A challenge answering the INVITE that already carried credentials means the
+     * server refused them. Retransmissions of the first challenge keep the older CSeq.
+     */
+    private fun credentialsRejected(msg: SipMessage): Boolean =
+        authHandled && authenticatedInviteCseq != 0 && responseCseq(msg) == authenticatedInviteCseq &&
+            (staleNonceRetried || SipAuth.parseChallenge(msg)?.stale != true)
 
     /** Accept an inbound INVITE: send 200 OK with SDP */
     fun accept(localRtpPort: Int) {

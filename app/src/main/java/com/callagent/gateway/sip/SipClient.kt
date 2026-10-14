@@ -747,10 +747,12 @@ class SipClient(
         val targetUri = if (uriStart >= 0) toHeader.substring(uriStart, uriEnd) else return
 
         val auth = digestState.authorization("INVITE", targetUri, username, password, authParams)
+        val cseq = call.localCseq++
+        call.authenticatedInviteCseq = cseq
         val invite = SipBuilder.invite(
             targetUri, username, serverDomain,
             publicIp, advertisedPort,
-            call.callId, call.localCseq++,
+            call.callId, cseq,
             call.localRtpPort,
             fromTag = call.localTag,
             callerIdNumber = call.outboundCallerIdNumber,

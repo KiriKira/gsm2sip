@@ -384,6 +384,18 @@ class SipClient(
     private fun isTrustedTlsServerPeer(address: Pair<String, Int>): Boolean =
         useTls && transport is TlsSipTransport && transport?.isOpen == true && address == serverAddress
 
+    /**
+     * Whether call routing metadata from [address] may be trusted. Over TLS that
+     * is the verified server session; plain UDP (an explicit LAN/VPN opt-in)
+     * has no session, so it trusts datagrams from the registrar's address and
+     * port, which is as far as an unencrypted transport can vouch.
+     */
+    private fun isTrustedServerPeer(address: Pair<String, Int>): Boolean {
+        if (useTls) return isTrustedTlsServerPeer(address)
+        if (!allowInsecureSignalling || address.second != serverPort) return false
+        return address.first == serverDomain || address.first == resolvedServerAddr?.hostAddress
+    }
+
     // ── Registration ────────────────────────────────────
 
     /**
@@ -522,7 +534,7 @@ class SipClient(
         call.fromHeader = msg.from
         call.toHeader = msg.to
         call.remoteTag = msg.fromTag
-        if (isTrustedTlsServerPeer(address)) {
+        if (isTrustedServerPeer(address)) {
             call.trustedGsmMetadata = msg.gsmCallMetadata()
         }
 

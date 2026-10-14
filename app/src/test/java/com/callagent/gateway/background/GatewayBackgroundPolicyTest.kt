@@ -53,15 +53,27 @@ class GatewayBackgroundPolicyTest {
     }
 
     @Test
-    fun wakeUrlIsWssOnlyAndDoesNotDuplicateTheVersionSegment() {
+    fun wakeUrlFollowsTheBaseSchemeAndDoesNotDuplicateTheVersionSegment() {
         assertEquals("wss://control.example/v1/ws",
             WakeConnectionPolicy.webSocketUrl("https://control.example"))
         assertEquals("wss://control.example/v1/ws",
             WakeConnectionPolicy.webSocketUrl("https://control.example/v1/"))
         assertEquals("wss://control.example/edge/v1/ws",
             WakeConnectionPolicy.webSocketUrl("https://control.example/edge"))
-        val rejected = runCatching { WakeConnectionPolicy.webSocketUrl("http://control.example") }.exceptionOrNull()
+        assertEquals("ws://192.168.1.10:8080/v1/ws",
+            WakeConnectionPolicy.webSocketUrl("http://192.168.1.10:8080"))
+        assertEquals("ws://control.example/edge/v1/ws",
+            WakeConnectionPolicy.webSocketUrl("http://control.example/edge/"))
+        val rejected = runCatching { WakeConnectionPolicy.webSocketUrl("ftp://control.example") }.exceptionOrNull()
         assertTrue(rejected is IllegalArgumentException)
+        val userInfoRejected = runCatching {
+            WakeConnectionPolicy.webSocketUrl("http://user:pass@control.example")
+        }.exceptionOrNull()
+        assertTrue(userInfoRejected is IllegalArgumentException)
+        val fragmentRejected = runCatching {
+            WakeConnectionPolicy.webSocketUrl("http://control.example#frag")
+        }.exceptionOrNull()
+        assertTrue(fragmentRejected is IllegalArgumentException)
         val queryRejected = runCatching {
             WakeConnectionPolicy.webSocketUrl("https://control.example?token=not-allowed")
         }.exceptionOrNull()

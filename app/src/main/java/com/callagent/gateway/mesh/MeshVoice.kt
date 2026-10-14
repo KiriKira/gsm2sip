@@ -7,9 +7,9 @@ import android.util.Base64
 import com.callagent.gateway.bridge.CallOrchestrator
 import com.callagent.gateway.data.GatewayDatabase
 import com.callagent.gateway.net.ControlApiClient
+import com.callagent.gateway.sip.ProvisionedSipTransport
 import com.callagent.gateway.sip.SipClient
 import org.json.JSONObject
-import java.net.URI
 import java.security.KeyStore
 import java.util.UUID
 import javax.crypto.Cipher
@@ -24,7 +24,9 @@ data class NodeSipAccount(
     val port: Int,
     val username: String,
     val password: String,
-    val caPem: String?
+    val caPem: String?,
+    /** SIP over TLS with SRTP; false is plain UDP/RTP for a LAN or tailnet node. */
+    val tls: Boolean = true
 )
 
 /**
@@ -41,7 +43,9 @@ object MeshVoiceStore {
         val json = read(context, nodeGatewayId) ?: return null
         val password = json.optString("password").takeIf { it.isNotBlank() } ?: return null
         return NodeSipAccount(nodeGatewayId, json.getString("server"), json.optInt("port", 5061),
-            json.getString("user"), password, json.optString("ca_pem").takeIf { it.isNotBlank() })
+            json.getString("user"), password, json.optString("ca_pem").takeIf { it.isNotBlank() },
+            // Accounts stored before UDP nodes existed were always TLS.
+            json.optBoolean("tls", true))
     }
 
     @Synchronized fun beginProvisioning(context: Context, nodeGatewayId: String): String {
@@ -53,10 +57,11 @@ object MeshVoiceStore {
     }
 
     @Synchronized fun saveProvisioned(context: Context, nodeGatewayId: String, config: JSONObject) {
-        val registrar = URI(config.getString("registrar_uri").replaceFirst("sips:", "https://"))
+        val transport = ProvisionedSipTransport.from(config)
         write(context, nodeGatewayId, JSONObject()
             .put("server", config.getString("server_name"))
-            .put("port", if (registrar.port > 0) registrar.port else 5061)
+            .put("port", transport.port)
+            .put("tls", transport.tls)
             .put("user", config.getString("auth_username"))
             .put("password", config.getString("password"))
             .put("ca_pem", config.optString("ca_pem")))
@@ -138,7 +143,8 @@ object MeshVoiceProvisioning {
 
 /**
  * The gateway's SIP registrations with mesh nodes, next to the primary's.
- * Each runs its own TLS connection and is attached to the one
+ * Each runs its own TLS connection (or UDP socket, for a node that offers
+ * plain SIP) and is attached to the one
  * [CallOrchestrator], which still bridges one call at a time.
  */
 class MeshVoiceClients(private val context: Context, private val log: (String) -> Unit) {
@@ -150,10 +156,11 @@ class MeshVoiceClients(private val context: Context, private val log: (String) -
         val wanted = database.meshNodes().mapNotNull { node -> MeshVoiceStore.account(context, node.gatewayId) }
             .associateBy { it.nodeGatewayId }
         (clients.keys - wanted.keys).toList().forEach { nodeId -> stop(orchestrator, nodeId) }
-        wanted.values.forEachIndexed { index, account ->
+        wanted.values.forEach { account ->
             val existing = clients[account.nodeGatewayId]
             if (existing != null && existing.serverDomain == account.server && existing.username == account.username &&
-                existing.localIp == localIp) return@forEachIndexed
+                existing.serverPort == account.port && existing.useTls == account.tls &&
+                existing.localIp == localIp) return@forEach
             existing?.let { stop(orchestrator, account.nodeGatewayId) }
             val client = SipClient(
                 username = account.username,
@@ -161,10 +168,12 @@ class MeshVoiceClients(private val context: Context, private val log: (String) -
                 serverDomain = account.server,
                 serverPort = account.port,
                 localIp = localIp,
-                localPort = NODE_SIP_PORT_BASE + 2 * index,
+                // UDP binds this port, so it must not be one a running client holds.
+                localPort = nodeLocalPort(clients.values.map { it.localPort }.toSet()),
                 publicIp = publicIp,
-                useTls = true,
+                useTls = account.tls,
                 srtpRequested = true,
+                allowInsecureSignalling = !account.tls,
                 caPem = account.caPem,
                 nodeGatewayId = account.nodeGatewayId
             )
@@ -195,7 +204,12 @@ class MeshVoiceClients(private val context: Context, private val log: (String) -
         runCatching { client.stop() }
     }
 
-    private companion object {
+    internal companion object {
+        /** The primary binds 5060; node clients take 5062, 5064, ... */
         const val NODE_SIP_PORT_BASE = 5062
+
+        /** Lowest node port not held by a running client. */
+        fun nodeLocalPort(inUse: Set<Int>): Int =
+            generateSequence(NODE_SIP_PORT_BASE) { it + 2 }.first { it !in inUse }
     }
 }

@@ -692,7 +692,7 @@
                             android:layout_marginTop="8dp"
                             android:text="中转服务器" />
 
-                        <TextView style="@style/CfgLabel" android:text="服务器地址（HTTPS）" />
+                        <TextView style="@style/CfgLabel" android:text="服务器地址（http:// 或 https://）" />
                         <com.google.android.material.textfield.TextInputEditText
                             android:id="@+id/etControlUrl"
                             style="@style/CfgField"
@@ -1026,7 +1026,7 @@
                         <TextView
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="生产模式强制使用经证书校验的 TLS（通常为 5061 端口）加密 SIP 信令；通话音频由下方 SRTP 加密。"
+                            android:text="由服务器的 SIP 配置决定。推荐经证书校验的 TLS（通常为 5061 端口）加密 SIP 信令，通话音频由下方 SRTP 加密；局域网或 Tailscale 节点也可使用 UDP（5060，不加密）。"
                             android:textSize="12sp"
                             android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />

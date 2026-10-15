@@ -1384,13 +1384,22 @@ class CallOrchestrator(
                 tearDown("RTP error")
             }
             override fun onDtmfTone(digit: Char, active: Boolean) {
-                val targetCall = activeGsmCall ?: return
+                // The digit is never logged: it may be a PIN.
+                val targetCall = activeGsmCall ?: run {
+                    if (active) listener?.onRtpStats("DTMF received but there is no GSM call to play it on")
+                    return
+                }
                 telecomHandler.post {
-                    if (activeGsmCall !== targetCall || targetCall.state != Call.STATE_ACTIVE) return@post
+                    if (activeGsmCall !== targetCall || targetCall.state != Call.STATE_ACTIVE) {
+                        if (active) listener?.onRtpStats("DTMF received but the GSM call is not active")
+                        return@post
+                    }
                     try {
                         if (active) targetCall.playDtmfTone(digit) else targetCall.stopDtmfTone()
+                        if (active) listener?.onRtpStats("DTMF received and played on the GSM call")
                     } catch (e: Exception) {
                         Log.w(TAG, "Telecom DTMF dispatch failed: ${e.javaClass.simpleName}")
+                        if (active) listener?.onRtpStats("DTMF could not be played on the GSM call: ${e.javaClass.simpleName}")
                     }
                 }
             }

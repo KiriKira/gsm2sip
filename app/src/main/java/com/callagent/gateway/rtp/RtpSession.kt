@@ -1203,6 +1203,9 @@ class RtpSession(
 
                 val isTelephoneEvent = telephoneEventPayloadType != null &&
                     rtp.payloadType == telephoneEventPayloadType
+                // Voice keeps arriving during a keypress, so the socket never
+                // times out; age a tone whose end packets were lost here too.
+                if (!isTelephoneEvent) telephoneEvents?.expire()
                 if (isTelephoneEvent) {
                     if (telephoneEvents?.accept(rtp) != true) continue
                 } else if (rtp.payloadType != payloadType) {

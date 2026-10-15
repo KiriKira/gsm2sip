@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.telecom.Call
 import android.telecom.DisconnectCause
 import android.telecom.PhoneAccountHandle
@@ -137,6 +138,9 @@ class CallOrchestrator(
     @Volatile private var stopped = false
     @Volatile private var mediaBridgeEstablished = false
     private val telecomHandler = Handler(Looper.getMainLooper())
+    // Main-thread only: the tone currently playing on the GSM call, if any.
+    private var dtmfToneGeneration = 0L
+    private var dtmfToneStartedAt = 0L
     @Volatile private var lastStateChangeTime = 0L
 
     /** SIM-account resolution can cross the Magisk broker and take seconds.
@@ -1395,8 +1399,27 @@ class CallOrchestrator(
                         return@post
                     }
                     try {
-                        if (active) targetCall.playDtmfTone(digit) else targetCall.stopDtmfTone()
-                        if (active) listener?.onRtpStats("DTMF received and played on the GSM call")
+                        if (active) {
+                            targetCall.playDtmfTone(digit)
+                            val tone = ++dtmfToneGeneration
+                            dtmfToneStartedAt = SystemClock.elapsedRealtime()
+                            listener?.onRtpStats("DTMF received and played on the GSM call")
+                            // Many modems mute the downlink while a tone plays, so a
+                            // tone left on silences the far end for the rest of the call.
+                            telecomHandler.postDelayed({
+                                if (dtmfToneGeneration != tone || dtmfToneStartedAt == 0L) return@postDelayed
+                                dtmfToneStartedAt = 0L
+                                runCatching { targetCall.stopDtmfTone() }
+                                listener?.onRtpStats("DTMF tone had no end after ${MAX_DTMF_TONE_MS} ms; stopped it")
+                            }, MAX_DTMF_TONE_MS)
+                        } else {
+                            targetCall.stopDtmfTone()
+                            val startedAt = dtmfToneStartedAt
+                            dtmfToneStartedAt = 0L
+                            if (startedAt != 0L) {
+                                listener?.onRtpStats("DTMF tone stopped after ${SystemClock.elapsedRealtime() - startedAt} ms")
+                            }
+                        }
                     } catch (e: Exception) {
                         Log.w(TAG, "Telecom DTMF dispatch failed: ${e.javaClass.simpleName}")
                         if (active) listener?.onRtpStats("DTMF could not be played on the GSM call: ${e.javaClass.simpleName}")
@@ -1589,6 +1612,8 @@ class CallOrchestrator(
         private const val TAG = "CallOrchestrator"
         private const val SIP_CALL_TIMEOUT_MS = 30_000L
         private const val GSM_DIAL_TIMEOUT_MS = 45_000L
+        /** Longest a single SIP keypress may hold a tone on the GSM call. */
+        private const val MAX_DTMF_TONE_MS = 2_000L
         /** If bridge is non-IDLE for this long, consider it stale */
         private const val STALE_STATE_TIMEOUT_MS = 60_000L
 

@@ -24,6 +24,7 @@ import com.callagent.gateway.data.CredentialStore
 import com.callagent.gateway.data.GatewayDatabase
 import com.callagent.gateway.background.GatewayBackgroundPolicy
 import com.callagent.gateway.background.GatewayBackgroundRuntime
+import com.callagent.gateway.background.StayAwake
 import com.callagent.gateway.net.ControlApiClient
 import com.callagent.gateway.net.ControlApiException
 import com.callagent.gateway.net.ControlExtensions
@@ -92,6 +93,7 @@ class GatewayService : Service() {
     @Volatile private var wakeAuthBlocked = false
     private var wakeAuthorizationTokenToRefresh: String? = null
     private val syncWakeLockGuard = Any()
+    private val stayAwake by lazy { StayAwake(this, powerLeaseScheduler) { broadcastLog(it) } }
     private var syncWakeLock: PowerManager.WakeLock? = null
 
     /** Saved config for reconnect */
@@ -894,6 +896,7 @@ class GatewayService : Service() {
         }
         checkSmsPermission()
         broadcastLog("CONTROL: paired gateway session active")
+        stayAwake.hold()
         startControlLoop()
         return true
     }
@@ -1664,6 +1667,7 @@ class GatewayService : Service() {
         closeWakeConnection()
         voiceRuntimeStarted = false
         releaseVoicePowerLeases()
+        stayAwake.release()
         if (wasAlreadyStopped) {
             GatewayBackgroundRuntime.markServiceStopped(this,
                 userInitiated = GatewayBackgroundRuntime.userStopped(this))

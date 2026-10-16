@@ -34,9 +34,15 @@ class CallerIdTest {
     }
 
     @Test
-    fun descriptionNeverContainsTheNumber() {
-        assertEquals("caller number shown", CallerId.describe("09012345678", TelecomManager.PRESENTATION_ALLOWED))
-        assertEquals("caller withheld the number", CallerId.describe("", TelecomManager.PRESENTATION_RESTRICTED))
-        assertEquals("the network sent no caller number", CallerId.describe(null, TelecomManager.PRESENTATION_UNKNOWN))
+    fun descriptionShowsWhatCameInAndWhatIsSent() {
+        assertEquals(
+            "from \"090-1234-5678\", sent as 09012345678, presentation allowed",
+            CallerId.describe("090-1234-5678", TelecomManager.PRESENTATION_ALLOWED)
+        )
+        assertEquals(
+            "from \"\", sent as anonymous, presentation restricted",
+            CallerId.describe("", TelecomManager.PRESENTATION_RESTRICTED)
+        )
+        assertEquals("from \"\", sent as anonymous, presentation missing", CallerId.describe(null, null))
     }
 }

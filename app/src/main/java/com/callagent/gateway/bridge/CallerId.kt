@@ -30,11 +30,21 @@ internal object CallerId {
 
     fun displayName(sipUser: String): String = if (sipUser == ANONYMOUS) "Anonymous" else sipUser
 
-    /** For the gateway's own log: whether a number came in, never the number itself. */
-    fun describe(number: String?, presentation: Int?): String = when {
-        sipUser(number) != null -> "caller number shown"
-        presentation == TelecomManager.PRESENTATION_RESTRICTED -> "caller withheld the number"
-        presentation == TelecomManager.PRESENTATION_PAYPHONE -> "payphone, no number"
-        else -> "the network sent no caller number"
+    /**
+     * For the gateway's own log: the number exactly as Android gave it, what
+     * goes into the From header, and the network's presentation flag.
+     */
+    fun describe(number: String?, presentation: Int?): String {
+        val sent = sipUser(number) ?: ANONYMOUS
+        return "from \"${number.orEmpty()}\", sent as $sent, presentation ${presentationName(presentation)}"
+    }
+
+    private fun presentationName(presentation: Int?): String = when (presentation) {
+        TelecomManager.PRESENTATION_ALLOWED -> "allowed"
+        TelecomManager.PRESENTATION_RESTRICTED -> "restricted"
+        TelecomManager.PRESENTATION_UNKNOWN -> "unknown"
+        TelecomManager.PRESENTATION_PAYPHONE -> "payphone"
+        null -> "missing"
+        else -> presentation.toString()
     }
 }

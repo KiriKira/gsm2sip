@@ -168,6 +168,8 @@ class SipCall(
     // Outbound caller-ID (preserved for auth re-INVITE)
     var outboundCallerIdNumber: String? = null
     var outboundCallerIdName: String? = null
+    /** The server's final error response to our INVITE; null while none came. */
+    @Volatile var finalResponseCode: Int? = null
 
     // GSM forward target (for outbound from server)
     var gsmForwardNumber: String? = null
@@ -377,6 +379,7 @@ class SipCall(
                     Log.i(TAG, "Ignoring ${msg.statusCode} — call is no longer pending (CSeq: ${msg.cseq})")
                     return true
                 }
+                finalResponseCode = msg.statusCode
                 val reason = if (msg.statusCode == 401 || msg.statusCode == 407) " — server rejected the gateway's SIP credentials" else ""
                 sipClient.logListener?.invoke("INVITE rejected: ${msg.statusCode}$reason (call $callId)")
                 listener?.onCallTerminated(this)

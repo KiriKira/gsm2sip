@@ -684,7 +684,12 @@ class CallOrchestrator(
 
         // If GSM is still ringing and we haven't exhausted retries, try again.
         // Transient network issues or socket races can kill the first SIP attempt.
+        // A final answer from the server (declined, busy, no answer) is the
+        // call's outcome: the server has closed this call ID, so a retry is
+        // refused at once and only repeats the incoming call on the host.
+        val finalCode = call.finalResponseCode
         if ((bridgeState == BridgeState.SIP_CALLING || bridgeState == BridgeState.SIP_RINGING)
+            && (finalCode == null || finalCode == 503)
             && sipCallRetries < MAX_SIP_RETRIES && activeGsmCall != null) {
             sipCallRetries++
             Log.w(TAG, "SIP call failed while GSM ringing — retrying ($sipCallRetries/$MAX_SIP_RETRIES)")
@@ -723,7 +728,7 @@ class CallOrchestrator(
             return
         }
 
-        tearDown("SIP call ended")
+        tearDown(if (finalCode != null) "Server ended the call ($finalCode)" else "SIP call ended")
     }
 
     // ── GsmCallManager.Listener ─────────────────────────
@@ -782,7 +787,10 @@ class CallOrchestrator(
         pendingInboundCall = call
         pendingInboundCallId = callId
         pendingInboundGeneration = callGeneration
-        listener?.onStateChanged(bridgeState, "Incoming GSM call")
+        listener?.onStateChanged(
+            bridgeState,
+            "Incoming GSM call (${CallerId.describe(number, call.details?.handlePresentation)})"
+        )
 
         try {
             pendingInboundResolution = inboundWorker.submit {
@@ -1247,14 +1255,15 @@ class CallOrchestrator(
         bridgeState = BridgeState.SIP_CALLING
         listener?.onStateChanged(bridgeState, "Calling Asterisk")
 
+        val fromUser = CallerId.sipUser(callerNumber) ?: CallerId.ANONYMOUS
         try {
             val legs = mutableListOf<SipCall>()
             try {
                 legs += sipClient.makeCall(
                     targetExtension = sipDestination,
                     localRtpPort = rtpPort,
-                    callerIdNumber = callerNumber,
-                    callerIdName = callerNumber,
+                    callerIdNumber = fromUser,
+                    callerIdName = CallerId.displayName(fromUser),
                     gsmMetadata = metadata
                 )
             } catch (e: Exception) {
@@ -1270,8 +1279,8 @@ class CallOrchestrator(
                     legs += node.makeCall(
                         targetExtension = sipDestination,
                         localRtpPort = rtpPort,
-                        callerIdNumber = callerNumber,
-                        callerIdName = callerNumber,
+                        callerIdNumber = fromUser,
+                        callerIdName = CallerId.displayName(fromUser),
                         gsmMetadata = metadata.copy(mappingRevision = revision)
                     )
                 } catch (e: Exception) {

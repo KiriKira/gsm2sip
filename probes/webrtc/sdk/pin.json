@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "coordinate": "io.github.webrtc-sdk:android:150.7871.01",
+  "aar_url": "https://repo.maven.apache.org/maven2/io/github/webrtc-sdk/android/150.7871.01/android-150.7871.01.aar",
+  "aar_sha256": "0a1627b1a48c2bc17d9a40d62fc47bd45166f44a311e95917f147c402de379b0",
+  "publisher_commit": "3396525b2f3d7f7271f259b1f79351e3de45a1f4",
+  "publisher_notices_sha256": "d1f9382c6878ac024155fd6d44a5977329108bb8b0a01cea40e4a2f1d7de252e",
+  "declared_source_commit": "73cb8180f7258ee292878d6edd05177f41883962",
+  "source_files": {
+    "sdk/android/src/java/org/webrtc/audio/WebRtcAudioTrack.java": "96c77cbea46cb507e22c39118cbcff6989d7473d1061e3a5a09b46a631d8560b",
+    "LICENSE": "ab00a482b6a3902e40211b43c5d0441962ea99b6cc7c25c0f243fa270b78d482",
+    "PATENTS": "01462e2068d1a04c2274f3389773014c14ed9bc3446b28303543bd3e3c064145"
+  }
+}

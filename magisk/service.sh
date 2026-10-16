@@ -81,6 +81,12 @@ for PERM in \
         log -t "$TAG" "Granted: $PERM" || \
         log -t "$TAG" "Skip (already granted or N/A): $PERM"
 done
+# Doze and App Standby cut the network of a screen-off, unplugged phone;
+# the gateway must keep heartbeating, so exempt it from both.
+dumpsys deviceidle whitelist +"$PKG" >/dev/null 2>&1 && \
+    log -t "$TAG" "Doze: exempted $PKG" || log -t "$TAG" "Doze: exemption failed"
+cmd appops set "$PKG" RUN_ANY_IN_BACKGROUND allow >/dev/null 2>&1
+am set-standby-bucket "$PKG" active >/dev/null 2>&1
 ) &
 
 # ── Ensure tinymix is available ────────────────────────

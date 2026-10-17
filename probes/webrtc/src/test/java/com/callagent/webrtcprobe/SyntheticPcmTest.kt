@@ -3,8 +3,56 @@ package com.callagent.webrtcprobe
 import java.nio.ByteBuffer
 import org.junit.Assert.*
 import org.junit.Test
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.sin
 
 class SyntheticPcmTest {
+    @Test fun frameCachePreservesPhaseAcrossPartialCyclesAndSizeChanges() {
+        for (frequency in listOf(997.0, 1500.0)) {
+            val source = SyntheticPcm(frequency)
+            var sampleNumber = 0
+            for (samples in listOf(240, 480, 480, 960, 240, 240, 480)) {
+                val frame = ByteBuffer.allocateDirect(samples * 2)
+                source.fill(frame, 2, 1, 48000)
+                repeat(samples) {
+                    val expected = (sin(2 * PI * frequency * sampleNumber++ / 48000) * 6000).toInt()
+                    assertTrue(abs(frame.short.toInt() - expected) <= 1)
+                }
+            }
+        }
+    }
+
+    @Test fun consecutiveFramesKeepTheAnalyticFrequencyAndPhase() {
+        for (frequency in listOf(997.0, 1000.0, 1500.0)) {
+            val source = SyntheticPcm(frequency)
+            val frame = ByteBuffer.allocateDirect(960)
+            var sampleNumber = 0
+            repeat(50) {
+                source.fill(frame, 2, 1, 48000)
+                repeat(480) {
+                    val expected = (sin(2 * PI * frequency * sampleNumber++ / 48000) * 6000).toInt()
+                    assertTrue(abs(frame.short.toInt() - expected) <= 1)
+                }
+            }
+        }
+    }
+
+    @Test fun detectorHandlesWindowSizeChangesAndPhaseOffsets() {
+        val source = SyntheticPcm(1000.0)
+        val remote = ToneDetector(1000.0, 1500.0)
+        val echo = ToneDetector(1500.0, 1000.0)
+        for (samples in listOf(480, 240, 960, 480)) {
+            val frame = ByteBuffer.allocateDirect(samples * 2)
+            source.fill(frame, 2, 1, 48000)
+            val data = ByteArray(frame.remaining()).also { frame.get(it) }
+            remote.accept(2, 1, 48000, data)
+            echo.accept(2, 1, 48000, data)
+        }
+        assertEquals(4, remote.matchedFrames.get())
+        assertEquals(0, echo.matchedFrames.get())
+    }
+
     @Test fun oppositeTonePassesButSilenceAndLocalEchoDoNot() {
         val source = SyntheticPcm(1000.0)
         val expected = ToneDetector(1000.0, 1500.0)

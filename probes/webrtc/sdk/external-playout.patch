@@ -25,12 +25,14 @@
 +        runExternalPlayout();
 +        return;
 +      }
-@@ -166,0 +190,34 @@
+@@ -166,0 +190,28 @@
 +    private void runExternalPlayout() {
++      Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT);
 +      doAudioTrackStateCallback(AUDIO_TRACK_START);
-+      long deadline = System.nanoTime();
-+      final long period = CALLBACK_BUFFER_SIZE_MS * 1000000L;
++      ExternalPlayout.FramePacer pacer = new ExternalPlayout.FramePacer();
 +      while (keepAlive) {
++        pacer.awaitNextFrame();
++        if (!keepAlive) break;
 +        byteBuffer.clear();
 +        nativeGetPlayoutData(nativeAudioTrack, byteBuffer.capacity());
 +        if (!keepAlive) break;
@@ -49,35 +51,33 @@
 +          reportWebRtcAudioTrackError("External PCM sink failed");
 +          break;
 +        }
-+        deadline += period;
-+        long remaining = deadline - System.nanoTime();
-+        if (remaining > 0) {
-+          java.util.concurrent.locks.LockSupport.parkNanos(remaining);
-+        } else {
-+          // Drop scheduling debt rather than create an unbounded catch-up burst.
-+          deadline = System.nanoTime();
-+        }
 +      }
 +    }
 +
-@@ -213,0 +271,6 @@
+@@ -213,0 +265,6 @@
 +    if (externalPlayout) {
 +      externalSampleRate = sampleRate;
 +      externalChannels = channels;
 +      initialBufferSizeInFrames = sampleRate / BUFFERS_PER_SECOND;
 +      return byteBuffer.capacity();
 +    }
-@@ -289,0 +353,6 @@
+@@ -289,0 +347,6 @@
 +    if (externalPlayout) {
 +      assertTrue(audioThread == null);
 +      audioThread = new AudioTrackThread("ExternalPcmPlayout");
 +      audioThread.start();
 +      return true;
 +    }
-@@ -329 +398 @@
+@@ -329,1 +392,1 @@
 -    logUnderrunCount();
 +    if (!externalPlayout) logUnderrunCount();
-@@ -339,0 +409 @@
+@@ -339,0 +403,1 @@
 +    if (externalPlayout) doAudioTrackStateCallback(AUDIO_TRACK_STOP);
-@@ -365,0 +436 @@
+@@ -365,0 +430,1 @@
 +    if (externalPlayout) return false;
+@@ -499,0 +565,5 @@
++    // External PCM uses the 10 ms buffer configured by initPlayout; there is
++    // deliberately no Android AudioTrack for this JNI getter to query.
++    if (externalPlayout) {
++      return initialBufferSizeInFrames;
++    }

@@ -1,0 +1,12 @@
+{
+  "batch": "20261017-webrtc-sip",
+  "branch": "ci/webrtc-sip-debug-20261017",
+  "main_commits": {
+    "gsm2sip": "2437f6a9508d67a48b48bd5dcc8529ac7e2b7e17",
+    "gsm2sip-server": "b15b8df5be574589d30ed4141f334b4e8f587cd4",
+    "gsm2sip-client-android": "1a7188918bddbfeadc4c92c77ed8381dcc0d2308"
+  },
+  "transport": "SIP (existing production path)",
+  "webrtc": "Experimental contracts and separate synthetic probe; production three-party media is not connected",
+  "android_debug_signing": "Standard Android debug key, not the production release signing identity"
+}

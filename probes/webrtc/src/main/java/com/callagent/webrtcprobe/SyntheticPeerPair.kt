@@ -6,10 +6,14 @@ import org.webrtc.*
 import org.webrtc.audio.ExternalPlayout
 import org.webrtc.audio.JavaAudioDeviceModule
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Real native ICE/DTLS-SRTP and Opus, but exclusively synthetic PCM and in-process signaling. */
@@ -17,28 +21,95 @@ class SyntheticPeerPair(private val context: Context) : AutoCloseable {
     private val endpoints = mutableListOf<Endpoint>()
     private val relays = mutableListOf<CandidateRelay>()
     private val errors = ConcurrentLinkedQueue<String>()
+    private var stage = "initializing"
+        set(value) {
+            field = value
+            reportState(JSONObject().put("stage", value))
+        }
+    private var cleanupStage = "not_started"
+    private var closingSnapshot: JSONObject? = null
+
+    private fun reportState(state: JSONObject) {
+        state.put("recorded_at_epoch_ms", System.currentTimeMillis())
+        context.filesDir.resolve("webrtc-probe-state.json").writeText(state.toString())
+        android.util.Log.i("WebRtcProbeState", state.toString())
+    }
+
+    fun diagnostics(): JSONObject = (closingSnapshot ?: snapshot())
+        .put("stage", stage).put("cleanup_stage", cleanupStage)
+
+    private fun snapshot(): JSONObject {
+        val result = JSONObject().put("errors", org.json.JSONArray(errors.distinct().take(16)))
+        for ((index, endpoint) in endpoints.withIndex()) {
+            val name = if (index == 0) "a" else "b"
+            result.put("${name}_connection_state", endpoint.connectionState)
+                .put("${name}_ice_state", endpoint.iceState)
+                .put("${name}_ice_gathering_state", endpoint.gatheringState)
+                .put("${name}_capture_frames", endpoint.source.frames.get())
+                .put("${name}_playout_frames", endpoint.detector.frames.get())
+                .put("${name}_remote_tone_frames", endpoint.detector.matchedFrames.get())
+                .put("${name}_last_rms", endpoint.detector.lastRms)
+        }
+        for ((index, relay) in relays.withIndex()) {
+            val name = if (index == 0) "a" else "b"
+            result.put("${name}_ice_received", relay.received.get())
+                .put("${name}_ice_delivered", relay.delivered.get())
+                .put("${name}_ice_callbacks", relay.callbacks.get())
+                .put("${name}_ice_queued", relay.queueSize())
+        }
+        return result
+    }
 
     fun run(): JSONObject {
+        reportState(JSONObject().put("stage", stage))
         PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(context)
             .setEnableInternalTracer(false).createInitializationOptions())
         val aRelay = CandidateRelay(errors).also { relays += it }
         val bRelay = CandidateRelay(errors).also { relays += it }
+        stage = "endpoint_a"
         val a = endpoint(1000.0, 1500.0, bRelay)
+        stage = "endpoint_b"
         val b = endpoint(1500.0, 1000.0, aRelay)
         aRelay.attach(a.peer!!)
         bRelay.attach(b.peer!!)
 
+        stage = "create_offer"
         val offer = description { a.peer!!.createOffer(it, MediaConstraints()) }
+        stage = "set_local_offer"
         setDescription { a.peer!!.setLocalDescription(it, offer) }
+        stage = "set_remote_offer"
         setDescription { b.peer!!.setRemoteDescription(it, offer) }
         bRelay.remoteDescriptionReady()
+        stage = "create_answer"
         val answer = description { b.peer!!.createAnswer(it, MediaConstraints()) }
+        stage = "set_local_answer"
         setDescription { b.peer!!.setLocalDescription(it, answer) }
+        stage = "set_remote_answer"
         setDescription { a.peer!!.setRemoteDescription(it, answer) }
         aRelay.remoteDescriptionReady()
 
+        // Let transport setup finish before starting four real-time audio threads.
+        // This also keeps synthetic media from competing with ICE on slow devices.
+        stage = "wait_for_ice"
+        val iceDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20)
+        while (!a.connected.get() || !b.connected.get()) {
+            check(errors.isEmpty()) { "Native audio or ICE failed" }
+            check(System.nanoTime() < iceDeadline) { "Timed out waiting for ICE and DTLS" }
+            Thread.sleep(20)
+        }
+        for (endpoint in listOf(a, b)) {
+            endpoint.peer!!.setAudioRecording(true)
+            endpoint.peer!!.setAudioPlayout(true)
+        }
+
+        stage = "wait_for_pcm"
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20)
+        var nextReport = System.nanoTime()
         while (System.nanoTime() < deadline) {
+            if (System.nanoTime() >= nextReport) {
+                reportState(snapshot().put("stage", stage))
+                nextReport = System.nanoTime() + TimeUnit.SECONDS.toNanos(1)
+            }
             check(errors.isEmpty()) { "Native audio or ICE failed" }
             if (a.connected.get() && b.connected.get() && a.detector.matchedFrames.get() >= 30 &&
                 b.detector.matchedFrames.get() >= 30 && a.source.frames.get() >= 30 && b.source.frames.get() >= 30) {
@@ -58,6 +129,8 @@ class SyntheticPeerPair(private val context: Context) : AutoCloseable {
 
     private fun endpoint(sendFrequency: Double, expectedFrequency: Double, remote: CandidateRelay): Endpoint {
         val source = SyntheticPcm(sendFrequency)
+        val capturePacer = CaptureFramePacer()
+        val capturePriority = ThreadLocal.withInitial { false }
         val detector = ToneDetector(expectedFrequency, sendFrequency)
         val scheduler = Executors.newSingleThreadScheduledExecutor { task ->
             Thread(task, "webrtc-probe-audio-check").apply { isDaemon = true }
@@ -66,7 +139,14 @@ class SyntheticPeerPair(private val context: Context) : AutoCloseable {
             .setSampleRate(SyntheticPcm.SAMPLE_RATE)
             .setUseHardwareAcousticEchoCanceler(false).setUseHardwareNoiseSuppressor(false)
             .setEnableVolumeLogger(false)
-            .setAudioBufferCallback { buffer, format, channels, rate, _, _ -> source.fill(buffer, format, channels, rate) }
+            .setAudioBufferCallback { buffer, format, channels, rate, _, _ ->
+                if (!capturePriority.get()) {
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT)
+                    capturePriority.set(true)
+                }
+                capturePacer.awaitNextFrame()
+                source.fill(buffer, format, channels, rate)
+            }
             .setPlaybackSamplesReadyCallback { samples ->
                 detector.accept(samples.audioFormat, samples.channelCount, samples.sampleRate, samples.data)
             }
@@ -97,13 +177,17 @@ class SyntheticPeerPair(private val context: Context) : AutoCloseable {
         val observer = object : PeerConnection.Observer {
             override fun onSignalingChange(state: PeerConnection.SignalingState) = Unit
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
+                endpoint.iceState = state.name
                 if (state == PeerConnection.IceConnectionState.FAILED) errors += "ice"
             }
             override fun onConnectionChange(state: PeerConnection.PeerConnectionState) {
+                endpoint.connectionState = state.name
                 endpoint.connected.set(state == PeerConnection.PeerConnectionState.CONNECTED)
             }
             override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
-            override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) = Unit
+            override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
+                endpoint.gatheringState = state.name
+            }
             override fun onIceCandidate(candidate: IceCandidate) = remote.add(candidate)
             override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) = Unit
             override fun onAddStream(stream: MediaStream) = Unit
@@ -115,6 +199,8 @@ class SyntheticPeerPair(private val context: Context) : AutoCloseable {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
         }
         endpoint.peer = checkNotNull(factory.createPeerConnection(config, observer))
+        endpoint.peer!!.setAudioRecording(false)
+        endpoint.peer!!.setAudioPlayout(false)
         val constraints = MediaConstraints().apply {
             for (key in listOf("googEchoCancellation", "googAutoGainControl", "googNoiseSuppression", "googHighpassFilter")) {
                 optional += MediaConstraints.KeyValuePair(key, "false")
@@ -153,9 +239,13 @@ class SyntheticPeerPair(private val context: Context) : AutoCloseable {
     }
 
     override fun close() {
+        closingSnapshot = snapshot()
+        cleanupStage = "ice_relays"
+        reportState(diagnostics())
         relays.forEach { it.close() }
         var failure: Throwable? = null
         for (endpoint in endpoints.reversed()) {
+            cleanupStage = "peer_resources"
             endpoint.source.stop()
             for (release in listOf<() -> Unit>(
                 { endpoint.peer?.close() }, { endpoint.peer?.dispose() },
@@ -168,6 +258,8 @@ class SyntheticPeerPair(private val context: Context) : AutoCloseable {
             )) try { release() } catch (caught: Throwable) { failure = failure ?: caught }
         }
         endpoints.clear()
+        cleanupStage = if (failure == null) "complete" else "failed"
+        reportState(diagnostics())
         failure?.let { throw it }
     }
 
@@ -175,21 +267,39 @@ class SyntheticPeerPair(private val context: Context) : AutoCloseable {
                            val source: SyntheticPcm, val detector: ToneDetector,
                            val scheduler: ScheduledExecutorService) {
         val connected = AtomicBoolean(false)
+        @Volatile var connectionState = "NEW"
+        @Volatile var iceState = "NEW"
+        @Volatile var gatheringState = "NEW"
         var peer: PeerConnection? = null
         var audioSource: AudioSource? = null
         var track: AudioTrack? = null
     }
 
     private class CandidateRelay(private val errors: ConcurrentLinkedQueue<String>) : AutoCloseable {
+        val received = java.util.concurrent.atomic.AtomicInteger()
+        val delivered = java.util.concurrent.atomic.AtomicInteger()
+        val callbacks = java.util.concurrent.atomic.AtomicInteger()
+        // Native addIceCandidate synchronously enters the other peer's signaling
+        // thread. Calling it from an ICE observer can deadlock both signaling
+        // threads, even without a Java monitor. Dispatch off those callbacks.
+        private val dispatcher = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+            ArrayBlockingQueue<Runnable>(256), ThreadFactory { task ->
+                Thread(task, "webrtc-probe-ice-relay").apply { isDaemon = true }
+            })
         private var target: PeerConnection? = null
         private var ready = false
-        private var closed = false
+        private val closed = AtomicBoolean(false)
         private val pending = mutableListOf<IceCandidate>()
-        @Synchronized fun attach(peer: PeerConnection) { target = peer }
-        @Synchronized fun add(candidate: IceCandidate) {
-            if (closed) return
+        fun attach(peer: PeerConnection) = enqueue { target = peer }
+        fun queueSize() = dispatcher.queue.size
+        fun add(candidate: IceCandidate) {
+            callbacks.incrementAndGet()
+            enqueue { addOnDispatcher(candidate) }
+        }
+        private fun addOnDispatcher(candidate: IceCandidate) {
+            received.incrementAndGet()
             if (ready) {
-                if (target?.addIceCandidate(candidate) != true) errors += "candidate_rejected"
+                deliver(candidate)
             } else {
                 if (pending.size >= 256) {
                     errors += "candidate_budget"
@@ -198,11 +308,35 @@ class SyntheticPeerPair(private val context: Context) : AutoCloseable {
                 pending += candidate
             }
         }
-        @Synchronized fun remoteDescriptionReady() {
+        fun remoteDescriptionReady() = enqueue {
             ready = true
-            pending.forEach { if (target?.addIceCandidate(it) != true) errors += "candidate_rejected" }
+            pending.forEach { deliver(it) }
             pending.clear()
         }
-        @Synchronized override fun close() { closed = true; pending.clear(); target = null }
+        private fun deliver(candidate: IceCandidate) {
+            if (target?.addIceCandidate(candidate) == true) delivered.incrementAndGet()
+            else errors += "candidate_rejected"
+        }
+        private fun enqueue(action: () -> Unit) {
+            if (closed.get()) return
+            try {
+                dispatcher.execute {
+                    if (!closed.get()) try { action() } catch (_: RuntimeException) {
+                        errors += "candidate_delivery_failed"
+                    }
+                }
+            } catch (_: RejectedExecutionException) {
+                if (!closed.get()) errors += "candidate_budget"
+            }
+        }
+
+        override fun close() {
+            if (!closed.compareAndSet(false, true)) return
+            dispatcher.shutdownNow()
+            // Drain any in-flight native call before disposing either peer.
+            check(dispatcher.awaitTermination(2, TimeUnit.SECONDS)) { "ICE relay did not stop" }
+            pending.clear()
+            target = null
+        }
     }
 }

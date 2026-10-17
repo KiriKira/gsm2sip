@@ -5,7 +5,7 @@ plugins {
 
 val sdkOutput = layout.buildDirectory.dir("webrtc-sdk")
 val prepareSdk = tasks.register<Exec>("prepareWebRtcSdk") {
-    inputs.files("sdk/pin.json", "sdk/external-playout.patch", "tools/prepare_sdk.py")
+    inputs.files("sdk/pin.json", "sdk/external-playout.patch", "tools/prepare_sdk.py", "tools/validate_sdk_patch.py")
     outputs.dir(sdkOutput)
     commandLine("python3", "tools/prepare_sdk.py")
 }

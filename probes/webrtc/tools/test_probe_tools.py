@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from prepare_sdk import download
-from run_probe import evaluate_instrumentation
+from run_probe import controlled_failure, evaluate_activity_result, evaluate_instrumentation
 
 
 class EvidenceTests(unittest.TestCase):
@@ -21,6 +21,41 @@ class EvidenceTests(unittest.TestCase):
 
     def test_complete_native_evidence_is_accepted(self):
         self.assertEqual(self.report(), evaluate_instrumentation(self.output(self.report())))
+
+    def test_activity_rejects_stale_nonce_and_failed_result_code(self):
+        report = dict(self.report(), run_id="fresh-run", activity_result_code=-1)
+        self.assertEqual(report, evaluate_activity_result(report, "fresh-run"))
+        for invalid in (dict(report, run_id="old-run"), dict(report, activity_result_code=0)):
+            with self.assertRaises(RuntimeError):
+                evaluate_activity_result(invalid, "fresh-run")
+
+    def test_activity_keeps_the_same_bidirectional_pcm_and_audio_path_requirements(self):
+        for field, value in (("b_remote_tone_frames", 0), ("default_audio_track", "ACTIVE")):
+            report = dict(self.report(), run_id="fresh-run", activity_result_code=-1)
+            report["observed"] = dict(report["observed"], **{field: value})
+            with self.assertRaises(RuntimeError):
+                evaluate_activity_result(report, "fresh-run")
+
+    def test_failure_keeps_stage_and_counters_without_native_payloads(self):
+        report = {"status": "FAIL", "failure_code": "pcm_timeout", "message": "secret SDP",
+                  "diagnostics": {"stage": "wait_for_pcm", "cleanup_stage": "complete", "a_capture_frames": 123,
+                                  "b_remote_tone_frames": 0, "a_connection_state": "CONNECTED",
+                                  "errors": ["ice", "secret candidate"], "sdp": "secret SDP"}}
+        result = controlled_failure(self.output(report, code=0))
+        self.assertEqual("pcm_timeout", result["failure_code"])
+        self.assertEqual(123, result["diagnostics"]["a_capture_frames"])
+        self.assertEqual(["ice"], result["diagnostics"]["errors"])
+        self.assertNotIn("secret", json.dumps(result))
+        with self.assertRaises(RuntimeError):
+            evaluate_instrumentation(self.output(report, code=0))
+
+    def test_failure_extractor_does_not_accept_a_pass_claim_or_unknown_text(self):
+        self.assertIsNone(controlled_failure(self.output(self.report(), code=0)))
+        report = {"status": "FAIL", "failure_code": "secret SDP",
+                  "diagnostics": {"stage": "secret SDP", "a_capture_frames": True,
+                                  "a_connection_state": "secret SDP", "errors": [{"sdp": "secret"}]}}
+        self.assertEqual({"status": "FAIL", "failure_code": "unexpected_exception", "diagnostics": {"errors": []}},
+                         controlled_failure(self.output(report, code=0)))
 
     def test_successful_adb_exit_or_result_text_cannot_hide_instrumentation_failure(self):
         for output in ["INSTRUMENTATION_CODE: -1\n", self.output(self.report(), code=0),

@@ -8,6 +8,7 @@ from pathlib import Path
 import struct
 import subprocess
 import zipfile
+from validate_sdk_patch import validate_patch_offsets, validate_external_layout
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +46,7 @@ def load_alignments(data):
 
 
 def main():
+    validate_patch_offsets((ROOT / "sdk/external-playout.patch").read_text())
     pin = json.loads((ROOT / "sdk/pin.json").read_text())
     out = ROOT / "build/webrtc-sdk"
     cache = ROOT / "build/sdk-downloads"
@@ -65,6 +67,7 @@ def main():
         target.write_bytes(content)
     subprocess.run(["patch", "--batch", "--fuzz=0", "-p1", "-i",
                     str(ROOT / "sdk/external-playout.patch"), "-d", str(out / "source")], check=True)
+    validate_external_layout((source / "WebRtcAudioTrack.java").read_text())
 
     removed = []
     native = {}

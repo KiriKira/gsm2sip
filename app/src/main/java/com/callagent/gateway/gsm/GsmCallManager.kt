@@ -3,6 +3,7 @@ package com.callagent.gateway.gsm
 import android.annotation.SuppressLint
 import android.content.Context
 import android.media.AudioManager
+import android.os.Build
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -64,8 +65,20 @@ object GsmCallManager {
         val call: Call?,
         val service: InCallService,
         val route: Int?,
-        val microphoneMuted: Boolean?
+        val microphoneMuted: Boolean?,
+        val voiceCallVolume: Int? = null,
+        val telecomMuted: Boolean? = null
     )
+
+    /**
+     * Silence this phone's own microphone and earpiece while a call is
+     * bridged (digital routing only). The caller's voice otherwise plays from
+     * the earpiece, the live microphone picks it up, and the caller hears it
+     * back as echo. The host's voice reaches the uplink through the telephony
+     * TX injection, which a call mute does not touch on platforms that support
+     * that injection; the setting exists for a device where it does.
+     */
+    @Volatile var silenceHandsetDuringCalls: Boolean = true
     private var genericAudioState: GenericAudioState? = null
 
     @Volatile var listener: Listener? = null
@@ -496,6 +509,8 @@ object GsmCallManager {
                     runCatching { am?.isMicrophoneMute = false }
                     appLog("Audio: locally enabled microphone fallback requested; no volume changes")
                 }
+            } else if (silenceHandsetDuringCalls) {
+                silenceHandset()
             }
             return
         }
@@ -571,6 +586,34 @@ object GsmCallManager {
         }
     }
 
+    /** Mute the handset microphone and turn the earpiece down for this call; restored in [restoreAudio]. */
+    private fun silenceHandset() {
+        val service = inCallService ?: return
+        val am = service.getSystemService(AudioManager::class.java) ?: return
+        if (genericAudioState?.call !== activeCall || genericAudioState == null) {
+            genericAudioState = GenericAudioState(
+                activeCall, service,
+                route = null,
+                microphoneMuted = null,
+                voiceCallVolume = runCatching { am.getStreamVolume(AudioManager.STREAM_VOICE_CALL) }.getOrNull(),
+                telecomMuted = runCatching { service.callAudioState?.isMuted }.getOrNull()
+            )
+        }
+        // Through Telecom, which owns the call's mute and re-applies it on
+        // every route change; an AudioManager-only mute can be undone under us.
+        val muted = runCatching { service.setMuted(true) }.isSuccess
+        val lowest = runCatching {
+            val min = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                am.getStreamMinVolume(AudioManager.STREAM_VOICE_CALL)
+            } else 1
+            am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, min.coerceAtLeast(1), 0)
+            am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+        }.getOrNull()
+        appLog("Audio: handset silenced against echo (mic ${if (muted) "muted" else "mute refused"}, " +
+            "earpiece volume ${lowest ?: "unchanged"}). If the caller cannot hear you, turn off " +
+            "\"通话时静音本机\" in settings.")
+    }
+
     /** Set audio stream volumes for the GSM↔SIP bridge.
      *  Called multiple times: immediately, after delayed route change,
      *  and from RtpSession as a secondary safeguard. */
@@ -637,6 +680,10 @@ object GsmCallManager {
             if (saved != null && (activeCall == null || activeCall === saved.call)) {
                 val am = saved.service.getSystemService(AudioManager::class.java)
                 saved.microphoneMuted?.let { muted -> runCatching { am?.isMicrophoneMute = muted } }
+                saved.telecomMuted?.let { muted -> runCatching { saved.service.setMuted(muted) } }
+                saved.voiceCallVolume?.let { volume ->
+                    runCatching { am?.setStreamVolume(AudioManager.STREAM_VOICE_CALL, volume, 0) }
+                }
                 if (inCallService === saved.service) saved.route?.let { route ->
                     if (route > 0 && Integer.bitCount(route) == 1) {
                         runCatching { saved.service.setAudioRoute(route) }

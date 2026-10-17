@@ -1066,6 +1066,23 @@
                             android:textColor="?attr/colorOutline"
                             android:paddingTop="6dp" />
 
+                        <com.google.android.material.materialswitch.MaterialSwitch
+                            android:id="@+id/cbCfgSilenceHandset"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:minHeight="48dp"
+                            android:text="通话时静音本机"
+                            android:textColor="?attr/colorOnSurfaceVariant"
+                            android:layout_marginTop="8dp" />
+
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="转接通话时关闭本机麦克风、把听筒调到最低，避免对方听到回音。如果开启后对方听不到主机的声音，说明这台手机静音会连同注入的声音一起静音，请关闭此项。"
+                            android:textSize="12sp"
+                            android:textColor="?attr/colorOutline"
+                            android:paddingTop="6dp" />
+
                         <com.google.android.material.button.MaterialButton
                             android:id="@+id/btnCfgClearRecents"
                             android:layout_width="wrap_content"

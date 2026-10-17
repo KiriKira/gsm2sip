@@ -1390,6 +1390,8 @@ class GatewayService : Service() {
         // rather than waiting for the next call.
         com.callagent.gateway.gsm.GsmCallManager.agentVolumeStep =
             prefs.getInt("agent_vol_step", 0)
+        com.callagent.gateway.gsm.GsmCallManager.silenceHandsetDuringCalls =
+            prefs.getBoolean("silence_handset", true)
 
         cfgServer = server
         cfgPort = port

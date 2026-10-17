@@ -1662,6 +1662,8 @@ class MainActivity : AppCompatActivity() {
             prefs.getBoolean("use_stun", false)
         findViewById<MaterialSwitch>(R.id.cbCfgTranslit).isChecked =
             prefs.getBoolean("translit_ascii", false)
+        findViewById<MaterialSwitch>(R.id.cbCfgSilenceHandset).isChecked =
+            prefs.getBoolean("silence_handset", true)
         val cbTls = findViewById<MaterialSwitch>(R.id.cbCfgTls)
         val cbSrtp = findViewById<MaterialSwitch>(R.id.cbCfgSrtp)
         cbTls.isChecked = prefs.getBoolean("sip_tls", true)
@@ -1786,6 +1788,7 @@ class MainActivity : AppCompatActivity() {
         val backgroundEnabledBeforeSave = GatewayBackgroundRuntime.allowedRecovery(this)
         val useStun = findViewById<MaterialSwitch>(R.id.cbCfgUseStun).isChecked
         val translit = findViewById<MaterialSwitch>(R.id.cbCfgTranslit).isChecked
+        val silenceHandset = findViewById<MaterialSwitch>(R.id.cbCfgSilenceHandset).isChecked
         // The transport comes from the server's SIP configuration; the editor
         // keeps whatever was provisioned (TLS unless the server chose UDP).
         val savedPrefs = getSharedPreferences("gateway", MODE_PRIVATE)
@@ -1816,6 +1819,7 @@ class MainActivity : AppCompatActivity() {
             .putBoolean("autoconnect", auto)
             .putBoolean("use_stun", useStun)
             .putBoolean("translit_ascii", translit)
+            .putBoolean("silence_handset", silenceHandset)
             .putBoolean("sip_tls", tls)
             .putBoolean("srtp_enabled", srtp)
             .putString("codec", codec)

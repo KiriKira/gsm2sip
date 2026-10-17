@@ -66,6 +66,36 @@ class InboundNodeForkTest {
         assertEquals(CallOrchestrator.BridgeState.SIP_CALLING, orchestrator.bridgeState)
     }
 
+    @Test
+    fun aNodeDeclineKeepsThePrimaryLegRinging() = withServers { orchestrator, primaryPeer, nodePeer, _, nodePort ->
+        dispatch(orchestrator)
+        assertNotNull(await(primaryPeer, "INVITE"))
+        val nodeInvite = await(nodePeer, "INVITE")!!
+        // A node where the host is not reachable turns the call down at once.
+        send(nodePeer, nodePort, response(nodeInvite, "603 Decline", nodePeer.localPort, sdp = false))
+        awaitCondition { ReflectionHelpers.getField<List<SipCall>>(orchestrator, "inboundForkLegs").size == 1 }
+        assertNull("the primary leg is still the call", ReflectionHelpers.getField<SipCall?>(orchestrator, "activeSipCall")?.client?.nodeGatewayId)
+        assertEquals(CallOrchestrator.BridgeState.SIP_CALLING, orchestrator.bridgeState)
+        assertNull("the primary leg is not cancelled", await(primaryPeer, "CANCEL", timeoutMs = 500))
+    }
+
+    @Test
+    fun whenTheGsmCallerHangsUpEveryRingingLegIsCancelled() = withServers { orchestrator, primaryPeer, nodePeer, primaryPort, _ ->
+        dispatch(orchestrator)
+        val primaryInvite = await(primaryPeer, "INVITE")!!
+        assertNotNull(await(nodePeer, "INVITE"))
+        send(primaryPeer, primaryPort, response(primaryInvite, "183 Session Progress", primaryPeer.localPort, sdp = false))
+        val gsmCall = ReflectionHelpers.getField<Call>(orchestrator, "activeGsmCall")
+        orchestrator.onGsmCallEnded(gsmCall)
+        // Neither INVITE was answered, so only CANCEL withdraws it; a BYE
+        // outside a dialog is ignored and the host would keep ringing.
+        val primaryCancel = await(primaryPeer, "CANCEL")
+        assertNotNull("the ringing primary leg is cancelled", primaryCancel)
+        assertEquals(primaryInvite.callId, primaryCancel!!.callId)
+        assertNotNull("the ringing node leg is cancelled", await(nodePeer, "CANCEL"))
+        assertEquals(CallOrchestrator.BridgeState.IDLE, orchestrator.bridgeState)
+    }
+
     private fun dispatch(orchestrator: CallOrchestrator) {
         val gsmCall = ReflectionHelpers.newInstance(Call::class.java).also {
             ReflectionHelpers.setField(it, "mState", Call.STATE_RINGING)

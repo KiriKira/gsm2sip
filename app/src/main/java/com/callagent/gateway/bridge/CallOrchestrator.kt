@@ -666,7 +666,11 @@ class CallOrchestrator(
     override fun onCallTerminated(call: SipCall) {
         Log.i(TAG, "SIP call terminated: ${call.callId} (bridge=$bridgeState, retries=$sipCallRetries)")
         if (call != activeSipCall) {
-            inboundForkLegs.remove(call)
+            if (inboundForkLegs.remove(call) &&
+                (bridgeState == BridgeState.SIP_CALLING || bridgeState == BridgeState.SIP_RINGING)) {
+                listener?.onStateChanged(bridgeState, "SIP leg ${legName(call)} ended" +
+                    (call.finalResponseCode?.let { " ($it)" } ?: "") + "; the other node(s) keep ringing")
+            }
             return
         }
         // Another node's leg is still ringing: keep waiting on it instead of
@@ -678,6 +682,8 @@ class CallOrchestrator(
             call.client.removeCall(call.callId)
             activeSipCall = survivors.first()
             Log.i(TAG, "SIP leg failed; ${survivors.size} other node leg(s) still ringing")
+            listener?.onStateChanged(bridgeState, "SIP leg ${legName(call)} ended" +
+                (call.finalResponseCode?.let { " ($it)" } ?: "") + "; the other node(s) keep ringing")
             return
         }
         inboundForkLegs.clear()
@@ -1040,9 +1046,27 @@ class CallOrchestrator(
         // Tear down if this is our tracked call, OR if we're in a call state
         // but activeGsmCall was never set (call failed before going ACTIVE)
         if (call === activeGsmCall) {
-            tearDown("GSM call ended",
-                sipStatusFor(GsmCallManager.lastDisconnectCause))
+            val cause = GsmCallManager.lastDisconnectCause
+            tearDown("GSM call ended (${describeDisconnect(cause)})", sipStatusFor(cause))
         }
+    }
+
+    /** Who ended the GSM call, for the status line: the caller, this phone or the network. */
+    private fun describeDisconnect(cause: DisconnectCause?): String {
+        val who = when (cause?.code) {
+            DisconnectCause.REMOTE -> "caller hung up"
+            DisconnectCause.LOCAL -> "ended on this phone"
+            DisconnectCause.REJECTED -> "rejected on this phone"
+            DisconnectCause.MISSED -> "missed"
+            DisconnectCause.BUSY -> "busy"
+            DisconnectCause.CANCELED -> "cancelled"
+            DisconnectCause.ERROR -> "network error"
+            DisconnectCause.RESTRICTED -> "restricted"
+            null -> "cause unknown"
+            else -> "cause ${cause.code}"
+        }
+        val detail = cause?.reason?.takeIf { it.isNotBlank() }
+        return if (detail != null) "$who, $detail" else who
     }
 
     /**
@@ -1062,6 +1086,9 @@ class CallOrchestrator(
         inboundForkLegs += winner
         losers.forEach(::endLosingLeg)
     }
+
+    private fun legName(leg: SipCall): String =
+        if (leg.client.nodeGatewayId != null) "via ${leg.client.serverDomain}" else "via the primary server"
 
     private fun endLosingLeg(leg: SipCall) {
         try {
@@ -1486,6 +1513,10 @@ class CallOrchestrator(
             activeRtpSession?.stop()
             activeRtpSession = null
 
+            // Taken first: ending the active leg re-enters onCallTerminated,
+            // which clears the fork list before the other legs are cancelled.
+            val losingLegs = inboundForkLegs.filter { it !== activeSipCall }
+            inboundForkLegs.clear()
             activeSipCall?.let {
                 try {
                     if (it.state != SipCall.State.TERMINATED) {
@@ -1497,7 +1528,11 @@ class CallOrchestrator(
                             it.state != SipCall.State.ANSWERED) {
                             val (code, phrase) = sipStatus ?: (480 to "Temporarily Unavailable")
                             it.reject(code, phrase)
-                        } else {
+                        } else if (!it.cancelPendingInvite()) {
+                            // An INVITE we sent that is still ringing has no dialog
+                            // yet: only CANCEL withdraws it. A BYE there was ignored,
+                            // so the host kept ringing after the GSM caller hung up
+                            // and could answer a call with nothing on the other end.
                             it.hangup()
                         }
                     }
@@ -1506,8 +1541,7 @@ class CallOrchestrator(
                 }
                 it.client.removeCall(it.callId)
             }
-            inboundForkLegs.filter { it !== activeSipCall }.forEach(::endLosingLeg)
-            inboundForkLegs.clear()
+            losingLegs.forEach(::endLosingLeg)
             activeSipCall = null
 
             activeGsmCall?.let { call ->

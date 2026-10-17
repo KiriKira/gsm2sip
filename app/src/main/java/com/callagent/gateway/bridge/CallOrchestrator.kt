@@ -90,7 +90,8 @@ class CallOrchestrator(
             .firstOrNull { it.simId.equals(simId, ignoreCase = true) && it.state == "active" }?.mappingRevision
     },
     private val incomingAccountResolver: (Context, PhoneAccountHandle?) -> SimRegistry.SimMapping? =
-        { appContext, handle -> SimRegistry.resolvePhoneAccount(appContext, handle) }
+        { appContext, handle -> SimRegistry.resolvePhoneAccount(appContext, handle) },
+    private val rtcAdapter: com.callagent.gateway.rtc.GatewayRtcMedia? = null
 ) : SipClient.Listener, GsmCallManager.Listener, SipCall.Listener {
 
     /**
@@ -121,6 +122,12 @@ class CallOrchestrator(
     }
 
     private var activeRtpSession: RtpSession? = null
+    @Volatile private var activeRtc: com.callagent.gateway.rtc.GatewayRtcMedia.Prepared? = null
+    @Volatile private var mediaSelectedFor: SipCall? = null
+    @Volatile private var mediaPreparingFor: SipCall? = null
+    private val mediaWorker = Executors.newSingleThreadExecutor()
+    @Volatile private var dtmfQueuedUntil = 0L
+    val mediaTransport: String get() = if (activeRtc != null) "webrtc" else "sip"
     @Volatile private var activeSipCall: SipCall? = null
     @Volatile private var activeGsmCall: Call? = null
     @Volatile private var activeGsmMapping: SimRegistry.SimMapping? = null
@@ -238,6 +245,7 @@ class CallOrchestrator(
         stopped = true
         cancelPendingInboundWork()
         inboundWorker.shutdownNow()
+        mediaWorker.shutdownNow()
         tearDown("Orchestrator stopped", ledgerStateOverride = "unknown")
         sipClient.listener = null
         nodeClients.forEach { if (it.listener === nodeClientListener) it.listener = null }
@@ -574,6 +582,17 @@ class CallOrchestrator(
             freshMapping.phoneAccountHandle == null) {
             failPendingOutbound(call, metadata, callGeneration, 409, "SIM Mapping Changed",
                 "Call rejected: SIM mapping changed during call preparation")
+            return
+        }
+        if (!isPendingOutbound(call, metadata, callGeneration)) return
+
+        try {
+            prepareCallMedia(call, metadata.callId, callGeneration) {
+                isPendingOutbound(call, metadata, callGeneration)
+            }
+        } catch (_: Throwable) {
+            failPendingOutbound(call, metadata, callGeneration, 488, "WebRTC Media Unavailable",
+                "WebRTC media preparation failed; no cellular dial or SIP audio fallback was started")
             return
         }
         if (!isPendingOutbound(call, metadata, callGeneration)) return
@@ -1100,6 +1119,62 @@ class CallOrchestrator(
 
     // ── SipCall.Listener ────────────────────────────────
 
+    private fun prepareCallMedia(call: SipCall, callId: String, gen: Long, valid: () -> Boolean) {
+        if (mediaSelectedFor === call) return
+        val prepared = rtcAdapter?.prepare(call, callId, valid,
+            publish = { next ->
+                synchronized(this) {
+                    if (stopped || generation != gen || activeSipCall !== call || !valid()) false
+                    else { activeRtc = next; true }
+                }
+            },
+            log = { line ->
+                if (line.startsWith("media=sip")) Log.i("GsmRtc", line)
+                listener?.onRtpStats(line)
+            },
+            digit = { digit -> receiveRtcDigit(digit, gen) },
+            failure = { reason ->
+                telecomHandler.post {
+                    if (generation == gen && activeSipCall === call) {
+                        listener?.onError("WebRTC media failed: $reason")
+                        tearDown("WebRTC media failed")
+                    }
+                }
+            })
+        synchronized(this) {
+            if (stopped || generation != gen || activeSipCall !== call || !valid()) {
+                prepared?.session?.close()
+                error("Media preparation retired")
+            }
+            activeRtc = prepared
+            mediaSelectedFor = call
+            mediaPreparingFor = null
+            context.getSharedPreferences("gateway-runtime-media", Context.MODE_PRIVATE).edit()
+                .putString("media_transport", mediaTransport).apply()
+        }
+        val line = "media=$mediaTransport call_control=sip call_id=$callId event=prepared"
+        Log.i("GsmRtc", line)
+        listener?.onRtpStats(line)
+    }
+
+    private fun receiveRtcDigit(digit: Char, gen: Long) {
+        telecomHandler.post {
+            val session = activeRtpSession ?: return@post
+            if (generation != gen || bridgeState != BridgeState.BRIDGED) return@post
+            val now = SystemClock.elapsedRealtime()
+            val delay = (dtmfQueuedUntil - now).coerceAtLeast(0)
+            if (delay > 5000) return@post
+            dtmfQueuedUntil = now + delay + 200
+            telecomHandler.postDelayed({
+                if (generation != gen || activeRtpSession !== session) return@postDelayed
+                session.listener?.onDtmfTone(digit, true)
+                telecomHandler.postDelayed({
+                    if (generation == gen && activeRtpSession === session) session.listener?.onDtmfTone(digit, false)
+                }, 120)
+            }, delay)
+        }
+    }
+
     override fun onCallAnswered(call: SipCall) {
         Log.i(TAG, "SIP call answered: ${call.callId}")
     }
@@ -1110,6 +1185,31 @@ class CallOrchestrator(
         settleInboundFork(call)
         if (call !== activeSipCall) {
             Log.d(TAG, "Ignoring RTP-ready callback from a stale SIP call")
+            return
+        }
+        if (rtcAdapter == null) mediaSelectedFor = call
+        if (mediaSelectedFor !== call) {
+            synchronized(this) {
+                if (mediaPreparingFor === call) return
+                mediaPreparingFor = call
+            }
+            val gen = generation
+            mediaWorker.execute {
+                try {
+                    val id = call.trustedGsmMetadata?.callId ?: activeBusinessCallId ?: error("Call authority missing")
+                    prepareCallMedia(call, id, gen) { !stopped && generation == gen && activeSipCall === call }
+                    if (!stopped && generation == gen && activeSipCall === call) {
+                        onRtpReady(call, remoteRtpAddr, remoteRtpPort, payloadType)
+                    }
+                } catch (_: Throwable) {
+                    telecomHandler.post {
+                        if (generation == gen && activeSipCall === call) {
+                            listener?.onError("WebRTC media unavailable; cellular call was not answered")
+                            tearDown("Media selection/preparation failed")
+                        }
+                    }
+                }
+            }
             return
         }
         val codecName = when (payloadType) {
@@ -1392,15 +1492,16 @@ class CallOrchestrator(
             localPort,
             remoteAddr,
             remotePort,
-            payloadType,
-            activeSipCall?.negotiatedTelephoneEventPayloadType,
-            activeSipCall?.requiresSrtp == true
+            if (activeRtc != null) RtpPacket.PT_G722 else payloadType,
+            if (activeRtc == null) activeSipCall?.negotiatedTelephoneEventPayloadType else null,
+            activeRtc == null && activeSipCall?.requiresSrtp == true,
+            activeRtc?.pcm
         )
 
         // Attach the negotiated SRTP keys, if this call has any.  Done before
         // start() so no packet is ever sent or accepted unprotected on a call
         // that agreed to be protected.
-        activeSipCall?.let { call ->
+        activeSipCall?.takeIf { activeRtc == null }?.let { call ->
             val local = call.localSrtpKeys
             val remote = call.remoteSrtpKeys
             if (local != null && remote != null) {
@@ -1412,6 +1513,15 @@ class CallOrchestrator(
         session.listener = object : RtpSession.Listener {
             override fun onRtpStarted() {
                 if (activeRtpSession === session) mediaBridgeEstablished = true
+                activeRtc?.session?.let { rtc ->
+                    if (!GsmCallManager.isCallActive) {
+                        tearDown("WebRTC audio cannot start before cellular ACTIVE")
+                    } else {
+                        rtc.enableAudio(true)
+                        rtc.markCellularActive()
+                        listener?.onRtpStats("media=webrtc call_control=sip call_id=${rtc.callId} event=cellular_pcm_started rate=16000")
+                    }
+                }
                 Log.i(TAG, "RTP session started")
             }
             override fun onRtpStopped() {
@@ -1510,6 +1620,11 @@ class CallOrchestrator(
         Log.i(TAG, "Tearing down bridge: $reason")
 
         try {
+            activeRtc?.session?.close()
+            activeRtc = null
+            mediaSelectedFor = null
+            mediaPreparingFor = null
+            dtmfQueuedUntil = 0L
             activeRtpSession?.stop()
             activeRtpSession = null
 

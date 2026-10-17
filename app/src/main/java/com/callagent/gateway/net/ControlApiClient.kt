@@ -58,7 +58,8 @@ class ControlApiClient(
     context: Context,
     baseUrl: String,
     /** Session store for this server; the primary pairing unless a mesh node vault is given. */
-    private val sessions: SessionSource = CredentialStore
+    private val sessions: SessionSource = CredentialStore,
+    private val ioTimeoutMillis: Int? = null
 ) {
     private val app = context.applicationContext
     private val base = normalizeBase(baseUrl)
@@ -195,6 +196,12 @@ class ControlApiClient(
         if (revision < 1) throw ControlApiException("INVALID_HEARTBEAT_RESPONSE", "服务器未返回有效 SIM revision")
         val invalidated = response.optJSONArray("invalidated_sim_ids") ?: JSONArray()
         val extensions = response.optJSONArray("extensions") ?: JSONArray()
+        if (body.optBoolean("sip_registered", false)) runCatching {
+            val capabilities = request("GET", "/v1/capabilities", authenticated = false)
+            if (capabilities.optBoolean("rtc_audio", false) && com.callagent.rtcmedia.RtcAudioSession.isAvailable(app)) {
+                rtcRequest("POST", "/devices/self/rtc-capability", JSONObject().put("version", 1))
+            }
+        }.onFailure { android.util.Log.w("GsmRtc", "role=gateway event=capability_registration_failed") }
         return HeartbeatResult(revision, (0 until invalidated.length()).map { invalidated.getString(it) },
             (0 until extensions.length()).mapNotNull { extensions.optString(it).takeIf(String::isNotBlank) }.toSet())
     }
@@ -307,6 +314,14 @@ class ControlApiClient(
 
     private fun gatewayId(): String = sessionOrThrow().gatewayId
 
+    internal fun rtcRequest(method: String, path: String, body: JSONObject?): JSONObject {
+        require(path.matches(Regex("/(devices/self/rtc-capability|rtc/legs/[a-zA-Z0-9_-]+|calls/[a-zA-Z0-9_-]+/media(/active)?)")))
+        val expected = sessionOrThrow()
+        return try { request(method, "/v1$path", body, expectedGatewayId = expected.gatewayId) }
+        catch (failure: ControlApiException) { throw com.callagent.rtcmedia.MediaApiException(failure.httpStatus, failure.code) }
+        catch (_: java.io.IOException) { throw com.callagent.rtcmedia.MediaApiException(503, "NETWORK_UNAVAILABLE") }
+    }
+
     private fun sessionOrThrow(): CredentialStore.Session {
         val session = sessions.load(app)
             ?: throw ControlApiException("PAIRING_REQUIRED", "设备尚未完成服务端配对")
@@ -333,8 +348,8 @@ class ControlApiClient(
         try {
             conn.instanceFollowRedirects = false
             conn.requestMethod = method
-            conn.connectTimeout = CONNECT_TIMEOUT_MS
-            conn.readTimeout = READ_TIMEOUT_MS
+            conn.connectTimeout = ioTimeoutMillis ?: CONNECT_TIMEOUT_MS
+            conn.readTimeout = ioTimeoutMillis ?: READ_TIMEOUT_MS
             conn.setRequestProperty("Accept", "application/json")
             if (session != null) conn.setRequestProperty("Authorization", "Bearer ${session.accessToken}")
             if (body != null) {

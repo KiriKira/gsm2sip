@@ -1513,7 +1513,7 @@ class GatewayService : Service() {
         )
         sipClient = sip
 
-        val orch = CallOrchestrator(this, sip)
+        val orch = CallOrchestrator(this, sip, rtcAdapter = com.callagent.gateway.rtc.GatewayRtcMedia(this))
         orch.listener = object : CallOrchestrator.OrchestratorListener {
             override fun onStateChanged(state: CallOrchestrator.BridgeState, info: String) {
                 Log.i(TAG, "Bridge: $state - $info")

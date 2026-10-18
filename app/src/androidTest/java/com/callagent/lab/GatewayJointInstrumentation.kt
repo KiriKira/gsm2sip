@@ -117,6 +117,16 @@ class GatewayJointInstrumentation:Instrumentation(){
                 val reply=JSONObject().put("id",id)
                 try{
                     when(command.getString("op")){
+                        "reconnect"->{
+                            check(orch?.bridgeState==CallOrchestrator.BridgeState.IDLE){"active_call_reconnect_forbidden"}
+                            onMain{GatewayService.stop(targetContext)}
+                            Thread.sleep(700)
+                            onMain{check(GatewayService.start(targetContext,server,prefs.getInt("port",5061),username,password)){"reconnect_start_denied"}}
+                        }
+                        "mesh_add"->{
+                            val node=com.callagent.gateway.mesh.MeshPairing.add(targetContext,command.getString("api_url"),command.getString("pairing_code"),"RTC joint gateway mesh")
+                            reply.put("added_gateway_id",node.gatewayId)
+                        }
                         "hangup"->onMain{GsmCallManager.hangupCall()}
                         "mute"->orch?.setAgentMuted(command.getBoolean("enabled"))
                         "status"->Unit

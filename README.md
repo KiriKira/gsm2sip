@@ -1,6 +1,6 @@
 # 双 SIM 远程网关（开发中）
 
-实验分支已接入可选 WebRTC 语音：主机在拨号页/设置里开启后，新通话使用 ICE/DTLS-SRTP/Opus，SIP 仍负责呼叫控制；失败不自动回退或重拨。需同时更新网关与服务端，并配置必要的 TURN 端口。[部署与端口说明](https://github.com/KiriKira/gsm2sip-server/blob/ci/webrtc-sip-debug-20261017/docs/webrtc-audio.md)。双模拟器联合验收正在进行；真实蜂窝音频还需真机验证。
+实验分支已接入可选 WebRTC 语音：主机在拨号页/设置里开启后，新通话使用 ICE/DTLS-SRTP/Opus，SIP 仍负责呼叫控制；失败不自动回退或重拨。需同时更新网关与服务端，并配置必要的 TURN 端口。[部署与端口说明](https://github.com/KiriKira/gsm2sip-server/blob/ci/webrtc-sip-debug-20261017/docs/webrtc-audio.md)。双模拟器联合验收已通过，含呼入/呼出双向测试音频、TURN 与三节点备用切换；[结果与已签名 Release](docs/webrtc-joint-validation-20261019.md)。真实蜂窝音频仍需真机验证。
 
 [自动构建与 Release、固定签名配置](docs/releases.md)：`main` 推送发布预览版，版本标签发布正式版；首次发布前运行签名 Secrets 配置脚本。
 

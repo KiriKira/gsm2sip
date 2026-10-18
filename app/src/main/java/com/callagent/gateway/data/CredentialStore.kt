@@ -29,6 +29,8 @@ interface SessionSource {
  * non-exportable Android Keystore key shared by all vaults of this app.
  */
 class SessionVault(private val prefsName: String, private val blobKey: String) : SessionSource {
+    private var cachedBlob: String? = null
+    private var cachedSession: CredentialStore.Session? = null
     @Synchronized
     fun save(context: Context, session: CredentialStore.Session) {
         persist(context, session)
@@ -68,7 +70,17 @@ class SessionVault(private val prefsName: String, private val blobKey: String) :
 
     @Synchronized
     override fun load(context: Context): CredentialStore.Session? {
-        val encoded = prefs(context).getString(blobKey, null) ?: return null
+        val encoded = prefs(context).getString(blobKey, null)
+        if (encoded == null) {
+            cachedBlob = null
+            cachedSession = null
+            return null
+        }
+        // Signal reads and writes must not each wait for several Keystore
+        // Binder operations between a revision read and its conditional POST.
+        // Check the persisted encrypted blob on every load, including reads
+        // after another vault instance rotates or clears this store.
+        if (encoded == cachedBlob) cachedSession?.let { return it }
         return try {
             val packed = Base64.decode(encoded, Base64.NO_WRAP)
             require(packed.size > 12)
@@ -80,7 +92,10 @@ class SessionVault(private val prefsName: String, private val blobKey: String) :
             CredentialStore.Session(json.getString("gateway_id"), json.getString("control_base_url"),
                 json.getString("access_token"), json.getString("access_expires_at"),
                 json.getString("refresh_token"), json.getString("refresh_expires_at"),
-                json.optString("pending_refresh_key").takeIf { it.isNotBlank() && it != "null" })
+                json.optString("pending_refresh_key").takeIf { it.isNotBlank() && it != "null" }).also {
+                    cachedBlob = encoded
+                    cachedSession = it
+                }
         } catch (_: Exception) {
             // A restored backup or invalidated Keystore key cannot authenticate.
             clear(context)
@@ -105,6 +120,8 @@ class SessionVault(private val prefsName: String, private val blobKey: String) :
 
     @Synchronized
     fun clear(context: Context) {
+        cachedBlob = null
+        cachedSession = null
         val removed = prefs(context).edit().remove(blobKey).commit()
         check(removed) { "Credential storage clear failed" }
     }
@@ -124,9 +141,12 @@ class SessionVault(private val prefsName: String, private val blobKey: String) :
             encrypt(plaintext, key())
         }
         val packed = iv + encrypted
+        val encoded = Base64.encodeToString(packed, Base64.NO_WRAP)
         val persisted = prefs(context).edit()
-            .putString(blobKey, Base64.encodeToString(packed, Base64.NO_WRAP)).commit()
+            .putString(blobKey, encoded).commit()
         check(persisted) { "Credential storage commit failed" }
+        cachedBlob = encoded
+        cachedSession = session
     }
 
     private fun sameVersion(a: CredentialStore.Session, b: CredentialStore.Session): Boolean =

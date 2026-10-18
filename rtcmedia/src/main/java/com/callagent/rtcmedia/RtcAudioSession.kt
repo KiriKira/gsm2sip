@@ -106,7 +106,6 @@ class RtcAudioSession(
         if(isConnected && outgoingIce.isEmpty() && peer?.hasQueuedCandidates!=true && localEndQueued && now-lastPoll<2_000_000_000L)return
         lastPoll=now
         try {
-            flushCandidates()
             val result=refresh()
             val state=result.getJSONObject("state")
             val snapshot=state.getJSONObject("snapshot")
@@ -152,6 +151,8 @@ class RtcAudioSession(
                 consumedSequences.add(sequence)
                 check(consumedSequences.size<=132)
             }
+            // Apply remote SDP before a burst of local ICE POSTs can delay it.
+            flushCandidates()
             val connected=peer?.isConnected==true
             isConnected=connected
             if(connected){
@@ -163,7 +164,7 @@ class RtcAudioSession(
             }else if(now-startedAt>28_000_000_000L){fail("media_negotiation_timeout");return}
             if(now-lastStats>5_000_000_000L){lastStats=now;peer?.stats()}
         }catch(failure:MediaApiException){
-            if(failure.status in listOf(400,401,403,404,410,429)){fail("signal_${failure.code}")}
+            if(failure.status in listOf(400,401,403,404,409,410,429)){fail("signal_${failure.code}")}
             else if(System.nanoTime()-lastSuccessfulRead>10_000_000_000L)fail("signal_unavailable")
         }catch(_:Throwable){fail("media_signal_or_native_failure")}
     }
@@ -178,9 +179,10 @@ class RtcAudioSession(
     }
     private fun flushCandidates(){
         val native=peer?:return
-        for(candidate in native.takeCandidates())outgoingIce.add(PendingIce(JSONObject()
+        val batch=native.takeCandidates()
+        for(candidate in batch.candidates)outgoingIce.add(PendingIce(JSONObject()
             .put("candidate",candidate.sdp).put("sdp_mid",candidate.sdpMid).put("sdp_mline_index",candidate.sdpMLineIndex)))
-        if(native.gatheringComplete && !localEndQueued){localEndQueued=true;outgoingIce.add(PendingIce(null))}
+        if(batch.complete && !localEndQueued){localEndQueued=true;outgoingIce.add(PendingIce(null))}
         repeat(8){
             val item=outgoingIce.peek()?:return
             check(System.nanoTime()-item.queuedAt<10_000_000_000L){"candidate_delivery_timeout"}

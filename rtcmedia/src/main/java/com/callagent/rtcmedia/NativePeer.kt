@@ -28,13 +28,10 @@ internal class NativePeer(
     private val closed = AtomicBoolean()
     private val connected = CountDownLatch(1)
     private val gathered = CountDownLatch(1)
-    private val localCandidates = java.util.concurrent.ConcurrentLinkedQueue<IceCandidate>()
+    private val localCandidates = LocalIceQueue<IceCandidate>()
     private val candidateCount = java.util.concurrent.atomic.AtomicInteger()
-    @Volatile var gatheringComplete = false; private set
-    val hasQueuedCandidates: Boolean get() = localCandidates.isNotEmpty()
-    fun takeCandidates(): List<IceCandidate> = buildList {
-        while (true) add(localCandidates.poll() ?: break)
-    }
+    val hasQueuedCandidates: Boolean get() = localCandidates.hasCandidates()
+    fun takeCandidates(): LocalIceQueue.Batch<IceCandidate> = localCandidates.drain()
     private val lock = Any()
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
     private val pacer = ExternalPlayout.FramePacer()
@@ -105,7 +102,7 @@ internal class NativePeer(
             }
             override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
-                if (state == PeerConnection.IceGatheringState.COMPLETE) { gatheringComplete=true; gathered.countDown() }
+                if (state == PeerConnection.IceGatheringState.COMPLETE) { localCandidates.complete(); gathered.countDown() }
             }
             override fun onIceCandidate(candidate: IceCandidate) {
                 if (candidateCount.incrementAndGet()>128) { onFailure("local_candidate_budget"); return }

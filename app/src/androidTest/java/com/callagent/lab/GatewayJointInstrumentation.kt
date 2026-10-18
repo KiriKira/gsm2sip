@@ -65,19 +65,31 @@ class GatewayJointInstrumentation:Instrumentation(){
             Thread.sleep(500)
             stage="pair"
             val api=ControlApiClient(targetContext,config.getString("api_url"))
-            api.pair(config.getString("pairing_code"),"RTC joint emulator gateway")
+            val reuse=config.optBoolean("reuse_pairing")
+            if(!reuse)api.pair(config.getString("pairing_code"),"RTC joint emulator gateway")
             val paired=checkNotNull(CredentialStore.load(targetContext))
             stage="bind_emulated_sim"
             val snapshot=SimRegistry.snapshot(targetContext,includeVoice=true)
             check(snapshot.subscriptions.isNotEmpty()){"emulator_sim_missing"}
             check(snapshot.subscriptions.all{it.voiceAvailable}){"real_emulator_telecom_account_unavailable"}
-            val mappings=JSONArray()
-            snapshot.subscriptions.sortedBy{it.slotIndex}.forEach{mappings.put(JSONObject().put("slot_index",it.slotIndex).put("label","Emulated SIM").put("carrier_name",it.carrierName).put("phone_number",JSONObject.NULL))}
-            val proposal=api.proposeSimBindings(UUID.randomUUID().toString(),mappings)
-            api.confirmSimBindings(proposal.operationId,JSONArray().apply{proposal.mappings.forEach{put(JSONObject().put("sim_id",it.simId).put("confirmed",true).put("slot_index",it.slotIndex))}})
-            SimRegistry.confirmMappings(targetContext,proposal.mappings.map{m->SimRegistry.SimBindingConfirmation(m.simId,snapshot.subscriptions.single{it.slotIndex==m.slotIndex}.subscriptionId)},proposal.mappingRevision)
-            val voice=api.rotateSipCredentials(UUID.randomUUID().toString())
-            VoiceCredentialStore.saveProvisioned(targetContext,paired.gatewayId,voice)
+            val confirmed=if(reuse){
+                check(snapshot.ownerGatewayId==paired.gatewayId){"resume_gateway_identity_changed"}
+                check(snapshot.ownerControlBaseUrl==paired.controlBaseUrl){"resume_gateway_origin_changed"}
+                snapshot.mappings.single().simId to snapshot.mappingRevision
+            }else{
+                val mappings=JSONArray()
+                snapshot.subscriptions.sortedBy{it.slotIndex}.forEach{mappings.put(JSONObject().put("slot_index",it.slotIndex).put("label","Emulated SIM").put("carrier_name",it.carrierName).put("phone_number",JSONObject.NULL))}
+                val proposal=api.proposeSimBindings(UUID.randomUUID().toString(),mappings)
+                api.confirmSimBindings(proposal.operationId,JSONArray().apply{proposal.mappings.forEach{put(JSONObject().put("sim_id",it.simId).put("confirmed",true).put("slot_index",it.slotIndex))}})
+                SimRegistry.confirmMappings(targetContext,proposal.mappings.map{m->SimRegistry.SimBindingConfirmation(m.simId,snapshot.subscriptions.single{it.slotIndex==m.slotIndex}.subscriptionId)},proposal.mappingRevision)
+                VoiceCredentialStore.saveProvisioned(targetContext,paired.gatewayId,api.rotateSipCredentials(UUID.randomUUID().toString()))
+                proposal.mappings.first().simId to proposal.mappingRevision
+            }
+            val prefs=targetContext.getSharedPreferences("gateway",0)
+            val server=checkNotNull(prefs.getString("server",null))
+            val username=checkNotNull(prefs.getString("user",null))
+            val password=VoiceCredentialStore.password(targetContext,server,username)
+            check(password.isNotBlank()){"resume_sip_credentials_missing"}
             targetContext.getSharedPreferences("gateway",0).edit().putBoolean("use_stun",false).putString("own_number","+15550100299").commit()
             GatewayService.orchestratorFactoryForInstrumentation={service,sip->
                 // The synthetic backend supplies PCM directly and needs no
@@ -93,10 +105,10 @@ class GatewayJointInstrumentation:Instrumentation(){
             }
             stage="service_start"
             activity=startActivitySync(Intent(targetContext,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-            onMain{check(GatewayService.start(targetContext,voice.getString("server_name"),com.callagent.gateway.sip.ProvisionedSipTransport.from(voice).port,voice.getString("auth_username"),voice.getString("password"))){"service_start_denied"}}
-            val ready=JSONObject().put("status","READY").put("gateway_id",paired.gatewayId).put("sim_id",proposal.mappings.first().simId).put("mapping_revision",proposal.mappingRevision)
+            onMain{check(GatewayService.start(targetContext,server,prefs.getInt("port",5061),username,password)){"service_start_denied"}}
+            val ready=JSONObject().put("status","READY").put("gateway_id",paired.gatewayId).put("sim_id",confirmed.first).put("mapping_revision",confirmed.second)
             targetContext.filesDir.resolve("joint-ready.json").writeText(ready.toString())
-            var last="";val deadline=System.nanoTime()+java.util.concurrent.TimeUnit.MINUTES.toNanos(60)
+            var last="";val deadline=System.nanoTime()+java.util.concurrent.TimeUnit.HOURS.toNanos(6)
             stage="commands"
             while(System.nanoTime()<deadline){
                 Thread.sleep(200)

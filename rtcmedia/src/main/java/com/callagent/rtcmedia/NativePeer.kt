@@ -27,7 +27,6 @@ internal class NativePeer(
 ) : AutoCloseable {
     private val closed = AtomicBoolean()
     private val connected = CountDownLatch(1)
-    private val gathered = CountDownLatch(1)
     private val localCandidates = LocalIceQueue<IceCandidate>()
     private val candidateCount = java.util.concurrent.atomic.AtomicInteger()
     val hasQueuedCandidates: Boolean get() = localCandidates.hasCandidates()
@@ -97,16 +96,21 @@ internal class NativePeer(
             override fun onConnectionChange(state: PeerConnection.PeerConnectionState) {
                 isConnected = state == PeerConnection.PeerConnectionState.CONNECTED
                 onEvent("peer_${state.name.lowercase()}")
-                if (isConnected) connected.countDown()
+                if (isConnected) {
+                    // Nomination succeeded. Seal this generation atomically;
+                    // never trickle a later network callback after its END.
+                    localCandidates.seal()
+                    connected.countDown()
+                }
                 if (state == PeerConnection.PeerConnectionState.FAILED && !closed.get()) onFailure("dtls_connection_failed")
             }
             override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
-                if (state == PeerConnection.IceGatheringState.COMPLETE) { localCandidates.complete(); gathered.countDown() }
+                onEvent("gathering_${state.name.lowercase()}")
             }
             override fun onIceCandidate(candidate: IceCandidate) {
                 if (candidateCount.incrementAndGet()>128) { onFailure("local_candidate_budget"); return }
-                localCandidates.add(candidate)
+                if (!localCandidates.add(candidate)) onEvent("late_local_candidate_ignored")
             }
             override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) = Unit
             override fun onAddStream(stream: MediaStream) = Unit

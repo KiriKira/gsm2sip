@@ -12,7 +12,7 @@ class LocalIceQueueTest {
         val firstBatch = queue.drain()
         // Native callbacks run while the signal worker serializes this batch.
         queue.add("last")
-        queue.complete()
+        queue.seal()
         assertFalse(firstBatch.complete)
         val finalBatch = queue.drain()
         assertEquals(listOf("first", "last"), firstBatch.candidates + finalBatch.candidates)
@@ -27,7 +27,7 @@ class LocalIceQueueTest {
             val producer = thread {
                 start.await()
                 repeat(512) { queue.add(it); if (it % 7 == 0) Thread.yield() }
-                queue.complete()
+                queue.seal()
             }
             start.countDown()
             val received = mutableListOf<Int>()
@@ -41,5 +41,30 @@ class LocalIceQueueTest {
             assertEquals((0 until 512).toList(), received)
             assertFalse(queue.hasCandidates())
         }
+    }
+
+    @Test fun emptyGatheringCanBeFollowedByCandidatesUntilConnected() {
+        val queue = LocalIceQueue<String>()
+        // An empty COMPLETE from the platform is not ICE nomination.
+        assertFalse(queue.drain().complete)
+        assertTrue(queue.add("late-interface-host"))
+        assertFalse(queue.drain().complete)
+        assertTrue(queue.add("turn-relay"))
+        queue.seal()
+        val finalBatch = queue.drain()
+        assertEquals(listOf("turn-relay"), finalBatch.candidates)
+        assertTrue(finalBatch.complete)
+    }
+
+    @Test fun callbacksAfterNominationCannotTricklePastEnd() {
+        val queue = LocalIceQueue<String>()
+        queue.add("selected-relay")
+        queue.seal()
+        assertFalse(queue.add("later-network"))
+        val finalBatch = queue.drain()
+        assertEquals(listOf("selected-relay"), finalBatch.candidates)
+        assertTrue(finalBatch.complete)
+        assertFalse(queue.hasCandidates())
+        assertTrue(queue.drain().complete)
     }
 }

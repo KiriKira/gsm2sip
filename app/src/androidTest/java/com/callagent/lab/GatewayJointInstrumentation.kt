@@ -24,6 +24,12 @@ class GatewayJointInstrumentation:Instrumentation(){
     private val tones=CopyOnWriteArrayList<LabPcmTone>()
     @Volatile private var orch:CallOrchestrator?=null
     private var stage="init"
+        set(value){field=value;runCatching{targetContext.filesDir.resolve("joint-stage.txt").writeText(value)}}
+    private fun onMain(action:()->Unit){
+        var failure:Throwable?=null
+        runOnMainSync{try{action()}catch(error:Throwable){failure=error}}
+        failure?.let{throw it}
+    }
     override fun onCreate(arguments:Bundle?){super.onCreate(arguments);start()}
     private class PcmHardware(private val tone:LabPcmTone):CallAudioSession{
         override var listener:RtpSession.Listener?=null
@@ -40,7 +46,7 @@ class GatewayJointInstrumentation:Instrumentation(){
         try{
             check(android.os.Build.SUPPORTED_ABIS.contains("x86_64")){"emulator_only"}
             val config=JSONObject(targetContext.filesDir.resolve("joint-fixture.json").readText())
-            runOnMainSync{targetContext.stopService(Intent(targetContext,GatewayService::class.java))}
+            onMain{targetContext.stopService(Intent(targetContext,GatewayService::class.java))}
             Thread.sleep(500)
             stage="pair"
             val api=ControlApiClient(targetContext,config.getString("api_url"))
@@ -68,7 +74,7 @@ class GatewayJointInstrumentation:Instrumentation(){
             }
             stage="service_start"
             activity=startActivitySync(Intent(targetContext,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-            runOnMainSync{check(GatewayService.start(targetContext,voice.getString("server_name"),voice.getInt("port"),voice.getString("auth_username"),voice.getString("password"))){"service_start_denied"}}
+            onMain{check(GatewayService.start(targetContext,voice.getString("server_name"),com.callagent.gateway.sip.ProvisionedSipTransport.from(voice).port,voice.getString("auth_username"),voice.getString("password"))){"service_start_denied"}}
             val ready=JSONObject().put("status","READY").put("gateway_id",paired.gatewayId).put("sim_id",proposal.mappings.first().simId).put("mapping_revision",proposal.mappingRevision)
             targetContext.filesDir.resolve("joint-ready.json").writeText(ready.toString())
             var last="";val deadline=System.nanoTime()+java.util.concurrent.TimeUnit.MINUTES.toNanos(25)
@@ -80,7 +86,7 @@ class GatewayJointInstrumentation:Instrumentation(){
                 val reply=JSONObject().put("id",id)
                 try{
                     when(command.getString("op")){
-                        "hangup"->runOnMainSync{GsmCallManager.hangupCall()}
+                        "hangup"->onMain{GsmCallManager.hangupCall()}
                         "mute"->orch?.setAgentMuted(command.getBoolean("enabled"))
                         "status"->Unit
                         "stop"->break
@@ -96,7 +102,7 @@ class GatewayJointInstrumentation:Instrumentation(){
         }catch(failure:Throwable){result.put("status","FAIL").put("error",failure.javaClass.simpleName+":"+failure.message)}
         finally{
             GatewayService.orchestratorFactoryForInstrumentation=null
-            runCatching{runOnMainSync{GatewayService.stop(targetContext);activity?.finish()}}
+            runCatching{onMain{GatewayService.stop(targetContext);activity?.finish()}}
             tones.forEach{it.close()};result.put("stage",stage)
             targetContext.filesDir.resolve("joint-finished.json").writeText(result.toString())
             finish(Activity.RESULT_OK,Bundle().apply{putString("joint_result",result.toString())})

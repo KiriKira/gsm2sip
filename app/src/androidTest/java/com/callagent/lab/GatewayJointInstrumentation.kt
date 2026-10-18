@@ -88,6 +88,7 @@ class GatewayJointInstrumentation:Instrumentation(){
                     }
                     reply.put("status","OK").put("bridge",orch?.bridgeState?.name).put("media",orch?.mediaTransport)
                         .put("telecom_state",GsmCallManager.activeCallState).put("pcm",JSONArray(tones.map{it.report()}))
+                        .put("dtmf_events",JSONArray(GatewayService.logSnapshot().filter{it.contains("DTMF received and played") || it.contains("DTMF tone stopped")}))
                 }catch(failure:Throwable){reply.put("status","FAIL").put("error",failure.javaClass.simpleName+":"+failure.message)}
                 targetContext.filesDir.resolve("joint-result.json").writeText(reply.toString())
             }

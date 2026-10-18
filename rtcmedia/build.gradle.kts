@@ -24,7 +24,9 @@ android {
 }
 tasks.named("preBuild") { dependsOn(prepareSdk) }
 dependencies {
-    implementation(files(sdkOutput.map { it.file("external-playout.aar") }).builtBy(prepareSdk))
+    // A local AAR must be packaged by the application, not nested in this
+    // library's lint AAR. Both modules compile against the same pinned SDK.
+    compileOnly(files(sdkOutput.map { it.file("external-playout.aar") }).builtBy(prepareSdk))
     implementation("androidx.annotation:annotation:1.9.1")
     testImplementation("junit:junit:4.13.2")
 }

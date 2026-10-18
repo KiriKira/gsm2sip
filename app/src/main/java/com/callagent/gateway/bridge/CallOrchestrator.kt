@@ -89,9 +89,10 @@ class CallOrchestrator(
         GatewayDatabase.get(appContext).meshNodeSims(node)
             .firstOrNull { it.simId.equals(simId, ignoreCase = true) && it.state == "active" }?.mappingRevision
     },
+    private val audioFactory: (com.callagent.gateway.rtp.CallAudioConfiguration) -> com.callagent.gateway.rtp.CallAudioSession = { it.realSession() },
+    private val rtcAdapter: com.callagent.gateway.rtc.GatewayRtcMedia? = null,
     private val incomingAccountResolver: (Context, PhoneAccountHandle?) -> SimRegistry.SimMapping? =
-        { appContext, handle -> SimRegistry.resolvePhoneAccount(appContext, handle) },
-    private val rtcAdapter: com.callagent.gateway.rtc.GatewayRtcMedia? = null
+        { appContext, handle -> SimRegistry.resolvePhoneAccount(appContext, handle) }
 ) : SipClient.Listener, GsmCallManager.Listener, SipCall.Listener {
 
     /**
@@ -121,7 +122,7 @@ class CallOrchestrator(
         if (client.listener === nodeClientListener) client.listener = null
     }
 
-    private var activeRtpSession: RtpSession? = null
+    private var activeRtpSession: com.callagent.gateway.rtp.CallAudioSession? = null
     @Volatile private var activeRtc: com.callagent.gateway.rtc.GatewayRtcMedia.Prepared? = null
     @Volatile private var mediaSelectedFor: SipCall? = null
     @Volatile private var mediaPreparingFor: SipCall? = null
@@ -1487,7 +1488,7 @@ class CallOrchestrator(
         }
 
         activeRtpSession?.stop()
-        val session = RtpSession(
+        val session = audioFactory(com.callagent.gateway.rtp.CallAudioConfiguration(
             context,
             localPort,
             remoteAddr,
@@ -1496,7 +1497,7 @@ class CallOrchestrator(
             if (activeRtc == null) activeSipCall?.negotiatedTelephoneEventPayloadType else null,
             activeRtc == null && activeSipCall?.requiresSrtp == true,
             activeRtc?.pcm
-        )
+        ))
 
         // Attach the negotiated SRTP keys, if this call has any.  Done before
         // start() so no packet is ever sent or accepted unprotected on a call
@@ -1728,6 +1729,10 @@ class CallOrchestrator(
         Log.w(TAG, "Force-resetting bridge: $reason")
         val businessCallId = activeBusinessCallId
         cancelPendingInboundWork()
+        activeRtc?.session?.close()
+        activeRtc = null
+        mediaSelectedFor = null
+        mediaPreparingFor = null
         try {
             activeRtpSession?.stop()
         } catch (_: Exception) {}

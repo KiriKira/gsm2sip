@@ -42,7 +42,7 @@ class RtpSession(
     private val telephoneEventPayloadType: Int? = null,
     private val requireSrtp: Boolean = false,
     private val externalPcm: com.callagent.rtcmedia.PcmBridge? = null
-) {
+) : CallAudioSession {
     private val running = AtomicBoolean(false)
     private val mediaFailureReported = AtomicBoolean(false)
     /** The four loop threads, so [stop] can wait for them to leave the
@@ -87,8 +87,8 @@ class RtpSession(
     // own rollover counters, and each is touched by exactly one thread --
     // send by the capture loop, receive by the receive loop.
 
-    @Volatile var srtpSend: SrtpContext? = null
-    @Volatile var srtpRecv: SrtpContext? = null
+    @Volatile override var srtpSend: SrtpContext? = null
+    @Volatile override var srtpRecv: SrtpContext? = null
 
     /** Packets dropped because they failed authentication. */
     @Volatile var srtpAuthFailures = 0L
@@ -201,7 +201,7 @@ class RtpSession(
     private val RATE_MIN_PERCENT = 85L
     private val SILENCE_FRAME_LIMIT get() = profile.captureSilenceFrames
 
-    var listener: Listener? = null
+    override var listener: Listener? = null
 
     interface Listener {
         fun onRtpStarted()
@@ -213,7 +213,7 @@ class RtpSession(
         fun onRtpStats(stats: String) {}  // Periodic detailed stats
     }
 
-    fun start() {
+    override fun start() {
         if (externalPcm == null && requireSrtp && (srtpSend == null || srtpRecv == null)) {
             listener?.onRtpError("SRTP was required but keys were not installed")
             return
@@ -805,7 +805,7 @@ class RtpSession(
      * tearDown(), which runs on the main thread via the Telecom callback;
      * blocking there for up to four joins is how ANRs happen.
      */
-    fun stop() {
+    override fun stop() {
         externalPcm?.clear()
         if (!running.getAndSet(false)) return
         Log.i(TAG, "Stopping RTP session on port $localPort")
@@ -1435,14 +1435,14 @@ class RtpSession(
     }
 
     /** Mute or unmute the agent towards the caller. */
-    fun setAgentMuted(on: Boolean) {
+    override fun setAgentMuted(on: Boolean) {
         agentMuted = on
         Log.i(TAG, if (on) "Agent MUTED towards caller" else "Agent unmuted")
         listener?.onRtpStats(if (on) "Agent muted" else "Agent unmuted")
     }
 
     /** Turn the speaker monitor on or off mid-call.  Safe to call repeatedly. */
-    fun setMonitorEnabled(on: Boolean) {
+    override fun setMonitorEnabled(on: Boolean) {
         if (on) {
             if (monitorTrack != null) return
             try {

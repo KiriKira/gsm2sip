@@ -22,11 +22,19 @@ internal class NativePeer(
     private val pcm: PcmBridge?,
     private val onEvent: (String) -> Unit,
     private val onDigit: (Char) -> Unit,
-    private val onFailure: (String) -> Unit
+    private val onFailure: (String) -> Unit,
+    forceRelay: Boolean = false
 ) : AutoCloseable {
     private val closed = AtomicBoolean()
     private val connected = CountDownLatch(1)
     private val gathered = CountDownLatch(1)
+    private val localCandidates = java.util.concurrent.ConcurrentLinkedQueue<IceCandidate>()
+    private val candidateCount = java.util.concurrent.atomic.AtomicInteger()
+    @Volatile var gatheringComplete = false; private set
+    val hasQueuedCandidates: Boolean get() = localCandidates.isNotEmpty()
+    fun takeCandidates(): List<IceCandidate> = buildList {
+        while (true) add(localCandidates.poll() ?: break)
+    }
     private val lock = Any()
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
     private val pacer = ExternalPlayout.FramePacer()
@@ -64,6 +72,7 @@ internal class NativePeer(
                 pacer.awaitNextFrame()
                 try { pcm.fill(buffer, format, channels, rate) }
                 catch (_: Throwable) { buffer.clear(); while (buffer.hasRemaining()) buffer.put(0.toByte());buffer.rewind();onFailure("external_pcm_capture_format") }
+                System.nanoTime()
             }
             builder.setPlaybackSamplesReadyCallback { samples ->
                 try { pcm.decoded(samples.audioFormat,samples.channelCount,samples.sampleRate,samples.data) }
@@ -95,8 +104,13 @@ internal class NativePeer(
                 if (state == PeerConnection.PeerConnectionState.FAILED && !closed.get()) onFailure("dtls_connection_failed")
             }
             override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
-            override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) { if (state == PeerConnection.IceGatheringState.COMPLETE) gathered.countDown() }
-            override fun onIceCandidate(candidate: IceCandidate) = Unit // Complete SDP carries bounded gathered candidates.
+            override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
+                if (state == PeerConnection.IceGatheringState.COMPLETE) { gatheringComplete=true; gathered.countDown() }
+            }
+            override fun onIceCandidate(candidate: IceCandidate) {
+                if (candidateCount.incrementAndGet()>128) { onFailure("local_candidate_budget"); return }
+                localCandidates.add(candidate)
+            }
             override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) = Unit
             override fun onAddStream(stream: MediaStream) = Unit
             override fun onRemoveStream(stream: MediaStream) = Unit
@@ -104,6 +118,7 @@ internal class NativePeer(
             override fun onRenegotiationNeeded() = Unit
         }
         val config = PeerConnection.RTCConfiguration(servers).apply {
+            if (forceRelay) iceTransportsType = PeerConnection.IceTransportsType.RELAY
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE
         }
@@ -129,14 +144,20 @@ internal class NativePeer(
         return localDescription { peer.createAnswer(it,MediaConstraints()) }
     }
     fun remoteAnswer(sdp: String) = setDescription(SessionDescription(SessionDescription.Type.ANSWER,sdp),false)
+    fun remoteCandidate(mid: String, index: Int, candidate: String) {
+        check(peer.addIceCandidate(IceCandidate(mid,index,candidate))) { "remote_candidate_rejected" }
+    }
     private fun localDescription(create: (SdpObserver)->Unit): String {
         val future = CompletableFuture<SessionDescription>()
         create(observer(created={ future.complete(it) },failed={ future.completeExceptionally(IllegalStateException("sdp_create")) }))
         val description=future.get(5,TimeUnit.SECONDS)
         setDescription(description,true)
-        check(gathered.await(10,TimeUnit.SECONDS)) { "ice_gather_timeout" }
         check(!closed.get()) { "closed" }
-        return checkNotNull(peer.localDescription).description.also { check(it.toByteArray().size <= 65536) }
+        // Every candidate is relayed exactly through the committed trickle
+        // queue. Do not publish an inline duplicate captured during setLocal.
+        return checkNotNull(peer.localDescription).description.split("\r\n")
+            .filterNot { it.startsWith("a=candidate:") || it == "a=end-of-candidates" }
+            .joinToString("\r\n").also { check(it.toByteArray().size <= 65536) }
     }
     private fun setDescription(description: SessionDescription,local: Boolean) {
         val future=CompletableFuture<Unit>()
@@ -201,7 +222,12 @@ internal class NativePeer(
                 if(stat.type=="inbound-rtp")rx+=(stat.members["packetsReceived"] as? Number)?.toLong()?:0
                 if(stat.type=="local-candidate" || stat.type=="remote-candidate")(stat.members["candidateType"] as? String)?.let(types::add)
             }
-            onEvent("stats tx_packets=$tx rx_packets=$rx candidate_types=${types.joinToString(",")} pcm_capture=${pcm?.captureFrames?.get()?:0} pcm_decoded=${pcm?.decodedFrames?.get()?:0}")
+            val transport = report.statsMap.values.firstOrNull { it.type == "transport" && it.members["selectedCandidatePairId"] != null }
+            val pair = report.statsMap[transport?.members?.get("selectedCandidatePairId") as? String]
+            val local = report.statsMap[pair?.members?.get("localCandidateId") as? String]
+            val remote = report.statsMap[pair?.members?.get("remoteCandidateId") as? String]
+            val selected = "${local?.members?.get("candidateType")}/${remote?.members?.get("candidateType")}"
+            onEvent("stats selected_pair=$selected tx_packets=$tx rx_packets=$rx candidate_types=${types.joinToString(",")} pcm_capture=${pcm?.captureFrames?.get()?:0} pcm_decoded=${pcm?.decodedFrames?.get()?:0}")
         }
     }
     override fun close(){

@@ -1936,11 +1936,10 @@ class MainActivity : AppCompatActivity() {
             val dest = getSharedPreferences("gateway", MODE_PRIVATE)
                 .getString("own_number", "") ?: ""
             tvHomeCallTo.text = if (dest.isNotEmpty()) "已连接到 $dest" else "已连接"
-            // Inbound is the normal direction for a gateway; a dialler-initiated
-            // call is the other way round.
-            tvHomeCallDirection.text =
-                if (com.callagent.gateway.gsm.GsmCallManager.activeCallState ==
-                    android.telecom.Call.STATE_ACTIVE && gsmCallActive) "GSM → SIP" else "GSM → SIP"
+            val media = getSharedPreferences("gateway-runtime-media", MODE_PRIVATE)
+                .getString("media_transport", "sip")
+            tvHomeCallDirection.text = if (media == "webrtc")
+                "语音：WebRTC · 控制：SIP" else "语音：SIP · 控制：SIP"
             startCallTimer()
         } else {
             homeCallCard.visibility = View.GONE

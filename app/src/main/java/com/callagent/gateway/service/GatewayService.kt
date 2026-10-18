@@ -1513,14 +1513,15 @@ class GatewayService : Service() {
         )
         sipClient = sip
 
-        val orch = CallOrchestrator(this, sip, rtcAdapter = com.callagent.gateway.rtc.GatewayRtcMedia(this))
+        val orch = orchestratorFactoryForInstrumentation?.invoke(this, sip)
+            ?: CallOrchestrator(this, sip, rtcAdapter = com.callagent.gateway.rtc.GatewayRtcMedia(this))
         orch.listener = object : CallOrchestrator.OrchestratorListener {
             override fun onStateChanged(state: CallOrchestrator.BridgeState, info: String) {
                 Log.i(TAG, "Bridge: $state - $info")
                 // The call lifecycle only ever reached logcat and the status
                 // pill; the log viewer showed SIP and audio lines with no
                 // record of the call they belonged to.
-                broadcastLog("CALL: ${state.name}${if (info.isBlank()) "" else " — $info"}")
+                broadcastLog("CALL: media=${orch.mediaTransport} call_control=sip ${state.name}${if (info.isBlank()) "" else " — $info"}")
                 val registered = sip.registered
 
                 // Track online time
@@ -2072,6 +2073,9 @@ class GatewayService : Service() {
     }
 
     companion object {
+        /** In-process instrumentation dependency injection; no IPC/config switch
+         * exposes synthetic cellular hardware to an installed application. */
+        internal var orchestratorFactoryForInstrumentation: ((GatewayService, SipClient) -> CallOrchestrator)? = null
         private const val TAG = "GatewayService"
         private const val LOG_BUFFER_SIZE = 200
         /** Ring buffer of recent log messages — survives activity pause/resume. */

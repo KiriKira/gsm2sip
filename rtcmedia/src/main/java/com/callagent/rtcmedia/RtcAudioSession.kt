@@ -29,7 +29,8 @@ class RtcAudioSession(
     private val onReady: () -> Unit = {},
     private val onDigit: (Char) -> Unit = {},
     private val onFailure: (String) -> Unit,
-    private val onLog: (String) -> Unit = {}
+    private val onLog: (String) -> Unit = {},
+    private val forceRelay: Boolean = false
 ) : AutoCloseable {
     private val binding = admission.getJSONObject("binding")
     val callId: String = binding.getString("call_id")
@@ -60,6 +61,11 @@ class RtcAudioSession(
     private var readyReported=false
     private var revision=1L
     private var highestSequence=0L
+    private val consumedSequences=hashSetOf<Long>()
+    private data class PendingIce(val ice:JSONObject?,val operationId:String=UUID.randomUUID().toString(),val queuedAt:Long=System.nanoTime())
+    private val outgoingIce=java.util.ArrayDeque<PendingIce>()
+    private var localEndQueued=false
+    private var remoteEndSeen=false
     private var startedAt=0L
     private var disconnectedAt=0L
     private var lastStats=0L
@@ -80,7 +86,7 @@ class RtcAudioSession(
         worker.execute {
             try {
                 if(closed.get())return@execute
-                val native=NativePeer(context,callId,servers,pcm,::event,onDigit){ reason -> runCatching { worker.execute { fail(reason) } }; Unit }
+                val native=NativePeer(context,callId,servers,pcm,::event,onDigit,{ reason -> runCatching { worker.execute { fail(reason) } }; Unit },forceRelay)
                 if(closed.get()){native.close();return@execute};peer=native
                 native.mute(desiredMute);native.enableAudio(desiredAudio)
                 if(!gateway){
@@ -95,9 +101,10 @@ class RtcAudioSession(
     private fun poll() {
         if(closed.get())return
         val now=System.nanoTime()
-        if(isConnected && now-lastPoll<2_000_000_000L)return
+        if(isConnected && outgoingIce.isEmpty() && peer?.hasQueuedCandidates!=true && localEndQueued && now-lastPoll<2_000_000_000L)return
         lastPoll=now
         try {
+            flushCandidates()
             val result=refresh()
             val state=result.getJSONObject("state")
             val snapshot=state.getJSONObject("snapshot")
@@ -106,10 +113,17 @@ class RtcAudioSession(
             check(snapshot.getJSONObject("binding").getString("call_id")==callId)
             generation=snapshot.getInt("generation")
             check(generation==1){"unsupported_remote_restart"}
-            val signals=state.getJSONArray("signals")
+            // The durable relay intentionally expires SDP/ICE replay after 15s.
+            // An already connected native peer retains the applied generation;
+            // it only needs fresh authorization, not stale SDP replay. A new or
+            // disconnected peer cannot reconstruct that generation from gaps.
+            if (!state.getBoolean("replay_complete")) {
+                check(descriptionApplied && peer?.isConnected == true) { "remote_replay_expired_before_connection" }
+            }
+            val signals=state.optJSONArray("signals") ?: org.json.JSONArray()
             for(i in 0 until signals.length()){
                 val signal=signals.getJSONObject(i);val sequence=signal.getLong("sequence")
-                if(sequence<=highestSequence)continue
+                if(sequence in consumedSequences)continue
                 check(signal.getString("sender_id")==remoteId && signal.getString("recipient_id")==selfId && signal.getInt("generation")==generation)
                 when(signal.getString("kind")){
                     "offer" -> {
@@ -123,10 +137,18 @@ class RtcAudioSession(
                         check(!gateway && !descriptionApplied)
                         descriptionApplied=true;checkNotNull(peer).remoteAnswer(signal.getString("sdp"));event("answer_applied")
                     }
+                    "candidate" -> {
+                        check(descriptionApplied && !remoteEndSeen)
+                        val ice=signal.getJSONObject("ice")
+                        checkNotNull(peer).remoteCandidate(ice.getString("sdp_mid"),ice.getInt("sdp_mline_index"),ice.getString("candidate"))
+                    }
+                    "end_of_candidates" -> { check(descriptionApplied); remoteEndSeen=true }
                     "close" -> {fail("remote_closed");return}
                     else -> error("unsupported_signal")
                 }
                 highestSequence=sequence
+                consumedSequences.add(sequence)
+                check(consumedSequences.size<=132)
             }
             val connected=peer?.isConnected==true
             isConnected=connected
@@ -152,17 +174,34 @@ class RtcAudioSession(
         lastSuccessfulRead=System.nanoTime()
         return result
     }
-    private fun send(kind:String,sdp:String?=null){
+    private fun flushCandidates(){
+        val native=peer?:return
+        for(candidate in native.takeCandidates())outgoingIce.add(PendingIce(JSONObject()
+            .put("candidate",candidate.sdp).put("sdp_mid",candidate.sdpMid).put("sdp_mline_index",candidate.sdpMLineIndex)))
+        if(native.gatheringComplete && !localEndQueued){localEndQueued=true;outgoingIce.add(PendingIce(null))}
+        repeat(8){
+            val item=outgoingIce.peek()?:return
+            check(System.nanoTime()-item.queuedAt<10_000_000_000L){"candidate_delivery_timeout"}
+            send(if(item.ice==null)"end_of_candidates" else "candidate",ice=item.ice,operationId=item.operationId)
+            outgoingIce.remove()
+        }
+    }
+    private fun send(kind:String,sdp:String?=null,ice:JSONObject?=null,operationId:String=UUID.randomUUID().toString()){
+        val exactRevision=kind in setOf("offer","answer","restart")
         var command=JSONObject().put("version",1).put("call_id",callId).put("leg_id",legId)
-            .put("attempt_id",attemptId).put("operation_id",UUID.randomUUID().toString())
-            .put("generation",generation).put("revision",if(kind=="close")0 else revision).put("kind",kind)
+            .put("attempt_id",attemptId).put("operation_id",operationId)
+            .put("generation",generation).put("revision",if(exactRevision)revision else 0).put("kind",kind)
         if(sdp!=null)command.put("sdp",sdp)
-        for(attempt in 0..2){
+        if(ice!=null)command.put("ice",ice)
+        for(attempt in 0..8){
             try {
                 val response=api.request("POST","/rtc/legs/$legId",command)
-                revision=response.getJSONObject("ack").getLong("revision");event("${kind}_committed");return
+                revision=response.getJSONObject("ack").getLong("revision")
+                if(kind!="candidate")event("${kind}_committed")
+                return
             }catch(failure:MediaApiException){
-                if(failure.status!=409 || attempt==2)throw failure
+                if(failure.status!=409 || !exactRevision || attempt==8)throw failure
+                Thread.sleep(50)
                 refresh();command=JSONObject(command.toString()).put("revision",revision)
             }
         }
@@ -188,6 +227,7 @@ class RtcAudioSession(
         // Fail closed even if the app callback itself throws.
         try{onFailure(reason)}finally{close()}
     }
+    fun awaitShutdown(timeoutMillis:Long):Boolean = worker.awaitTermination(timeoutMillis,TimeUnit.MILLISECONDS)
     override fun close(){
         if(!closed.compareAndSet(false,true))return
         connectionLatch.countDown();peer?.close();peer=null

@@ -16,6 +16,7 @@ android {
     compileSdk = 35
 
     defaultConfig {
+        testInstrumentationRunner = providers.gradleProperty("rtcLabRunner").orElse("androidx.test.runner.AndroidJUnitRunner").get()
         applicationId = "com.callagent.gateway"
         minSdk = 26
         targetSdk = 34

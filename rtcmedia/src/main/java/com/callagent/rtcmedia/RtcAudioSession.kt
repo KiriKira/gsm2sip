@@ -89,9 +89,11 @@ class RtcAudioSession(
                 val native=NativePeer(context,callId,servers,pcm,::event,onDigit,{ reason -> runCatching { worker.execute { fail(reason) } }; Unit },forceRelay)
                 if(closed.get()){native.close();return@execute};peer=native
                 native.mute(desiredMute);native.enableAudio(desiredAudio)
+                event("native_ready elapsed_ms=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-startedAt)}")
                 if(!gateway){
                     refresh()
                     val offer=native.offer()
+                    event("offer_created elapsed_ms=${TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-startedAt)}")
                     send("offer",offer)
                 }
                 if(!closed.get())worker.scheduleWithFixedDelay(::poll,0,250,TimeUnit.MILLISECONDS)

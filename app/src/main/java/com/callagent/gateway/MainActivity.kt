@@ -198,6 +198,7 @@ class MainActivity : AppCompatActivity() {
     /** Registration state as reported by the service, rather than guessed from
      *  the status text.  See GatewayService.broadcastStatus. */
     private var sipRegistered = false
+    private var rtcControlReady = false
     private var inCallOpen = false
     private var inCallOpenTime = 0L
     private var viewBeforeInCall = "dialer"
@@ -319,6 +320,7 @@ class MainActivity : AppCompatActivity() {
                     val state = intent.getStringExtra("state") ?: return
                     val info = intent.getStringExtra("info") ?: ""
                     sipRegistered = intent.getBooleanExtra("registered", sipRegistered)
+                    rtcControlReady = intent.getBooleanExtra("rtc_control_ready",false)
                     serviceCallStart = intent.getLongExtra("call_start", 0L)
                     updateStatus(state, info)
                     refreshBackgroundStatus()
@@ -847,10 +849,12 @@ class MainActivity : AppCompatActivity() {
             backgroundRunning = background?.running == true,
             notificationsEnabled = background?.notificationsEnabled == true,
             batteryExempt = background?.batteryExempt == true,
-            voiceConfigured = !prefs.getString("server", "").isNullOrBlank() &&
-                !prefs.getString("user", "").isNullOrBlank(),
+            voiceConfigured = getSharedPreferences("gateway-voice-transport",MODE_PRIVATE).getBoolean("rtc_control_server",false) || (!prefs.getString("server", "").isNullOrBlank() &&
+                !prefs.getString("user", "").isNullOrBlank()),
             voiceRunning = voiceRunning,
-            sipRegistered = gatewayOnline
+            sipRegistered = sipRegistered,
+            rtcControlReady = rtcControlReady,
+            rtcConfigured = getSharedPreferences("gateway-voice-transport",MODE_PRIVATE).getBoolean("rtc_control_server",false)
         )))
     }
 
@@ -913,6 +917,15 @@ class MainActivity : AppCompatActivity() {
         Thread({
             try {
                 val client = ControlApiClient(this,session.controlBaseUrl)
+                client.capabilities()
+                val transport=getSharedPreferences("gateway-voice-transport",MODE_PRIVATE)
+                if(transport.getBoolean("rtc_control_server",false) && !transport.getBoolean("sip_control_server",true)){
+                    runOnUiThread {
+                        refreshBackgroundStatus()
+                        Toast.makeText(this,"Go/RTC 语音已配置。请运行设备诊断，再确认启动语音。",Toast.LENGTH_LONG).show()
+                    }
+                    return@Thread
+                }
                 val available = client.getSipConfiguration(session.gatewayId).optBoolean("available",false)
                 check(available) { "SIP_NOT_CONFIGURED" }
                 val retryKey = VoiceCredentialStore.beginProvisioning(this,session.gatewayId)
@@ -1890,13 +1903,13 @@ class MainActivity : AppCompatActivity() {
         // — it is also the tap target for a manual retry.
         val online = when (state) {
             "STOPPED", "ERROR", "STARTING" -> false
-            "IDLE" -> sipRegistered
+            "IDLE" -> sipRegistered || rtcControlReady
             else -> true            // any call state means registration held
         }
         val registrationChanged = gatewayOnline != online
         gatewayOnline = online
         if (registrationChanged) refreshSetupChecklist()
-        tvHomeStatusPill.text = if (online) "● SIP 已注册" else "● SIP 未注册"
+        tvHomeStatusPill.text = if(rtcControlReady) "● RTC 已就绪" else if (online) "● SIP 已注册" else "● 语音未就绪"
         tvHomeStatusPill.setTextColor(
             themeColor(
                 if (online) MaterialR.attr.colorOnTertiaryContainer
@@ -3041,6 +3054,14 @@ class MainActivity : AppCompatActivity() {
     // ── Gateway Control ──────────────────────────────────
 
     private fun startGateway(): Boolean {
+        // A paired voice runtime obtains the server's actual control capability
+        // before selecting/bootstraping an engine, off the Activity main thread.
+        if(CredentialStore.load(this)!=null){
+            val started=GatewayService.start(this,"",5061,"","")
+            if(started){running=true;appendLog("User confirmed voice start after device diagnostics")}
+            else Toast.makeText(this,"Android 未能启动语音服务，请查看后台状态。",Toast.LENGTH_LONG).show()
+            return started
+        }
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
         val server = prefs.getString("server", "") ?: ""
         val port = prefs.getInt("port", 5061)

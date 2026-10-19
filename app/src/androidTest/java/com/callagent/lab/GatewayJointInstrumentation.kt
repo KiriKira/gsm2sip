@@ -86,10 +86,13 @@ class GatewayJointInstrumentation:Instrumentation(){
                 proposal.mappings.first().simId to proposal.mappingRevision
             }
             val prefs=targetContext.getSharedPreferences("gateway",0)
-            val server=checkNotNull(prefs.getString("server",null))
-            val username=checkNotNull(prefs.getString("user",null))
-            val password=VoiceCredentialStore.password(targetContext,server,username)
-            check(password.isNotBlank()){"resume_sip_credentials_missing"}
+            api.capabilities()
+            val policy=targetContext.getSharedPreferences("gateway-voice-transport",0)
+            val rtcOnly=policy.getBoolean("rtc_control_server",false) && !policy.getBoolean("sip_control_server",true)
+            val server=if(rtcOnly) "" else checkNotNull(prefs.getString("server",null))
+            val username=if(rtcOnly) "" else checkNotNull(prefs.getString("user",null))
+            val password=if(rtcOnly) "" else VoiceCredentialStore.password(targetContext,server,username)
+            check(rtcOnly || password.isNotBlank()){"resume_voice_credentials_missing"}
             targetContext.getSharedPreferences("gateway",0).edit().putBoolean("use_stun",false).putString("own_number","+15550100299").commit()
             GatewayService.orchestratorFactoryForInstrumentation={service,sip->
                 // The synthetic backend supplies PCM directly and needs no
@@ -133,7 +136,7 @@ class GatewayJointInstrumentation:Instrumentation(){
                         "stop"->break
                         else->error("unknown_op")
                     }
-                    reply.put("status","OK").put("bridge",orch?.bridgeState?.name).put("media",orch?.mediaTransport)
+                    reply.put("status","OK").put("bridge",orch?.bridgeState?.name).put("media",orch?.mediaTransport).put("call_control",orch?.callControlTransport)
                         .put("telecom_state",GsmCallManager.activeCallState).put("pcm",JSONArray(tones.map{it.report()}))
                         .put("dtmf_events",JSONArray(GatewayService.logSnapshot().filter{it.contains("DTMF received and played") || it.contains("DTMF tone stopped")}))
                 }catch(failure:Throwable){reply.put("status","FAIL").put("error",failure.javaClass.simpleName+":"+failure.message)}

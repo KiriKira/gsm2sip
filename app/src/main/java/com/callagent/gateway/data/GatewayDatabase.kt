@@ -181,6 +181,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         createSmsProviderRecoveryTables(db)
         db.execSQL("ALTER TABLE commands ADD COLUMN content_hash TEXT")
         createMeshTables(db)
+        createCallWinnerTable(db)
     }
 
     /** Additional independent control-server nodes and cross-node command aliases (v7). */
@@ -230,10 +231,38 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             db.execSQL("ALTER TABLE commands ADD COLUMN archive_source TEXT NOT NULL DEFAULT 'gsm2sip:server-api:unknown'")
             createSmsArchiveTables(db)
         }
+        if (oldVersion < 8) createCallWinnerTable(db)
         if (oldVersion < 7) {
             db.execSQL("ALTER TABLE commands ADD COLUMN content_hash TEXT")
             createMeshTables(db)
         }
+    }
+
+    private fun createCallWinnerTable(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE rtc_cellular_slot (singleton INTEGER PRIMARY KEY CHECK(singleton=1),call_id TEXT NOT NULL UNIQUE REFERENCES call_ledger(call_id))")
+        db.execSQL("CREATE TABLE rtc_control_terminals (call_id TEXT NOT NULL,node_gateway_id TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'ended',PRIMARY KEY(call_id,node_gateway_id))")
+        db.execSQL("""CREATE TABLE call_winners (
+            call_id TEXT PRIMARY KEY REFERENCES call_ledger(call_id),
+            node_gateway_id TEXT NOT NULL, client_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )""")
+    }
+
+    /** Global to this physical installation. A losing node can never answer
+     * the same GSM call, even after the process restarts. */
+    fun claimCallWinner(callId: String, node: String, clientId: String): Boolean {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val live = db.rawQuery("SELECT 1 FROM call_ledger WHERE call_id=? AND state='dispatching' AND direction='incoming'", arrayOf(callId)).use { it.moveToFirst() }
+            if (!live || !servingGateway(db, node)) return false
+            val inserted = db.insertWithOnConflict("call_winners", null, ContentValues().apply {
+                put("call_id",callId); put("node_gateway_id",node); put("client_id",clientId); put("created_at",System.currentTimeMillis())
+            }, SQLiteDatabase.CONFLICT_IGNORE) != -1L
+            val same = inserted || db.rawQuery("SELECT 1 FROM call_winners WHERE call_id=? AND node_gateway_id=? AND client_id=?", arrayOf(callId,node,clientId)).use { it.moveToFirst() }
+            db.setTransactionSuccessful()
+            return same
+        } finally { db.endTransaction() }
     }
 
     private fun createSmsArchiveTables(db: SQLiteDatabase) {
@@ -1171,15 +1200,54 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
 
     /** Commit call identity and dispatching state atomically before Telecom or
      * SIP work. Existing IDs, including recovered unknown rows, cannot dispatch again. */
-    fun beginCallDispatch(callId: String, simId: String, mappingRevision: Long, direction: String): Boolean {
+    fun beginCallDispatch(callId: String, simId: String, mappingRevision: Long, direction: String): Boolean =
+        beginCallDispatchInternal(callId,simId,mappingRevision,direction,false)
+
+    fun beginRtcCallDispatch(callId: String, simId: String, mappingRevision: Long): Boolean =
+        beginCallDispatchInternal(callId,simId,mappingRevision,"outgoing",true)
+
+    private fun beginCallDispatchInternal(callId: String, simId: String, mappingRevision: Long, direction: String, rtc: Boolean): Boolean {
         require(direction == "incoming" || direction == "outgoing")
-        val now = System.currentTimeMillis()
-        val owner = activeGatewayId()
-        return writableDatabase.insertWithOnConflict("call_ledger", null, ContentValues().apply {
-            put("call_id", callId); put("sim_id", simId); put("mapping_revision", mappingRevision)
-            put("direction", direction); put("state", "dispatching"); put("owner_gateway_id", owner)
-            put("created_at", now); put("updated_at", now)
-        }, SQLiteDatabase.CONFLICT_IGNORE) != -1L
+        val db=writableDatabase;db.beginTransaction()
+        try {
+            if(db.rawQuery("SELECT 1 FROM rtc_cellular_slot",null).use{it.moveToFirst()})return false
+            val now=System.currentTimeMillis()
+            val recorded=db.insertWithOnConflict("call_ledger",null,ContentValues().apply{
+                put("call_id",callId);put("sim_id",simId);put("mapping_revision",mappingRevision)
+                put("direction",direction);put("state","dispatching");put("owner_gateway_id",activeGatewayId())
+                put("created_at",now);put("updated_at",now)
+            },SQLiteDatabase.CONFLICT_IGNORE)!=-1L
+            if(!recorded)return false
+            if(rtc)db.execSQL("INSERT INTO rtc_cellular_slot(singleton,call_id) VALUES(1,?)",arrayOf(callId))
+            db.setTransactionSuccessful();return true
+        }finally{db.endTransaction()}
+    }
+    fun reserveRtcCellularSlot(callId: String): Boolean {
+        val db=writableDatabase
+        db.execSQL("INSERT OR IGNORE INTO rtc_cellular_slot(singleton,call_id) SELECT 1,call_id FROM call_ledger WHERE call_id=? AND state='dispatching'",arrayOf(callId))
+        return db.rawQuery("SELECT 1 FROM rtc_cellular_slot WHERE call_id=?",arrayOf(callId)).use{it.moveToFirst()}
+    }
+    fun releaseRtcCellularSlot(callId: String) {
+        writableDatabase.delete("rtc_cellular_slot","call_id=?",arrayOf(callId))
+    }
+    fun queueRtcTerminal(callId: String,node: String,kind: String = "ended") {
+        require(kind in setOf("ended","answered_elsewhere"))
+        writableDatabase.execSQL("INSERT OR IGNORE INTO rtc_control_terminals(call_id,node_gateway_id,kind) VALUES(?,?,?)",arrayOf(callId,node,kind))
+    }
+    fun rtcTerminals(node: String): List<Pair<String,String>> = readableDatabase.rawQuery("SELECT call_id,kind FROM rtc_control_terminals WHERE node_gateway_id=? LIMIT 32",arrayOf(node)).use{c->buildList{while(c.moveToNext())add(c.getString(0) to c.getString(1))}}
+    /** Real cellular END, occupancy release and per-node delivery are one commit. */
+    fun completeRtcCellular(callId: String,state: String,nodes: Collection<String>) {
+        require(state in setOf("completed","failed","cancelled"))
+        val db=writableDatabase;db.beginTransaction()
+        try {
+            db.execSQL("UPDATE call_ledger SET state=?,updated_at=? WHERE call_id=? AND state IN ('dispatching','unknown')",arrayOf(state,System.currentTimeMillis(),callId))
+            db.delete("rtc_cellular_slot","call_id=?",arrayOf(callId))
+            nodes.forEach{node->db.execSQL("INSERT OR IGNORE INTO rtc_control_terminals(call_id,node_gateway_id,kind) VALUES(?,?,'ended')",arrayOf(callId,node))}
+            db.setTransactionSuccessful()
+        } finally {db.endTransaction()}
+    }
+    fun acknowledgeRtcTerminal(callId: String,node: String) {
+        writableDatabase.delete("rtc_control_terminals","call_id=? AND node_gateway_id=?",arrayOf(callId,node))
     }
 
     fun activeGatewayId(): String? = readableDatabase.rawQuery(
@@ -1774,7 +1842,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         private const val SMS_PER_MINUTE_LIMIT = 5
         private const val SMS_PER_HOUR_LIMIT = 30
         private const val TAG = "GatewayDatabase"
-        private const val VERSION = 7
+        private const val VERSION = 8
         private const val ARCHIVE_COLUMNS = "id,source,owner_id,gateway_id,owner_gateway_id,message_id,sim_id,sim_label," +
             "direction,from_address,to_address,body,created_at,status,observed_at,slot_index,subscription_id,part_count"
         private val ARCHIVE_SNAPSHOT_QUERY = """

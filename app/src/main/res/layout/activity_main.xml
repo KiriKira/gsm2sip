@@ -819,7 +819,7 @@
                             style="?attr/materialButtonOutlinedStyle"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="从服务器配置 SIP 语音"
+                            android:text="从服务器配置语音"
                             android:textAllCaps="false" />
                         <TextView
                             android:layout_width="match_parent"

@@ -1,6 +1,6 @@
 # 双 SIM 远程网关（开发中）
 
-本批是 WebRTC 音频过渡实现，**尚未替换 Asterisk 依赖**：主机在设置里开启后，新通话使用 ICE/DTLS-SRTP/Opus，SIP 仍负责呼叫控制；失败不自动回退或重拨。需同时更新网关与服务端，并配置必要的 TURN 端口。[部署与端口说明](https://github.com/KiriKira/gsm2sip-server/blob/ci/webrtc-sip-debug-20261017/docs/webrtc-audio.md)。双模拟器联合验收已通过，含呼入/呼出双向测试音频、TURN 与三节点备用切换；[结果与已签名 Release](docs/webrtc-joint-validation-20261019.md)。真实蜂窝音频仍需真机验证。
+本分支已接入独立 Go/HTTPS 呼叫控制与原生 WebRTC 音频；服务端可关闭 Asterisk，原 SIP 作为可选兼容路径保留。Host 的开关位于设置页，通话显示实际语音/控制协议；失败不自动回退或重拨。[部署、协议与可配置 TURN 端口](https://github.com/KiriKira/gsm2sip-server/blob/ci/webrtc-sip-debug-20261017/docs/rtc-call-control-v1.md)。正在持续运行的 KVM 模拟器上进行独立控制联合验收；[旧混合模式验收记录](docs/webrtc-joint-validation-20261019.md) 仅对应旧 Release。真实蜂窝音频仍需真机验证。
 
 [自动构建与 Release、固定签名配置](docs/releases.md)：`main` 推送发布预览版，版本标签发布正式版；首次发布前运行签名 Secrets 配置脚本。
 

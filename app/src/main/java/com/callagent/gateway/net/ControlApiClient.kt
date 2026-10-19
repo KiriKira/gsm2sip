@@ -108,9 +108,14 @@ class ControlApiClient(
     /** Public extension list; also the cheapest reachability probe for a node. */
     fun capabilities(): Set<String> {
         val response = request("GET", "/v1/capabilities", authenticated = false)
+        if(sessions===CredentialStore) app.getSharedPreferences("gateway-voice-transport",Context.MODE_PRIVATE).edit()
+            .putBoolean("rtc_control_server",response.optBoolean("rtc_call_control",false))
+            .putBoolean("sip_control_server",response.optBoolean("sip_call_control",true)).apply()
         val array = response.optJSONArray("extensions") ?: JSONArray()
         return (0 until array.length()).mapNotNull { array.optString(it).takeIf(String::isNotBlank) }.toSet()
     }
+
+    fun rtcControlAvailable(): Boolean = request("GET", "/v1/capabilities", authenticated = false).optBoolean("rtc_call_control", false)
 
     fun revoke() {
         synchronized(refreshLock) {
@@ -315,7 +320,7 @@ class ControlApiClient(
     private fun gatewayId(): String = sessionOrThrow().gatewayId
 
     internal fun rtcRequest(method: String, path: String, body: JSONObject?): JSONObject {
-        require(path.matches(Regex("/(devices/self/rtc-capability|rtc/legs/[a-zA-Z0-9_-]+|calls/[a-zA-Z0-9_-]+/media(/active)?)")))
+        require(path.matches(Regex("/(devices/self/rtc-capability|rtc/control/(capability|incoming-policy|calls(/[a-zA-Z0-9_-]+(/operations)?)?|incoming)|rtc/legs/[a-zA-Z0-9_-]+|calls/[a-zA-Z0-9_-]+/media(/active)?)")))
         val expected = sessionOrThrow()
         return try { request(method, "/v1$path", body, expectedGatewayId = expected.gatewayId) }
         catch (failure: ControlApiException) { throw com.callagent.rtcmedia.MediaApiException(failure.httpStatus, failure.code) }

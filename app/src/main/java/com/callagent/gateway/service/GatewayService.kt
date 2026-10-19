@@ -68,6 +68,9 @@ import kotlin.concurrent.thread
 class GatewayService : Service() {
 
     private var sipClient: SipClient? = null
+    private fun rtcOnlyServer(): Boolean = getSharedPreferences("gateway-voice-transport",MODE_PRIVATE).let {
+        it.getBoolean("rtc_control_server",false) && !it.getBoolean("sip_control_server",true)
+    }
     private var orchestrator: CallOrchestrator? = null
     private var voiceWakeLock: PowerManager.WakeLock? = null
     private var voiceWifiLock: WifiManager.WifiLock? = null
@@ -443,7 +446,7 @@ class GatewayService : Service() {
             ACTION_RECONNECT -> {
                 if (!GatewayBackgroundRuntime.allowedRecovery(this)) {
                     broadcastStatus("STOPPED", "Gateway stopped by user")
-                    if (sipClient == null) stopSelf(startId)
+                    if (orchestrator == null && sipClient == null) stopSelf(startId)
                     return START_NOT_STICKY
                 }
                 // Tapping the offline pill should act immediately.  If there is
@@ -565,6 +568,7 @@ class GatewayService : Service() {
         cfgServer = prefs.getString("server", "") ?: ""
         cfgPort = prefs.getInt("port", 5061)
         cfgUser = prefs.getString("user", "") ?: ""
+        if(rtcOnlyServer()){broadcastLog("RTC voice configuration retained");return}
         cfgPass = com.callagent.gateway.data.VoiceCredentialStore.password(this,cfgServer,cfgUser)
         if (cfgServer.isEmpty() || cfgUser.isEmpty() || cfgPass.isEmpty()) {
             initGeneration.incrementAndGet()
@@ -632,7 +636,7 @@ class GatewayService : Service() {
                         if (e.code == "PAIRING_REQUIRED" || e.code == "SESSION_REVOKED") {
                             GatewayBackgroundRuntime.updateConnection(this@GatewayService, "Not paired",
                                 "Pair this device again to resume background sync")
-                            if (sipClient == null) stopSelf()
+                            if (orchestrator == null && sipClient == null) stopSelf()
                             break
                         }
                     } catch (_: Exception) {
@@ -650,7 +654,7 @@ class GatewayService : Service() {
                         // Nodes added, removed or newly provisioned for voice.
                         orchestrator?.let { orch ->
                             if (voiceRuntimeStarted && currentLocalIp.isNotEmpty()) {
-                                meshVoice.reconcile(orch, currentLocalIp, currentPublicIp.ifEmpty { currentLocalIp })
+                                if(!rtcOnlyServer())meshVoice.reconcile(orch, currentLocalIp, currentPublicIp.ifEmpty { currentLocalIp })
                             }
                         }
                     } catch (_: Exception) {
@@ -859,7 +863,7 @@ class GatewayService : Service() {
     private fun startControlGateway(): Boolean {
         if (!GatewayBackgroundRuntime.allowedRecovery(this)) {
             broadcastStatus("STOPPED", "Gateway stopped by user")
-            if (sipClient == null) stopSelf()
+            if (orchestrator == null && sipClient == null) stopSelf()
             return false
         }
         val session = CredentialStore.load(this)
@@ -867,7 +871,7 @@ class GatewayService : Service() {
             GatewayBackgroundRuntime.updateConnection(this, "Not paired",
                 "Pair this device with the control server before background sync can resume")
             broadcastStatus("PAIRING_REQUIRED", "Pair this phone with the control server")
-            if (sipClient == null) stopSelf()
+            if (orchestrator == null && sipClient == null) stopSelf()
             return false
         }
         stopped = false
@@ -888,7 +892,7 @@ class GatewayService : Service() {
             GatewayBackgroundRuntime.recordIssue(this,
                 "Android refused the foreground service start; open the app and retry")
             broadcastStatus("CONTROL_START_FAILED", "Foreground service start failed")
-            if (sipClient == null) {
+            if (orchestrator == null && sipClient == null) {
                 stopSelf()
                 GatewayBackgroundRuntime.markServiceStopped(this)
             }
@@ -1281,6 +1285,7 @@ class GatewayService : Service() {
         val registered = sipClient?.registered == true
         val info = when {
             stopped -> "Stopped"
+            state == CallOrchestrator.BridgeState.IDLE && orchestrator?.rtcControlReady==true -> "RTC control ready"
             state == CallOrchestrator.BridgeState.IDLE && registered -> "SIP registered"
             state == CallOrchestrator.BridgeState.IDLE -> "Connecting"
             else -> state.name
@@ -1298,6 +1303,28 @@ class GatewayService : Service() {
     }
 
     private fun startGateway(intent: Intent?) {
+        val paired=CredentialStore.load(this)
+        if(paired==null || (!stopped && orchestrator!=null)){startGatewayConfigured(intent);return}
+        if(!initializing.compareAndSet(false,true))return
+        val generation=initGeneration.incrementAndGet()
+        initializingSince=System.currentTimeMillis()
+        runCatching{startForegroundMode(callActive=false,status="Checking voice capabilities")}
+        thread(name="gateway-voice-capability"){
+            val result=runCatching{ControlApiClient(this,paired.controlBaseUrl,ioTimeoutMillis=3000).capabilities()}
+            android.os.Handler(android.os.Looper.getMainLooper()).post{
+                if(generation!=initGeneration.get())return@post
+                initializing.set(false)
+                if(result.isSuccess)startGatewayConfigured(intent)
+                else {
+                    broadcastLog("VOICE: server capability unavailable; no voice engine started")
+                    broadcastStatus("ERROR","Voice capability unavailable")
+                    startControlGateway()
+                }
+            }
+        }
+    }
+
+    private fun startGatewayConfigured(intent: Intent?) {
         if (!GatewayBackgroundPolicy.mayRestoreVoice(intent?.action, sipConfigured = true, explicitStartAction = ACTION_START) ||
             !GatewayBackgroundRuntime.allowedRecovery(this)
         ) {
@@ -1317,7 +1344,7 @@ class GatewayService : Service() {
         // + the Activity's autoStartGateway) would both see a null sipClient
         // and each bring up their own client — two sockets on :5060 and two
         // REGISTERs.
-        if (!stopped && (sipClient != null || initializing.get())) {
+        if (!stopped && (orchestrator != null || sipClient != null || initializing.get())) {
             Log.i(TAG, "startGateway: already running, skipping restart")
             // Broadcast current state so the Activity picks up the live status
             val state = orchestrator?.bridgeState ?: CallOrchestrator.BridgeState.IDLE
@@ -1351,13 +1378,14 @@ class GatewayService : Service() {
 
         val prefs = getSharedPreferences("gateway", MODE_PRIVATE)
         val paired = CredentialStore.load(this) != null
-        val server = if (paired) prefs.getString("server", "").orEmpty() else intent?.getStringExtra(EXTRA_SERVER) ?: prefs.getString("server", "").orEmpty()
+        val rtcOnly = rtcOnlyServer()
+        val server = if(rtcOnly) "" else if (paired) prefs.getString("server", "").orEmpty() else intent?.getStringExtra(EXTRA_SERVER) ?: prefs.getString("server", "").orEmpty()
         val port = if (paired) prefs.getInt("port", 5061) else intent?.getIntExtra(EXTRA_PORT, 5061) ?: prefs.getInt("port", 5061)
-        val username = if (paired) prefs.getString("user", "").orEmpty() else intent?.getStringExtra(EXTRA_USER) ?: prefs.getString("user", "").orEmpty()
-        val password = if (paired) com.callagent.gateway.data.VoiceCredentialStore.password(this,server,username)
+        val username = if(rtcOnly) "" else if (paired) prefs.getString("user", "").orEmpty() else intent?.getStringExtra(EXTRA_USER) ?: prefs.getString("user", "").orEmpty()
+        val password = if(rtcOnly) "" else if (paired) com.callagent.gateway.data.VoiceCredentialStore.password(this,server,username)
             else intent?.getStringExtra(EXTRA_PASS) ?: com.callagent.gateway.data.VoiceCredentialStore.password(this,server,username)
 
-        if (server.isEmpty() || username.isEmpty() || password.isEmpty()) {
+        if (!rtcOnly && (server.isEmpty() || username.isEmpty() || password.isEmpty())) {
             voiceRuntimeStarted = false
             refreshVoicePowerLease()
             cfgServer = ""
@@ -1372,7 +1400,7 @@ class GatewayService : Service() {
         }
 
         // Save for restart
-        prefs.edit()
+        if(!rtcOnly) prefs.edit()
             .putString("server", server)
             .putInt("port", port)
             .putString("user", username)
@@ -1402,7 +1430,7 @@ class GatewayService : Service() {
         notifStatusText = "Connecting"
         try {
             startForegroundMode(callActive = false, status = "Connecting")
-            GatewayBackgroundRuntime.markServiceStarted(this, "SIP connecting · HTTPS polling")
+            GatewayBackgroundRuntime.markServiceStarted(this, if(rtcOnly) "RTC connecting · HTTPS polling" else "SIP connecting · HTTPS polling")
         } catch (e: Exception) {
             voiceRuntimeStarted = false
             releaseVoicePowerLeases()
@@ -1467,7 +1495,7 @@ class GatewayService : Service() {
         // SIP server on the same network needs no public address at all —
         // advertising one there would point the server at the far side of a
         // NAT it never has to cross.
-        val useStun = getSharedPreferences("gateway", MODE_PRIVATE)
+        val useStun = !rtcOnlyServer() && getSharedPreferences("gateway", MODE_PRIVATE)
             .getBoolean("use_stun", false)
         val stunResult = if (!useStun) null else try {
             StunClient.discover()
@@ -1498,7 +1526,7 @@ class GatewayService : Service() {
         val useTls = prefs.getBoolean("sip_tls", true)
         broadcastLog("SIP transport: ${if (useTls) "TLS" else "UDP (unencrypted)"} to $cfgServer:$cfgPort")
 
-        val sip = SipClient(
+        val sip = if(rtcOnlyServer()) null else SipClient(
             username = cfgUser,
             password = cfgPass,
             serverDomain = cfgServer,
@@ -1521,8 +1549,8 @@ class GatewayService : Service() {
                 // The call lifecycle only ever reached logcat and the status
                 // pill; the log viewer showed SIP and audio lines with no
                 // record of the call they belonged to.
-                broadcastLog("CALL: media=${orch.mediaTransport} call_control=sip ${state.name}${if (info.isBlank()) "" else " — $info"}")
-                val registered = sip.registered
+                broadcastLog("CALL: media=${orch.mediaTransport} call_control=${orch.callControlTransport} ${state.name}${if (info.isBlank()) "" else " — $info"}")
+                val registered = sip?.registered == true || orch.rtcControlReady
 
                 // Track online time
                 if (registered && onlineSince == 0L) {
@@ -1625,24 +1653,30 @@ class GatewayService : Service() {
         }
         orchestrator = orch
         orch.start()
+        orch.startRtcControl()
         // Register with every mesh node that has a SIP endpoint for this gateway.
-        meshVoice.reconcile(orch, localIp, publicIp)
+        if(sip!=null)meshVoice.reconcile(orch, localIp, publicIp)
 
-        sip.logListener = { msg -> broadcastLog("SIP: $msg") }
+        sip?.logListener = { msg -> broadcastLog("SIP: $msg") }
         // Production SMS commands are claimed only over HTTPS. SIP MESSAGE is migration-only.
-        sip.onSmsRequest = null
+        sip?.onSmsRequest = null
         GsmCallManager.logCallback = { msg -> broadcastLog("AUDIO: $msg") }
         RootShell.statusCallback = { msg -> broadcastLog("ROOT: $msg") }
-        sip.onConnectionLost = { reconnect() }
+        sip?.onConnectionLost = { reconnect() }
 
         // Last check before anything binds a socket: if a newer bring-up has
         // started meanwhile, this client must not exist at all.
-        if (!current() || sipClient !== sip) {
+        if (!current() || orchestrator !== orch) {
             Log.w(TAG, "initSipClient: superseded before start (gen $gen) — discarding")
             orch.stop()
             return
         }
 
+        if(sip==null){
+            broadcastLog("VOICE: Go/RTC control started; SIP engine disabled by server capability")
+            broadcastStatus("IDLE","Connecting RTC control")
+            return
+        }
         try {
             sip.start()
             broadcastLog("[v${BuildConfig.VERSION_NAME}] SIP client started, registering with $cfgServer:$cfgPort")
@@ -1993,6 +2027,7 @@ class GatewayService : Service() {
             // change carrying any other text — "GSM call ended", for one —
             // read as offline while the registration was perfectly alive.
             putExtra("registered", sipClient?.registered == true)
+            putExtra("rtc_control_ready",orchestrator?.rtcControlReady==true)
             putExtra("online_since", onlineSince)
             // When the bridge came up, so the UI can show elapsed time rather
             // than time-since-it-noticed.  It only learns of a call when a
@@ -2075,7 +2110,7 @@ class GatewayService : Service() {
     companion object {
         /** In-process instrumentation dependency injection; no IPC/config switch
          * exposes synthetic cellular hardware to an installed application. */
-        internal var orchestratorFactoryForInstrumentation: ((GatewayService, SipClient) -> CallOrchestrator)? = null
+        internal var orchestratorFactoryForInstrumentation: ((GatewayService, SipClient?) -> CallOrchestrator)? = null
         private const val TAG = "GatewayService"
         private const val LOG_BUFFER_SIZE = 200
         /** Ring buffer of recent log messages — survives activity pause/resume. */

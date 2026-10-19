@@ -32,6 +32,7 @@ class RtcAudioSession(
     private val onLog: (String) -> Unit = {},
     private val forceRelay: Boolean = false
 ) : AutoCloseable {
+    private val callControl = admission.optString("call_control", "sip")
     private val binding = admission.getJSONObject("binding")
     val callId: String = binding.getString("call_id")
     val legId: String = binding.getString("leg_id")
@@ -222,7 +223,7 @@ class RtcAudioSession(
         }
     }
     private fun event(event:String){
-        val line="media=webrtc call_control=sip call_id=$callId leg_id=$legId role=${if(gateway)"gateway" else "host"} event=$event"
+        val line="media=webrtc call_control=$callControl call_id=$callId leg_id=$legId role=${if(gateway)"gateway" else "host"} event=$event"
         Log.i("GsmRtc",line);onLog(line)
     }
     private fun fail(reason:String){

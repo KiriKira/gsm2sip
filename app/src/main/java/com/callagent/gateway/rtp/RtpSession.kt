@@ -174,6 +174,14 @@ class RtpSession(
     // no usable frames. Remaining digital sources are tried first; acoustic
     // inputs only appear when the local profile explicitly allows them.
     private val silentSourceIds = mutableSetOf<Int>()
+    // Set once every permitted source has been judged silent.  Digital
+    // capture cannot tell a dead source from a quiet line: on an incoming
+    // call nobody has to speak in the first seconds after answer (there is
+    // no ringback, unlike an outgoing call), so every source "fails" and the
+    // call used to be torn down about five seconds in.  Once the list is
+    // exhausted the preferred source is reopened and kept; silence from then
+    // on is dead air, never a reason to end the call.
+    @Volatile private var holdCaptureSource = false
     @Volatile private var currentSourceId: Int = -1
     @Volatile private var currentSourceIsDigital: Boolean = false
     private data class SourceConfig(
@@ -601,7 +609,16 @@ class RtpSession(
             if (!running.get()) return
 
             // Build source list, filtering out sources that produced silence
-            val configs = buildCaptureConfigs(wideband)
+            var configs = buildCaptureConfigs(wideband)
+            if (configs.isEmpty() && silentSourceIds.isNotEmpty() && !holdCaptureSource) {
+                val msg = "Every capture source was silent (${silentSourceIds.size}); the line may just be " +
+                    "quiet — keeping the preferred source instead of ending the call"
+                Log.w(TAG, msg)
+                listener?.onRtpStats(msg)
+                holdCaptureSource = true
+                silentSourceIds.clear()
+                configs = buildCaptureConfigs(wideband)
+            }
             if (configs.isEmpty()) {
                 Log.e(TAG, "All capture sources produced silence — no working source found")
                 break
@@ -983,7 +1000,7 @@ class RtpSession(
                 // to stall does so from the start.  A proven source is still
                 // eligible -- "proven" only means it produced sound, which is
                 // exactly the state this failure hides behind.
-                if (!rateChecked) {
+                if (!rateChecked && !holdCaptureSource) {
                     val elapsed = System.currentTimeMillis() - captureStartMs
                     if (elapsed >= RATE_CHECK_AFTER_MS) {
                         rateChecked = true
@@ -1025,7 +1042,7 @@ class RtpSession(
                             Log.w(TAG, "Source $audioSourceName low audio (no-echo): rawCapRMS=$rawCaptureRms silence=${silenceFrameCount}/${SILENCE_FRAME_LIMIT} frames")
                         }
                         if (silenceFrameCount >= SILENCE_FRAME_LIMIT) {
-                            if (sourceProven) {
+                            if (sourceProven || holdCaptureSource) {
                                 // Dead air, not a dead source.  Tearing the
                                 // AudioRecord down here and blacklisting the
                                 // source was catastrophic mid-call: with

@@ -1,5 +1,7 @@
 # 双 SIM 远程网关（开发中）
 
+2026-10-19 更新：WebRTC 熄屏保活已修复，三端按本批一起更新；同版本备用切换与实际通话已验证。[本批验收与 Debug 下载](docs/webrtc-screenoff-validation-20261019.md)。
+
 本分支已接入独立 Go/HTTPS 呼叫控制与原生 WebRTC 音频；服务端可关闭 Asterisk，原 SIP 作为可选兼容路径保留。Host 的开关位于设置页，通话显示实际语音/控制协议；失败不自动回退或重拨。[部署、协议与可配置 TURN 端口](https://github.com/KiriKira/gsm2sip-server/blob/ci/webrtc-sip-debug-20261017/docs/rtc-call-control-v1.md)。独立 Go/RTC 联合验收已通过并发布原签名 Debug；[独立控制验收与下载](docs/webrtc-independent-validation-20261019.md)。[旧混合模式记录](docs/webrtc-joint-validation-20261019.md) 保留为历史。真实蜂窝音频仍需真机验证。
 
 [自动构建与 Release、固定签名配置](docs/releases.md)：`main` 推送发布预览版，版本标签发布正式版；首次发布前运行签名 Secrets 配置脚本。

@@ -116,6 +116,7 @@ class ControlApiClient(
     }
 
     fun rtcControlAvailable(): Boolean = request("GET", "/v1/capabilities", authenticated = false).optBoolean("rtc_call_control", false)
+    fun sipControlAvailable(): Boolean = request("GET", "/v1/capabilities", authenticated = false).optBoolean("sip_call_control", true)
 
     fun revoke() {
         synchronized(refreshLock) {

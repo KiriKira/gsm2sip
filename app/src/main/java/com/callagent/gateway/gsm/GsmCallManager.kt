@@ -87,6 +87,20 @@ object GsmCallManager {
      *  app log viewer (Settings tab).  Set by GatewayService. */
     @Volatile var logCallback: ((String) -> Unit)? = null
 
+    private fun stateName(state: Int) = when (state) {
+        Call.STATE_NEW -> "NEW"
+        Call.STATE_DIALING -> "DIALING"
+        Call.STATE_RINGING -> "RINGING"
+        Call.STATE_HOLDING -> "HOLDING"
+        Call.STATE_ACTIVE -> "ACTIVE"
+        Call.STATE_DISCONNECTED -> "DISCONNECTED"
+        Call.STATE_CONNECTING -> "CONNECTING"
+        Call.STATE_DISCONNECTING -> "DISCONNECTING"
+        Call.STATE_SELECT_PHONE_ACCOUNT -> "SELECT_PHONE_ACCOUNT"
+        Call.STATE_PULLING_CALL -> "PULLING_CALL"
+        else -> "OTHER($state)"
+    }
+
     /** Log to both Android logcat AND the app log viewer. */
     private fun appLog(msg: String) {
         Log.i(TAG, msg)
@@ -125,7 +139,9 @@ object GsmCallManager {
         val number = call.details?.handle?.schemeSpecificPart ?: "unknown"
 
         if (!isPrimary) {
-            Log.i(TAG, "Additional Telecom call observed while primary call is active")
+            // In the app log: a second call during a dial is exactly what a
+            // "busy" outgoing call needs ruled in or out.
+            appLog("GSM: additional Telecom call observed while primary call is active (state=${stateName(call.state)})")
             if (call.state == Call.STATE_RINGING) notifyIncomingCallOnce(call, number)
             return
         }
@@ -145,7 +161,7 @@ object GsmCallManager {
                 notifyIncomingCallOnce(call, number)
             }
             Call.STATE_DIALING, Call.STATE_CONNECTING -> {
-                Log.i(TAG, "Outgoing GSM call dialing")
+                appLog("GSM: outgoing call added (state=${stateName(call.state)})")
             }
             Call.STATE_ACTIVE -> {
                 Log.i(TAG, "GSM call active")
@@ -215,6 +231,7 @@ object GsmCallManager {
             activeCall === call
         }
 
+        if (state != Call.STATE_DISCONNECTED) appLog("GSM: state ${stateName(state)} (primary=$isPrimary)")
         when (state) {
             Call.STATE_RINGING -> {
                 // Handle calls that arrive as STATE_NEW in onCallAdded and
@@ -242,7 +259,8 @@ object GsmCallManager {
                         null
                     }
                 }
-                Log.i(TAG, "GSM call disconnected (primary=$isPrimary, cause=${if (isPrimary) lastDisconnectCause?.code else "n/a"})")
+                val cause = if (isPrimary) lastDisconnectCause else runCatching { call.details?.disconnectCause }.getOrNull()
+                appLog("GSM: call disconnected (primary=$isPrimary, cause=${cause?.code}, reason=${cause?.reason}, label=${cause?.label})")
                 if (isPrimary) {
                     notifyCallEnded(call)
                     synchronized(callLock) {

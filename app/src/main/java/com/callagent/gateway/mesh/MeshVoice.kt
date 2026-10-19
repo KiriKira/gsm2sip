@@ -109,12 +109,6 @@ object MeshVoiceStore {
 /** Last reported SIP registration per node, for the settings list (not a secret). */
 object MeshVoiceStatus {
     private const val PREFS = "mesh-voice-status"
-    // Start unknown in every process/service generation. Primary RTC-only
-    // capability says nothing about an independently configured backup node.
-    private val sipSupport = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
-    fun recordSipSupport(nodeGatewayId: String, enabled: Boolean) { sipSupport[nodeGatewayId.lowercase()] = enabled }
-    fun supportsSip(nodeGatewayId: String): Boolean = sipSupport[nodeGatewayId.lowercase()] == true
-    fun clearSipSupport() = sipSupport.clear()
 
     fun record(context: Context, nodeGatewayId: String, registered: Boolean) {
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
@@ -130,9 +124,6 @@ object MeshVoiceStatus {
 object MeshVoiceProvisioning {
     /** Returns true when the node has a usable SIP account afterwards. Blocking. */
     fun ensure(context: Context, node: GatewayDatabase.MeshNode, client: ControlApiClient): Boolean {
-        val supported = client.sipControlAvailable()
-        MeshVoiceStatus.recordSipSupport(node.gatewayId, supported)
-        if (!supported) return false
         if (MeshVoiceStore.account(context, node.gatewayId) != null) return true
         val available = client.getSipConfiguration(node.gatewayId).optBoolean("available", false)
         if (!available) return false
@@ -162,8 +153,7 @@ class MeshVoiceClients(private val context: Context, private val log: (String) -
     @Synchronized
     fun reconcile(orchestrator: CallOrchestrator, localIp: String, publicIp: String) {
         val database = GatewayDatabase.get(context)
-        val wanted = database.meshNodes().filter { MeshVoiceStatus.supportsSip(it.gatewayId) }
-            .mapNotNull { node -> MeshVoiceStore.account(context, node.gatewayId) }
+        val wanted = database.meshNodes().mapNotNull { node -> MeshVoiceStore.account(context, node.gatewayId) }
             .associateBy { it.nodeGatewayId }
         (clients.keys - wanted.keys).toList().forEach { nodeId -> stop(orchestrator, nodeId) }
         wanted.values.forEach { account ->
@@ -202,7 +192,6 @@ class MeshVoiceClients(private val context: Context, private val log: (String) -
 
     @Synchronized
     fun stopAll(orchestrator: CallOrchestrator?) {
-        MeshVoiceStatus.clearSipSupport()
         clients.keys.toList().forEach { stop(orchestrator, it) }
     }
 

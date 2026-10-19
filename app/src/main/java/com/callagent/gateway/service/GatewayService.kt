@@ -654,7 +654,7 @@ class GatewayService : Service() {
                         // Nodes added, removed or newly provisioned for voice.
                         orchestrator?.let { orch ->
                             if (voiceRuntimeStarted && currentLocalIp.isNotEmpty()) {
-                                meshVoice.reconcile(orch, currentLocalIp, currentPublicIp.ifEmpty { currentLocalIp })
+                                if(!rtcOnlyServer())meshVoice.reconcile(orch, currentLocalIp, currentPublicIp.ifEmpty { currentLocalIp })
                             }
                         }
                     } catch (_: Exception) {
@@ -1049,7 +1049,7 @@ class GatewayService : Service() {
     private fun meshHeartbeatInputs(): MeshHeartbeatInputs {
         val (percent, charging) = batteryState()
         return MeshHeartbeatInputs(RootShell.rootState() == "ok", percent, charging, ::serviceStateFor,
-            voiceConfigured = voiceRuntimeStarted,
+            voiceConfigured = voiceRuntimeStarted && cfgPass.isNotEmpty(),
             sipRegisteredFor = { node -> meshVoice.registered(node) })
     }
 
@@ -1655,7 +1655,7 @@ class GatewayService : Service() {
         orch.start()
         orch.startRtcControl()
         // Register with every mesh node that has a SIP endpoint for this gateway.
-        meshVoice.reconcile(orch, localIp, publicIp)
+        if(sip!=null)meshVoice.reconcile(orch, localIp, publicIp)
 
         sip?.logListener = { msg -> broadcastLog("SIP: $msg") }
         // Production SMS commands are claimed only over HTTPS. SIP MESSAGE is migration-only.

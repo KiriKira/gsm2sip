@@ -1130,8 +1130,13 @@ class RtpSession(
                         shouldForward = false
                         echoGatedFrames++
                     }
-                } else if (rawCaptureRms < noiseGateThreshold) {
+                } else if (externalPcm == null && rawCaptureRms < noiseGateThreshold) {
                     // Noise gate: only modem digital noise, no caller speech.
+                    // Not on WebRTC: the listener there is a person, and a
+                    // per-frame hard gate zeroes every quiet 20 ms of speech
+                    // (syllable tails, soft consonants) -- on the generic
+                    // profile's 300 threshold nearly half the frames of a
+                    // normal call, heard as a constant fast stutter.
                     shouldForward = false
                     noiseGatedFrames++
                 } else {

@@ -228,7 +228,7 @@ internal class NativePeer(
             val local = report.statsMap[pair?.members?.get("localCandidateId") as? String]
             val remote = report.statsMap[pair?.members?.get("remoteCandidateId") as? String]
             val selected = "${local?.members?.get("candidateType")}/${remote?.members?.get("candidateType")}"
-            onEvent("stats selected_pair=$selected tx_packets=$tx rx_packets=$rx candidate_types=${types.joinToString(",")} pcm_capture=${pcm?.captureFrames?.get()?:0} pcm_decoded=${pcm?.decodedFrames?.get()?:0}")
+            onEvent("stats selected_pair=$selected tx_packets=$tx rx_packets=$rx candidate_types=${types.joinToString(",")} pcm_capture=${pcm?.captureFrames?.get()?:0} pcm_decoded=${pcm?.decodedFrames?.get()?:0} pcm_underruns=${pcm?.underruns?.get()?:0} pcm_overruns=${pcm?.overruns?.get()?:0}")
         }
     }
     override fun close(){

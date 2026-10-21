@@ -38,6 +38,7 @@ class GatewayUiGroup4Instrumentation : Instrumentation() {
     private val targetRows = JSONArray()
     private val passed = mutableListOf<Boolean>()
     private var automation: android.app.UiAutomation? = null
+    private lateinit var report: JSONObject
 
     override fun onCreate(arguments: Bundle?) {
         super.onCreate(arguments)
@@ -57,7 +58,7 @@ class GatewayUiGroup4Instrumentation : Instrumentation() {
         var initialDeviceName = ""
         var initialPairingCode = ""
         var activityWasModified = false
-        val report = JSONObject()
+        report = JSONObject()
             .put("scope", "group4_unpaired_ui_state_layout_and_dark_screenshots")
             .put("status", "FAIL")
             .put("checks", checks)

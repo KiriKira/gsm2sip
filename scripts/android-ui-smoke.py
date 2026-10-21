@@ -1492,10 +1492,13 @@ class Smoke:
         unfold_text = str(unfold.stdout) + unfold.stderr.decode("utf-8", errors="replace")
         self.wait(6)
         unfolded = self.device_snapshot("group4_preflight_unfolded")
-        open_state = bool(re.search(r"\bname\s*=\s*['\"]?OPENED\b", unfolded["state"], re.IGNORECASE))
+        committed_lines = [line for line in unfolded["state"].split(" | ")
+                           if re.search(r"\bmCommittedState\s*=", line, re.IGNORECASE)]
+        committed_state = committed_lines[0] if committed_lines else ""
+        open_state = bool(re.search(r"\bname\s*=\s*['\"]?OPENED\b", committed_state, re.IGNORECASE))
         preflight_ok = unfold.returncode == 0 and open_state
         detail = (f"unfold exit={unfold.returncode}; output={unfold_text.strip()!r}; "
-                  f"wm size={unfolded['size']!r}; committed state={unfolded['state']!r}")
+                  f"wm size={unfolded['size']!r}; committed state={committed_state!r}")
         self.record("group4_unfold_preflight", "pass" if preflight_ok else "fail", detail)
         if not preflight_ok:
             self.record("group4_supplement", "fail",

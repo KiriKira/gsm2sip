@@ -31,11 +31,7 @@ data class MeshHeartbeatInputs(
     val root: Boolean,
     val batteryPercent: Int?,
     val charging: Boolean,
-    val serviceStateFor: (subscriptionId: Int) -> String,
-    /** Voice is set up on the primary, so each node gets its own SIP endpoint too. */
-    val voiceConfigured: Boolean = false,
-    /** Whether this gateway's SIP client for a node is registered right now. */
-    val sipRegisteredFor: (nodeGatewayId: String) -> Boolean = { false }
+    val serviceStateFor: (subscriptionId: Int) -> String
 )
 
 /**
@@ -78,13 +74,6 @@ class MeshCoordinator(
         val client = ControlApiClient(app, node.controlBaseUrl, vault)
         val snapshot = SimRegistry.snapshot(app)
         ensureBindings(node, client, snapshot)
-        if (inputs.voiceConfigured) {
-            try {
-                MeshVoiceProvisioning.ensure(app, node, client)
-            } catch (e: ControlApiException) {
-                log("MESH: ${hostOf(node.controlBaseUrl)} voice ${e.code}")
-            }
-        }
         heartbeat(node, client, snapshot, inputs)
         database.emitAliasEvents(node.gatewayId)
         val events = database.pendingMeshEvents(node.gatewayId)
@@ -153,9 +142,8 @@ class MeshCoordinator(
                 radio = radio)
         }
         val installId = if (accepts(MESH_EXTENSION)) database.installId() else null
-        MeshVoiceStatus.record(app, node.gatewayId, inputs.sipRegisteredFor(node.gatewayId))
         val prepared = database.prepareHeartbeatPayload(node.gatewayId) { sequence ->
-            client.heartbeatBody(sequence, inputs.root, sipRegistered = inputs.sipRegisteredFor(node.gatewayId),
+            client.heartbeatBody(sequence, inputs.root,
                 batteryPercent = inputs.batteryPercent,
                 charging = inputs.charging, sims = sims, installId = installId).toString()
         }
@@ -216,6 +204,5 @@ object MeshPairing {
         if (node != null) runCatching { ControlApiClient(app, node.controlBaseUrl, vault).revoke() }
         database.removeMeshNode(gatewayId)
         vault.clear(app)
-        runCatching { MeshVoiceStore.clear(app, gatewayId) }
     }
 }

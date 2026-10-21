@@ -1,5 +1,7 @@
 # Local SIM registry contract
 
+> **0.4.0 起**：网关已改名 Homura，SIP/RTP/SRTP/STUN 代码全部移除，通话只走服务器 HTTPS 呼叫控制与 WebRTC。本文中有关 SIP、Asterisk、ARI 的内容是历史记录。
+
 The gateway keeps server-assigned `sim_id` UUIDs separate from Android's
 `subscriptionId`, SIM slot, and Telecom account. The server owns the wire
 `mapping_revision`; Android identifiers are local lookup values and are never
@@ -58,6 +60,6 @@ calls use `TelecomManager.placeCall` with `EXTRA_PHONE_ACCOUNT_HANDLE` and never
 the default account. See [Magisk runtime](magisk-runtime.md).
 
 The gateway's call dispatch ledger persists `(call_id, sim_id, mapping_revision,
-direction)` before either SIP-to-GSM or GSM-to-SIP dispatch. Existing call IDs
+direction)` before either host-to-GSM or GSM-to-host dispatch. Existing call IDs
 are refused; interrupted `dispatching` entries recover to `unknown` and are not
 automatically replayed.

@@ -4,7 +4,6 @@ import android.Manifest
 import android.os.Looper
 import android.telecom.Call
 import com.callagent.gateway.sim.SimRegistry
-import com.callagent.gateway.sip.SipClient
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -57,7 +56,7 @@ class InboundResolutionTest {
         val started = CountDownLatch(1)
         val invocations = AtomicInteger()
         val errors = mutableListOf<String>()
-        val orchestrator = CallOrchestrator(context, SipClient("test", "unused", "invalid.example")) { _, _ ->
+        val orchestrator = CallOrchestrator(context) { _, _ ->
             invocations.incrementAndGet()
             started.countDown()
             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)

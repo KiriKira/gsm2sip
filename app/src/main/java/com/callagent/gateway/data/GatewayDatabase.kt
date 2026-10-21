@@ -1199,7 +1199,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
     }
 
     /** Commit call identity and dispatching state atomically before Telecom or
-     * SIP work. Existing IDs, including recovered unknown rows, cannot dispatch again. */
+     * call control work. Existing IDs, including recovered unknown rows, cannot dispatch again. */
     fun beginCallDispatch(callId: String, simId: String, mappingRevision: Long, direction: String): Boolean =
         beginCallDispatchInternal(callId,simId,mappingRevision,direction,false)
 

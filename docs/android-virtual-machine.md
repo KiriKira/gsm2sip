@@ -1,5 +1,7 @@
 # Android 虚拟机：GitHub Actions + KVM 使用说明
 
+> **0.4.0 起**：网关已改名 Homura，SIP/RTP/SRTP/STUN 代码全部移除，通话只走服务器 HTTPS 呼叫控制与 WebRTC。本文中有关 SIP、Asterisk、ARI 的内容是历史记录。
+
 更新：2026-10-07。本文记录本项目实际运行成功的方案，以及重新启动、获取结果和停止任务的方法。
 
 ## 最终采用的方案

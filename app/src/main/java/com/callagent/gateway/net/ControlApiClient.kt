@@ -18,7 +18,7 @@ import java.time.Instant
 import java.time.format.DateTimeFormatter
 import java.util.UUID
 
-data class PairResult(val gatewayId: String, val role: String, val sipAvailable: Boolean, val sipReason: String)
+data class PairResult(val gatewayId: String, val role: String)
 data class ServerMapping(val simId: String, val slotIndex: Int, val state: String, val mappingRevision: Long)
 data class MappingProposal(val operationId: String, val mappingRevision: Long, val mappings: List<ServerMapping>)
 data class ServerCommand(
@@ -73,7 +73,6 @@ class ControlApiClient(
         if (id.isBlank()) throw ControlApiException("INVALID_RESPONSE", "服务器未返回设备 ID")
         val priorSession = CredentialStore.load(app)
         val identityChanged = priorSession?.gatewayId != id || priorSession?.controlBaseUrl != base
-        if (identityChanged) com.callagent.gateway.data.VoiceCredentialStore.clear(app)
         CredentialStore.save(app, CredentialStore.Session(
             id, base, response.getString("access_token"), response.getString("access_expires_at"),
             response.getString("refresh_token"), response.getString("refresh_expires_at")
@@ -82,10 +81,7 @@ class ControlApiClient(
             GatewayDatabase.get(app).adoptGatewayId(id)
         } ?: throw ControlApiException("SESSION_CHANGED","配对身份已变化")
         if (changedOwner || identityChanged) SimRegistry.resetForGatewayChange(app,id,base)
-        if (identityChanged) com.callagent.gateway.data.VoiceCredentialStore.invalidatePreviousIdentity(app,id)
-        val sip = response.optJSONObject("sip")
-        return PairResult(id, role, sip?.optBoolean("available", false) ?: false,
-            sip?.optString("reason").orEmpty())
+        return PairResult(id, role)
     }
 
     /**
@@ -108,9 +104,6 @@ class ControlApiClient(
     /** Public extension list; also the cheapest reachability probe for a node. */
     fun capabilities(): Set<String> {
         val response = request("GET", "/v1/capabilities", authenticated = false)
-        if(sessions===CredentialStore) app.getSharedPreferences("gateway-voice-transport",Context.MODE_PRIVATE).edit()
-            .putBoolean("rtc_control_server",response.optBoolean("rtc_call_control",false))
-            .putBoolean("sip_control_server",response.optBoolean("sip_call_control",true)).apply()
         val array = response.optJSONArray("extensions") ?: JSONArray()
         return (0 until array.length()).mapNotNull { array.optString(it).takeIf(String::isNotBlank) }.toSet()
     }
@@ -124,40 +117,6 @@ class ControlApiClient(
                 authenticated = false, allowRefresh = false)
             sessions.clearIfCurrent(app, session)
         }
-    }
-
-    /** Return non-secret SIP transport details for the paired gateway. The
-     * returned JSON must not be logged because the rotate response also uses
-     * this type and includes the one-time password. */
-    fun getSipConfiguration(expectedGatewayId: String? = null): JSONObject = sipCredentialRequest(
-        "GET", "/v1/devices/self/sip-config", body = null, expectedGatewayId = expectedGatewayId
-    )
-
-    /** Provision or recover the same encrypted bootstrap response for this
-     * persisted key. The caller owns durable storage of the key and result. */
-    fun rotateSipCredentials(idempotencyKey: String, expectedGatewayId: String? = null): JSONObject {
-        if (!validIdempotencyKey(idempotencyKey)) {
-            throw ControlApiException("IDEMPOTENCY_KEY_INVALID", "SIP credential retry key is invalid")
-        }
-        return sipCredentialRequest("POST", "/v1/devices/self/sip-credentials/rotate",
-            body = JSONObject(), idempotencyKey = idempotencyKey, expectedGatewayId = expectedGatewayId)
-    }
-
-    private fun sipCredentialRequest(
-        method: String,
-        path: String,
-        body: JSONObject?,
-        idempotencyKey: String = UUID.randomUUID().toString(),
-        expectedGatewayId: String? = null
-    ): JSONObject {
-        val expected = sessionOrThrow()
-        if (expectedGatewayId != null && expected.gatewayId != expectedGatewayId) throw ControlApiException("SESSION_CHANGED","Control identity changed before SIP provisioning")
-        val response = request(method, path, body, idempotencyKey = idempotencyKey, expectedGatewayId = expected.gatewayId)
-        val current = sessionOrThrow()
-        if (current.gatewayId != expected.gatewayId || current.controlBaseUrl != expected.controlBaseUrl) {
-            throw ControlApiException("SESSION_CHANGED", "Control identity changed during SIP provisioning")
-        }
-        return response
     }
 
     fun proposeSimBindings(operationId: String, mappings: JSONArray): MappingProposal {
@@ -175,7 +134,7 @@ class ControlApiClient(
         return parseMappings(response.optJSONArray("mappings"))
     }
 
-    fun heartbeatBody(sequence: Long, root: Boolean, sipRegistered: Boolean, batteryPercent: Int?,
+    fun heartbeatBody(sequence: Long, root: Boolean, batteryPercent: Int?,
                       charging: Boolean, sims: List<HeartbeatSim>, installId: String? = null): JSONObject {
         val simArray = JSONArray()
         sims.forEach { sim ->
@@ -187,7 +146,7 @@ class ControlApiClient(
         }
         val body = JSONObject().put("sequence", sequence).put("protocol_version", 1)
             .put("app_version", BuildConfig.VERSION_NAME).put("root", root)
-            .put("sip_registered", sipRegistered).put("charging", charging)
+            .put("charging", charging)
             .put("sim_states", simArray)
         if (batteryPercent != null) body.put("battery_percent", batteryPercent)
         if (installId != null) body.put("install_id", installId)
@@ -201,12 +160,6 @@ class ControlApiClient(
         if (revision < 1) throw ControlApiException("INVALID_HEARTBEAT_RESPONSE", "服务器未返回有效 SIM revision")
         val invalidated = response.optJSONArray("invalidated_sim_ids") ?: JSONArray()
         val extensions = response.optJSONArray("extensions") ?: JSONArray()
-        if (body.optBoolean("sip_registered", false)) runCatching {
-            val capabilities = request("GET", "/v1/capabilities", authenticated = false)
-            if (capabilities.optBoolean("rtc_audio", false) && com.callagent.rtcmedia.RtcAudioSession.isAvailable(app)) {
-                rtcRequest("POST", "/devices/self/rtc-capability", JSONObject().put("version", 1))
-            }
-        }.onFailure { android.util.Log.w("GsmRtc", "role=gateway event=capability_registration_failed") }
         return HeartbeatResult(revision, (0 until invalidated.length()).map { invalidated.getString(it) },
             (0 until extensions.length()).mapNotNull { extensions.optString(it).takeIf(String::isNotBlank) }.toSet())
     }
@@ -320,7 +273,7 @@ class ControlApiClient(
     private fun gatewayId(): String = sessionOrThrow().gatewayId
 
     internal fun rtcRequest(method: String, path: String, body: JSONObject?): JSONObject {
-        require(path.matches(Regex("/(devices/self/rtc-capability|rtc/control/(capability|incoming-policy|calls(/[a-zA-Z0-9_-]+(/operations)?)?|incoming)|rtc/legs/[a-zA-Z0-9_-]+|calls/[a-zA-Z0-9_-]+/media(/active)?)")))
+        require(path.matches(Regex("/(devices/self/rtc-capability|rtc/control/(capability|calls(/[a-zA-Z0-9_-]+(/operations)?)?|incoming)|rtc/legs/[a-zA-Z0-9_-]+|calls/[a-zA-Z0-9_-]+/media(/active)?)")))
         val expected = sessionOrThrow()
         return try { request(method, "/v1$path", body, expectedGatewayId = expected.gatewayId) }
         catch (failure: ControlApiException) { throw com.callagent.rtcmedia.MediaApiException(failure.httpStatus, failure.code) }

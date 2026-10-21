@@ -2,15 +2,12 @@ package com.callagent.gateway.ui
 
 import android.app.Activity
 import android.text.InputType
-import android.view.Gravity
 import android.widget.LinearLayout
-import android.widget.TextView
 import android.widget.Toast
+import com.callagent.gateway.R
 import com.callagent.gateway.data.GatewayDatabase
 import com.callagent.gateway.mesh.JoinEntry
 import com.callagent.gateway.mesh.MeshPairing
-import com.callagent.gateway.mesh.MeshVoiceStatus
-import com.callagent.gateway.mesh.MeshVoiceStore
 import com.callagent.gateway.net.ControlApiException
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -28,51 +25,32 @@ import java.util.Locale
 class MeshNodesSection(
     private val activity: Activity,
     private val container: LinearLayout,
-    addButton: MaterialButton,
     private val deviceName: () -> String,
     private val onChanged: () -> Unit
 ) {
-    init {
-        addButton.setOnClickListener { showAddDialog() }
-    }
-
     fun render() {
         val nodes = runCatching { GatewayDatabase.get(activity).meshNodes() }.getOrDefault(emptyList())
         container.removeAllViews()
-        if (nodes.isEmpty()) {
-            container.addView(text("尚未添加其他节点。", secondary = true))
-            return
-        }
         val time = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
-        nodes.forEach { node ->
-            val row = LinearLayout(activity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                minimumHeight = dp(56)
-            }
-            val column = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
-            column.addView(text(node.label, secondary = false))
+        val count = nodes.size + 1
+        nodes.forEachIndexed { index, node ->
             val sync = when {
                 node.lastError.isNotEmpty() -> "同步失败（${node.lastError}）"
                 node.lastSyncAt != null -> "已同步 · ${time.format(Date(node.lastSyncAt))}"
                 else -> "等待首次同步"
             }
-            val voice = when {
-                MeshVoiceStatus.registered(activity, node.gatewayId) -> "通话已注册"
-                MeshVoiceStore.account(activity, node.gatewayId) != null -> "通话已开通，未注册"
-                else -> "仅短信"
-            }
-            val status = "$sync · $voice"
-            column.addView(text(status, secondary = true))
-            row.addView(column, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            row.addView(MaterialButton(activity, null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply {
+            val remove = MaterialButton(activity, null, androidx.appcompat.R.attr.borderlessButtonStyle).apply {
                 text = "移除"
                 isAllCaps = false
                 minHeight = dp(48)
                 setOnClickListener { confirmRemove(node) }
-            })
-            container.addView(row)
+            }
+            container.addView(GatewayUi.tile(activity, GatewayUi.position(index, count), node.label,
+                summary = sync, icon = R.drawable.ic_ui_server, trailing = remove))
         }
+        container.addView(GatewayUi.tile(activity, GatewayUi.position(count - 1, count), "添加节点",
+            summary = if (nodes.isEmpty()) "尚未添加其他节点" else null,
+            icon = R.drawable.ic_ui_add, onClick = { showAddDialog() }).apply { id = R.id.btnMeshAdd })
     }
 
     private fun showAddDialog() {
@@ -155,12 +133,6 @@ class MeshNodesSection(
         }
         layout.addView(edit)
         return layout to edit
-    }
-
-    private fun text(value: String, secondary: Boolean) = TextView(activity).apply {
-        text = value
-        setTextAppearance(if (secondary) com.google.android.material.R.style.TextAppearance_Material3_BodySmall
-            else com.google.android.material.R.style.TextAppearance_Material3_BodyLarge)
     }
 
     private fun dp(value: Int) = (value * activity.resources.displayMetrics.density).toInt()

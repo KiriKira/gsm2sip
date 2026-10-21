@@ -10,16 +10,17 @@ import com.callagent.gateway.net.ControlApiClient
 import com.callagent.gateway.data.*
 import com.callagent.gateway.sim.SimRegistry
 import com.callagent.gateway.bridge.CallOrchestrator
-import com.callagent.gateway.rtc.GatewayRtcMedia
 import com.callagent.gateway.gsm.GsmCallManager
-import com.callagent.gateway.rtp.*
+import com.callagent.gateway.audio.CallAudioSession
+import com.callagent.gateway.audio.CellularAudioSession
 import org.json.JSONObject
 import org.json.JSONArray
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 
 /** Exercises the actual GatewayService and CallOrchestrator. Only physical
- * cellular PCM is replaced; pairing, SIM mapping, SIP, RTC and Telecom are real. */
+ * cellular PCM is replaced; pairing, SIM mapping, RTC call control, WebRTC
+ * media and Telecom are real. */
 @android.annotation.TargetApi(29)
 class GatewayJointInstrumentation:Instrumentation(){
     private val tones=CopyOnWriteArrayList<LabPcmTone>()
@@ -33,17 +34,15 @@ class GatewayJointInstrumentation:Instrumentation(){
     }
     override fun onCreate(arguments:Bundle?){super.onCreate(arguments);start()}
     private class PcmHardware(private val tone:LabPcmTone):CallAudioSession{
-        override var listener:RtpSession.Listener?=null
-        override var srtpSend:SrtpContext?=null
-        override var srtpRecv:SrtpContext?=null
-        override fun start(){check(GsmCallManager.isCallActive){"pcm_before_telecom_active"};tone.start();listener?.onRtpStarted()}
-        override fun stop(){tone.close();listener?.onRtpStopped()}
+        override var listener:CellularAudioSession.Listener?=null
+        override fun start(){check(GsmCallManager.isCallActive){"pcm_before_telecom_active"};tone.start();listener?.onAudioStarted()}
+        override fun stop(){tone.close();listener?.onAudioStopped()}
         override fun setAgentMuted(on:Boolean){tone.muted=on}
         override fun setMonitorEnabled(on:Boolean){check(!on){"synthetic_hardware_has_no_speaker"}}
     }
     override fun onStart(){
         var activity:Activity?=null
-        val result=JSONObject().put("scope","real_gateway_service_sip_rtc_telecom_with_synthetic_cellular_pcm")
+        val result=JSONObject().put("scope","real_gateway_service_rtc_telecom_with_synthetic_cellular_pcm")
         try{
             check(android.os.Build.SUPPORTED_ABIS.contains("x86_64")){"emulator_only"}
             uiAutomation.adoptShellPermissionIdentity()
@@ -82,33 +81,22 @@ class GatewayJointInstrumentation:Instrumentation(){
                 val proposal=api.proposeSimBindings(UUID.randomUUID().toString(),mappings)
                 api.confirmSimBindings(proposal.operationId,JSONArray().apply{proposal.mappings.forEach{put(JSONObject().put("sim_id",it.simId).put("confirmed",true).put("slot_index",it.slotIndex))}})
                 SimRegistry.confirmMappings(targetContext,proposal.mappings.map{m->SimRegistry.SimBindingConfirmation(m.simId,snapshot.subscriptions.single{it.slotIndex==m.slotIndex}.subscriptionId)},proposal.mappingRevision)
-                VoiceCredentialStore.saveProvisioned(targetContext,paired.gatewayId,api.rotateSipCredentials(UUID.randomUUID().toString()))
                 proposal.mappings.first().simId to proposal.mappingRevision
             }
-            val prefs=targetContext.getSharedPreferences("gateway",0)
-            api.capabilities()
-            val policy=targetContext.getSharedPreferences("gateway-voice-transport",0)
-            val rtcOnly=policy.getBoolean("rtc_control_server",false) && !policy.getBoolean("sip_control_server",true)
-            val server=if(rtcOnly) "" else checkNotNull(prefs.getString("server",null))
-            val username=if(rtcOnly) "" else checkNotNull(prefs.getString("user",null))
-            val password=if(rtcOnly) "" else VoiceCredentialStore.password(targetContext,server,username)
-            check(rtcOnly || password.isNotBlank()){"resume_voice_credentials_missing"}
-            targetContext.getSharedPreferences("gateway",0).edit().putBoolean("use_stun",false).putString("own_number","+15550100299").commit()
-            GatewayService.orchestratorFactoryForInstrumentation={service,sip->
+            check(api.rtcControlAvailable()){"server_without_rtc_call_control"}
+            GatewayService.orchestratorFactoryForInstrumentation={service->
                 // The synthetic backend supplies PCM directly and needs no
                 // physical modem mixer profile. SIM resolution and Telecom
                 // dispatch still use the production implementations.
-                CallOrchestrator(service,sip,outboundAudioPreparation={true},audioFactory={audio->
-                    if(audio.externalPcm==null)audio.realSession() else {
-                        val tone=LabPcmTone(900.0,500.0,checkNotNull(audio.externalPcm))
-                        tones.add(tone)
-                        PcmHardware(tone)
-                    }
-                },rtcAdapter=GatewayRtcMedia(service)).also{orch=it}
+                CallOrchestrator(service,outboundAudioPreparation={true},audioFactory={audio->
+                    val tone=LabPcmTone(900.0,500.0,audio.pcm)
+                    tones.add(tone)
+                    PcmHardware(tone)
+                }).also{orch=it}
             }
             stage="service_start"
             activity=startActivitySync(Intent(targetContext,MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-            onMain{check(GatewayService.start(targetContext,server,prefs.getInt("port",5061),username,password)){"service_start_denied"}}
+            onMain{check(GatewayService.start(targetContext)){"service_start_denied"}}
             val ready=JSONObject().put("status","READY").put("gateway_id",paired.gatewayId).put("sim_id",confirmed.first).put("mapping_revision",confirmed.second)
             targetContext.filesDir.resolve("joint-ready.json").writeText(ready.toString())
             var last="";val deadline=System.nanoTime()+java.util.concurrent.TimeUnit.HOURS.toNanos(6)
@@ -124,7 +112,7 @@ class GatewayJointInstrumentation:Instrumentation(){
                             check(orch?.bridgeState==CallOrchestrator.BridgeState.IDLE){"active_call_reconnect_forbidden"}
                             onMain{GatewayService.stop(targetContext)}
                             Thread.sleep(700)
-                            onMain{check(GatewayService.start(targetContext,server,prefs.getInt("port",5061),username,password)){"reconnect_start_denied"}}
+                            onMain{check(GatewayService.start(targetContext)){"reconnect_start_denied"}}
                         }
                         "mesh_add"->{
                             val node=com.callagent.gateway.mesh.MeshPairing.add(targetContext,command.getString("api_url"),command.getString("pairing_code"),"RTC joint gateway mesh")
@@ -136,7 +124,7 @@ class GatewayJointInstrumentation:Instrumentation(){
                         "stop"->break
                         else->error("unknown_op")
                     }
-                    reply.put("status","OK").put("bridge",orch?.bridgeState?.name).put("media",orch?.mediaTransport).put("call_control",orch?.callControlTransport)
+                    reply.put("status","OK").put("bridge",orch?.bridgeState?.name).put("media","webrtc").put("call_control","rtc")
                         .put("telecom_state",GsmCallManager.activeCallState).put("pcm",JSONArray(tones.map{it.report()}))
                         .put("dtmf_events",JSONArray(GatewayService.logSnapshot().filter{it.contains("DTMF received and played") || it.contains("DTMF tone stopped")}))
                 }catch(failure:Throwable){reply.put("status","FAIL").put("error",failure.javaClass.simpleName+":"+failure.message)}

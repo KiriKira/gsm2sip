@@ -12,7 +12,7 @@ import java.util.concurrent.TimeUnit
 /**
  * Keeps a paired gateway reachable with the screen off and the charger out.
  *
- * Heartbeats, the WSS wake channel and SIP registration all run on ordinary
+ * Heartbeats, the WSS wake channel and call control all run on ordinary
  * threads. Once Android suspends the CPU none of them run, the server stops
  * hearing heartbeats and shows the gateway offline after 90 seconds, and
  * Doze cuts the network for everything that is not exempt. The gateway is a

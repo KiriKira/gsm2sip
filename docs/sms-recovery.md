@@ -1,5 +1,7 @@
 # SMS inbox recovery
 
+> **0.4.0 起**：网关已改名 Homura，SIP/RTP/SRTP/STUN 代码全部移除，通话只走服务器 HTTPS 呼叫控制与 WebRTC。本文中有关 SIP、Asterisk、ARI 的内容是历史记录。
+
 The gateway has two separate inbound paths. The normal path journals each
 `SMS_RECEIVED` broadcast before waking the service. Optional recovery scans
 Android's retained SMS inbox so a later app or service start can import a
@@ -57,6 +59,5 @@ carrier never delivered, one Android never stored, or one deleted before the
 scan. Once an event is journaled, the existing durable upload queue retries it
 until the server acknowledges it.
 
-Settings form values survive screen recreation, while the SIP password and
-one-time pairing code are excluded from saved view state. The SIP password is
-loaded from the encrypted Android Keystore-backed store after recreation.
+Settings form values survive screen recreation, while the one-time pairing
+code is excluded from saved view state.

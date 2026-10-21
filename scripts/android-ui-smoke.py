@@ -552,7 +552,7 @@ class Smoke:
     def app_specific_fields(self) -> tuple[str, str, str | None]:
         if self.args.scenario == "host":
             return "pairing_server", "pairing_device_name", None
-        return "etControlUrl", "etControlDeviceName", "btnHomeMenu"
+        return "etControlUrl", "etControlDeviceName", "navSettings"
 
     def open_settings_if_needed(self, root: ET.Element) -> ET.Element:
         server_id, _, trigger = self.app_specific_fields()
@@ -560,13 +560,11 @@ class Smoke:
         if self.args.scenario == "gateway":
             if server_node is None or not self.node_is_on_screen(server_node):
                 menu = next((node for node in self.nodes(root)
-                             if node.attrib.get("resource-id", "").endswith("/btnHomeMenu")), None)
-                if menu is None and trigger:
-                    menu = next((n for n in self.nodes(root) if n.attrib.get("content-desc", "") == "Menu"), None)
+                             if node.attrib.get("resource-id", "").endswith(f"/{trigger}")), None)
                 if menu is None:
-                    self.record("settings_navigation", "fail", "gateway home screen Menu control is missing")
-                    raise RuntimeError("Gateway home screen Menu control is missing")
-                self.tap_node(menu, "gateway_settings_menu")
+                    self.record("settings_navigation", "fail", "gateway Settings navigation item is missing")
+                    raise RuntimeError("Gateway Settings navigation item is missing")
+                self.tap_node(menu, "gateway_settings_navigation")
                 root = self.wait_for_app_tree(lambda tree: self.find_node(tree, server_id) is not None,
                                               "gateway_control_pairing_form")
                 self.record("settings_navigation", "pass", "opened Control server pairing from the visible gateway UI")
@@ -600,7 +598,7 @@ class Smoke:
                     else "gateway Control server pairing form reports 未配对")
         code_id = "pairing_code" if self.args.scenario == "host" else "etControlPairingCode"
         code_node = self.find_node(root, code_id)
-        code_hint = "一次性配对码" if self.args.scenario == "host" else "粘贴服务器生成的 gateway 配对码"
+        code_hint = "一次性配对码"
         if code_node is None:
             self.record("pairing_code_untouched", "blocked", "pairing code field is not exposed in the current UI hierarchy")
         elif (code_node.attrib.get("password", "false") != "true" or
@@ -865,10 +863,9 @@ class Smoke:
         entry_id = self.backup_entry_id()
         try:
             root = self.capture("main_backup_entry_preflight")
-            gateway_back = self.find_node(root, "btnConfigBack") if self.args.scenario == "gateway" else None
-            if gateway_back is not None and self.node_is_on_screen(gateway_back):
-                root = self.ensure_node_visible(root, "btnConfigBack")
-                self.tap_id(root, "btnConfigBack")
+            gateway_home = self.find_node(root, "navHome") if self.args.scenario == "gateway" else None
+            if gateway_home is not None and self.find_node(root, entry_id) is None:
+                self.tap_id(root, "navHome")
                 root = self.wait_for_app_tree(lambda tree: self.find_node(tree, entry_id) is not None,
                                               "gateway_home_sms_backup")
             root = self.ensure_node_visible(root, entry_id)

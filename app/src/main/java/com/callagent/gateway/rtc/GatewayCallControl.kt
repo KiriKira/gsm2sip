@@ -80,35 +80,30 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
             if(System.nanoTime()-node.lastSeen>15_000_000_000L)orchestrator.onRtcControlLost(node)
         }
     }
-    /** False means choose the SIP compatibility adapter BEFORE any invite.
-     * Once an RTC invitation is committed, errors end this call; never re-fork
-     * it over SIP. */
-    fun offerIncoming(mapping:SimRegistry.SimMapping,id:String,number:String,valid:()->Boolean):Boolean{
-        val candidates=nodes.values.toList()
-        if(candidates.isEmpty()||candidates.any{!it.checked||!it.supported}){
-            Log.i("GsmRtc","call_id=$id event=incoming_policy call_control=sip reason=node_capability_unknown_or_legacy")
-            return false
-        }
-        val eligible=candidates.filter{it.ready}
-        if(eligible.isEmpty())return false
-        if(eligible.any{it.api.request("GET","/rtc/control/incoming-policy",null).getString("call_control")!="rtc"}){
-            Log.i("GsmRtc","call_id=$id event=incoming_policy call_control=sip reason=participant_requires_compatibility")
-            return false
-        }
-        Log.i("GsmRtc","call_id=$id event=incoming_policy call_control=rtc nodes=${eligible.size}")
-        // All nodes selected RTC. A later race is a failed call, never permission
-        // to invite a second set of candidates using another control engine.
+    /** Offers the ringing cellular call to every ready node. A node that
+     * fails its create is left out; the call fails only when no node took it.
+     * Once offered, errors end this call; it is never offered a second time. */
+    fun offerIncoming(mapping:SimRegistry.SimMapping,id:String,number:String,valid:()->Boolean){
+        val eligible=nodes.values.filter{it.supported && it.ready}
+        check(eligible.isNotEmpty()){"RTC_NO_READY_NODE"}
         check(GatewayDatabase.get(context).reserveRtcCellularSlot(id)){"RTC_CELLULAR_OCCUPIED"}
+        var offered=0
         eligible.forEach{node->
             check(valid()){"RTC_INCOMING_RETIRED"}
-            val revision=if(node.primary)mapping.mappingRevision else GatewayDatabase.get(context).meshNodeSims(node.gatewayId)
-                .firstOrNull{it.simId.equals(mapping.simId,true)&&it.state=="active"}?.mappingRevision
-            checkNotNull(revision){"RTC_NODE_SIM_NOT_BOUND"}
-            val snapshot=node.control.create(id,node.gatewayId,mapping.simId,revision,
-                "",true,number.takeIf{it.isNotBlank()})
-            orchestrator.onRtcControlSnapshot(node,snapshot)
+            try{
+                val revision=if(node.primary)mapping.mappingRevision else GatewayDatabase.get(context).meshNodeSims(node.gatewayId)
+                    .firstOrNull{it.simId.equals(mapping.simId,true)&&it.state=="active"}?.mappingRevision
+                checkNotNull(revision){"RTC_NODE_SIM_NOT_BOUND"}
+                val snapshot=node.control.create(id,node.gatewayId,mapping.simId,revision,
+                    "",true,number.takeIf{it.isNotBlank()})
+                offered++
+                orchestrator.onRtcControlSnapshot(node,snapshot)
+            }catch(error:Exception){
+                Log.w("GsmRtc","call_id=$id event=incoming_offer_failed node=${node.gatewayId.take(8)} error=${error.javaClass.simpleName}")
+            }
         }
-        return true
+        check(offered>0){"RTC_INCOMING_NOT_OFFERED"}
+        Log.i("GsmRtc","call_id=$id event=incoming_offered nodes=$offered")
     }
     fun winner(id:String,winningNode:String){
         nodes.values.filter{it.supported && it.gatewayId!=winningNode}.forEach{node->GatewayDatabase.get(context).queueRtcTerminal(id,node.gatewayId,"answered_elsewhere")}

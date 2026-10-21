@@ -40,9 +40,9 @@ class RadioTelemetryTest {
         val client = ControlApiClient(RuntimeEnvironment.getApplication(), "https://control.invalid")
         val plain = HeartbeatSim("sim-a", 3, "in_service", true)
         val withRadio = plain.copy(radio = RadioSnapshot(2, "NR", "Carrier", null))
-        val plainBody = client.heartbeatBody(1, false, false, 50, true, listOf(plain))
+        val plainBody = client.heartbeatBody(1, false, 50, true, listOf(plain))
         assertFalse(plainBody.getJSONArray("sim_states").getJSONObject(0).has("radio"))
-        val radio = client.heartbeatBody(2, false, false, 50, true, listOf(withRadio))
+        val radio = client.heartbeatBody(2, false, 50, true, listOf(withRadio))
             .getJSONArray("sim_states").getJSONObject(0).getJSONObject("radio")
         assertEquals(2, radio.getInt("signal_level"))
         assertEquals("NR", radio.getString("network_type"))
@@ -79,12 +79,12 @@ class RadioTelemetryTest {
         val client = ControlApiClient(RuntimeEnvironment.getApplication(), "https://control.invalid")
         val sim = HeartbeatSim("sim-a", 3, "in_service", true,
             radio = RadioTelemetry.snapshot(2, TelephonyManager.NETWORK_TYPE_LTE, "Carrier", true, countryIso = "cn"))
-        val radio = client.heartbeatBody(1, false, false, 50, true, listOf(sim))
+        val radio = client.heartbeatBody(1, false, 50, true, listOf(sim))
             .getJSONArray("sim_states").getJSONObject(0).getJSONObject("radio")
         assertEquals("CN", radio.getString("country_iso"))
         assertEquals(setOf("signal_level", "network_type", "network_operator", "roaming", "country_iso"),
             radio.keys().asSequence().toSet())
-        val unknown = client.heartbeatBody(2, false, false, 50, true,
+        val unknown = client.heartbeatBody(2, false, 50, true,
             listOf(sim.copy(radio = sim.radio!!.copy(countryIso = null))))
             .getJSONArray("sim_states").getJSONObject(0).getJSONObject("radio")
         assertFalse(unknown.has("country_iso"))

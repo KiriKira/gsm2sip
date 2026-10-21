@@ -1,7 +1,8 @@
 package com.callagent.gateway.ui
 
 import android.content.res.ColorStateList
-import android.util.TypedValue
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import android.view.View
 import android.widget.LinearLayout
@@ -10,36 +11,31 @@ import androidx.core.view.ViewCompat
 import com.callagent.gateway.ui.GatewaySetupChecklist.Action
 import com.callagent.gateway.ui.GatewaySetupChecklist.Status
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.textview.MaterialTextView
 import com.google.android.material.R as MaterialR
 
-/** Renders [GatewaySetupChecklist.Summary] into the home screen's setup card. */
+/** Renders [GatewaySetupChecklist.Summary] as a group of tiles on the status page. */
 class GatewaySetupCard(
-    private val headline: TextView,
-    private val steps: LinearLayout,
+    private val container: LinearLayout,
     private val onAction: (Action) -> Unit
 ) {
     private var rendered: GatewaySetupChecklist.Summary? = null
 
-    init {
-        ViewCompat.setAccessibilityHeading(headline, true)
-    }
-
     fun render(summary: GatewaySetupChecklist.Summary) {
         if (summary == rendered) return
         rendered = summary
-        headline.text = summary.headline
-        steps.removeAllViews()
-        summary.steps.forEach { step -> steps.addView(stepRow(step)) }
+        val context = container.context
+        container.removeAllViews()
+        container.addView(GatewayUi.groupHeader(context, summary.headline).also {
+            ViewCompat.setAccessibilityHeading(it, true)
+        })
+        summary.steps.forEachIndexed { index, step ->
+            container.addView(stepTile(step, GatewayUi.position(index, summary.steps.size)))
+        }
     }
 
-    private fun stepRow(step: GatewaySetupChecklist.Step): View {
-        val context = steps.context
-        val row = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            minimumHeight = dp(56)
-            setPadding(0, dp(8), 0, dp(8))
-        }
+    private fun stepTile(step: GatewaySetupChecklist.Step, position: GatewayUi.Position): View {
+        val context = container.context
         val (glyph, colorAttr, containerAttr) = when (step.status) {
             Status.DONE -> Triple("✓", MaterialR.attr.colorOnTertiaryContainer, MaterialR.attr.colorTertiaryContainer)
             Status.NEXT -> Triple("${step.id.ordinal + 1}", MaterialR.attr.colorOnPrimary, androidx.appcompat.R.attr.colorPrimary)
@@ -47,52 +43,45 @@ class GatewaySetupCard(
             Status.BLOCKED -> Triple("${step.id.ordinal + 1}", MaterialR.attr.colorOnSurfaceVariant, MaterialR.attr.colorSurfaceContainerHighest)
             Status.OPTIONAL -> Triple("+", MaterialR.attr.colorOnSecondaryContainer, MaterialR.attr.colorSecondaryContainer)
         }
-        val badge = TextView(context).apply {
+        val label = step.actionLabel
+        val button = if (label != null && step.action != Action.NONE) {
+            MaterialButton(context, null,
+                if (step.status == Status.NEXT) MaterialR.attr.materialButtonStyle
+                else MaterialR.attr.materialButtonOutlinedStyle).apply {
+                this.text = label
+                isAllCaps = false
+                minHeight = GatewayUi.dp(context, 48)
+                cornerRadius = GatewayUi.dp(context, 24)
+                if (step.status == Status.NEXT) {
+                    backgroundTintList = ColorStateList.valueOf(GatewayUi.color(context, androidx.appcompat.R.attr.colorPrimary))
+                }
+                setOnClickListener { onAction(step.action) }
+            }
+        } else null
+        val tile = GatewayUi.tile(context, position, step.title, summary = step.detail, trailing = button)
+        tile.addView(badge(glyph, colorAttr, containerAttr), 0, LinearLayout.LayoutParams(
+            GatewayUi.dp(context, 32), GatewayUi.dp(context, 32)).apply { marginEnd = GatewayUi.dp(context, 16) })
+        if (step.status == Status.BLOCKED) {
+            ((tile.getChildAt(1) as? LinearLayout)?.getChildAt(0) as? TextView)
+                ?.setTextColor(GatewayUi.color(context, MaterialR.attr.colorOnSurfaceVariant))
+        }
+        tile.contentDescription = "${step.title}：${statusLabel(step.status)}。${step.detail}"
+        return tile
+    }
+
+    private fun badge(glyph: String, colorAttr: Int, containerAttr: Int): TextView =
+        MaterialTextView(container.context).apply {
             text = glyph
             gravity = Gravity.CENTER
             textSize = 14f
-            setTypeface(typeface, android.graphics.Typeface.BOLD)
-            setTextColor(color(colorAttr))
-            background = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(color(containerAttr))
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+            setTextColor(GatewayUi.color(context, colorAttr))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(GatewayUi.color(context, containerAttr))
             }
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
-        row.addView(badge, LinearLayout.LayoutParams(dp(32), dp(32)).apply { marginEnd = dp(12) })
-
-        val text = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
-        text.addView(TextView(context).apply {
-            this.text = step.title
-            setTextAppearance(MaterialR.style.TextAppearance_Material3_TitleSmall)
-            setTextColor(color(if (step.status == Status.BLOCKED) MaterialR.attr.colorOnSurfaceVariant else MaterialR.attr.colorOnSurface))
-        })
-        text.addView(TextView(context).apply {
-            this.text = step.detail
-            setTextAppearance(MaterialR.style.TextAppearance_Material3_BodySmall)
-            setTextColor(color(MaterialR.attr.colorOnSurfaceVariant))
-        })
-        row.addView(text, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        row.contentDescription = "${step.title}：${statusLabel(step.status)}。${step.detail}"
-
-        val label = step.actionLabel
-        if (label != null && step.action != Action.NONE) {
-            val button = MaterialButton(context, null,
-                if (step.status == Status.NEXT) com.google.android.material.R.attr.materialButtonStyle
-                else com.google.android.material.R.attr.materialButtonOutlinedStyle).apply {
-                this.text = label
-                isAllCaps = false
-                minHeight = dp(48)
-                setOnClickListener { onAction(step.action) }
-            }
-            if (step.status == Status.NEXT) {
-                button.backgroundTintList = ColorStateList.valueOf(color(androidx.appcompat.R.attr.colorPrimary))
-            }
-            row.addView(button, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(8) })
-        }
-        return row
-    }
 
     private fun statusLabel(status: Status) = when (status) {
         Status.DONE -> "已完成"
@@ -101,12 +90,4 @@ class GatewaySetupCard(
         Status.BLOCKED -> "等待前一步"
         Status.OPTIONAL -> "可选"
     }
-
-    private fun color(attr: Int): Int {
-        val value = TypedValue()
-        steps.context.theme.resolveAttribute(attr, value, true)
-        return value.data
-    }
-
-    private fun dp(value: Int): Int = (value * steps.resources.displayMetrics.density).toInt()
 }

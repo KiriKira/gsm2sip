@@ -1,5 +1,7 @@
 # WebRTC 三项目联合验证（2026-10-19）
 
+> **0.4.0 起**：网关已改名 Homura，SIP/RTP/SRTP/STUN 代码全部移除，通话只走服务器 HTTPS 呼叫控制与 WebRTC。本文中有关 SIP、Asterisk、ARI 的内容是历史记录。
+
 最终源代码：Gateway `c2a278381f59581d1776b02bab30b3536cec8784`，Host `9673b767955ca9408bcb0295ead274d98ac4f9ea`，Server `e7c789cb36eb1cce3330de9afea36d18da2ada2a`。均包含本次发布前获取的各自 main。
 
 在 EC2 18.119.132.34 上使用 KVM，Gateway API 36 与 Host API 29 两台 Android 模拟器持续运行，ADB 操作验证；未在每个用例冷启动。全部最终用例由普通运行进程执行，无调试器暂停或放宽产品超时。仅“租约停止续期”用例在音频验证后有意暂停两端应用，验证服务端看门狗及时回收。

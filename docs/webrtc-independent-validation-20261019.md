@@ -1,5 +1,7 @@
 # 独立 Go/RTC 联合验收
 
+> **0.4.0 起**：网关已改名 Homura，SIP/RTP/SRTP/STUN 代码全部移除，通话只走服务器 HTTPS 呼叫控制与 WebRTC。本文中有关 SIP、Asterisk、ARI 的内容是历史记录。
+
 状态：PASS。Gateway `2ef24b8546314d28ce707756b250f23d3c4f5ad0`，
 Host `0ededb1868253d863c66a0dcf00b225e668a1f82`，Server `f2dc1d162a5af8a8a0052194bdc4ea57b89a61da`。
 

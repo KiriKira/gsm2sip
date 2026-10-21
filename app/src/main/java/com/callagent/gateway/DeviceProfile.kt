@@ -28,7 +28,7 @@ data class DeviceProfile(
     /** Shell command to restore mixer state when call ends. */
     val mixerRestoreCmd: String,
 
-    /** Shell command to enable incall_music mixer (called from RtpSession
+    /** Shell command to enable incall_music mixer (called from CellularAudioSession
      *  after AudioTrack.play() when route is settled). */
     val mixerIncallMusicCmd: String,
 
@@ -643,7 +643,7 @@ data class DeviceProfile(
          *    Bridge is already On (set by telephony HAL), so the bridged
          *    audio source changes from mic to AudioTrack playback.
          *    AudioTrack uses USAGE_MEDIA (routes through SPUS → SIFS0).
-         *    This replaces physical mic with SIP agent audio in modem TX.
+         *    This replaces physical mic with the host's audio in modem TX.
          *    v2.8.42 confirmed: caller heard audio (overdriven loud noise).
          *    Enum names work: 'SIFS0' sets correctly, 'UAIF0' restores.
          *
@@ -885,7 +885,7 @@ data class DeviceProfile(
                 // can reach the far end is the digital in-call path.  These
                 // mutes are issued here rather than in mixerSetupCmd because
                 // the voice mutes are gated on the HAL's is_call_active flag,
-                // which RtpSession only sets on the way into initAudio — a
+                // which CellularAudioSession only sets on the way into initAudio — a
                 // mute written before that is discarded, which is why every
                 // earlier attempt at muting the mic did nothing.
                 //   Voice Rx Device Mute -> downlink no longer reaches the

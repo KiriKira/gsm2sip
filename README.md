@@ -1,46 +1,23 @@
-# 双 SIM 远程网关（开发中）
+# Homura：旧手机双 SIM 网关
 
-2026-10-19 更新：WebRTC 熄屏保活已修复，三端按本批一起更新；同版本备用切换与实际通话已验证。[本批验收与 Debug 下载](docs/webrtc-screenoff-validation-20261019.md)。
+Homura 是三端系统中的旧手机网关：旧 Android 保留两张 SIM，未 root 的主手机 [Madoka](https://github.com/KiriKira/gsm2sip-client-android) 经自建服务器 [SoulGem](https://github.com/KiriKira/gsm2sip-server) 收发短信、接打电话。
 
-本分支已接入独立 Go/HTTPS 呼叫控制与原生 WebRTC 音频；服务端可关闭 Asterisk，原 SIP 作为可选兼容路径保留。Host 的开关位于设置页，通话显示实际语音/控制协议；失败不自动回退或重拨。[部署、协议与可配置 TURN 端口](https://github.com/KiriKira/gsm2sip-server/blob/ci/webrtc-sip-debug-20261017/docs/rtc-call-control-v1.md)。独立 Go/RTC 联合验收已通过并发布原签名 Debug；[独立控制验收与下载](docs/webrtc-independent-validation-20261019.md)。[旧混合模式记录](docs/webrtc-joint-validation-20261019.md) 保留为历史。真实蜂窝音频仍需真机验证。
+0.4.0 起通话只走服务器 HTTPS 呼叫控制与原生 WebRTC 音频，SIP、RTP/SRTP、STUN 与 Asterisk 已全部移除；界面改为与 Madoka 相同的样式（状态 / 记录 / 设置三页，运行日志在设置中）。包名 `com.callagent.gateway` 不变，所有正式版共用 versionCode `1000000000`，可直接覆盖升级或回退到任一更早的正式版，见 [发布与回退](docs/releases.md)。三端升级顺序、回退步骤与联合测试计划见服务器仓库的 [0.4 发布说明](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/release-0.4.md) 与 [联合测试计划](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/plan-0.4-joint-test.md)。
 
-[自动构建与 Release、固定签名配置](docs/releases.md)：`main` 推送发布预览版，版本标签发布正式版；首次发布前运行签名 Secrets 配置脚本。
+- 短信：HTTPS 配对、服务器分配 SIM 身份与本机确认、SQLite 事件/执行账本、指定订阅发送短信、分片回执；可选系统库补收。不确定发送保留 `unknown`，不会自动重发或回落默认 SIM。
+- 通话（需 root/Magisk）：来电同时经各服务器节点向主手机振铃、先接者胜出；去电由主手机发起、本机只拨一次。蜂窝音频经 Magisk broker 采集与注入，通过 WebRTC 与主手机互通。
+- [多节点](docs/mesh.md)：可同时连接多台独立服务器，每条短信送到所有节点；同一条短信或同一通去电只执行一次。
+- [短信备份与归档](docs/sms-backup.md)：密码加密备份、JSON 与 SMS Backup & Restore XML 导出/导入。
 
-目标：旧 Android 保留两张 SIM（语音适配可使用 root/Magisk），未 root Android 主机通过自建服务器收发短信、接打电话。
-已实现短信基础、可选系统库补扫与刷新响应恢复，并接入独立 Go/RTC 与可选 SIP/ARI/Telecom 通话链路；目标手机的真实短信、数字音频与通话仍需验收。
-
-- 网关：HTTPS 配对、服务器分配 SIM 身份与本机确认、SQLite 事件/执行账本、指定订阅发送短信、分片回执。
-- [服务器](https://github.com/KiriKira/gsm2sip-server)：PostgreSQL 控制与消息接口，权威协议和联合实施顺序。
-- [主机](https://github.com/KiriKira/gsm2sip-client-android)：配对、两卡状态、消息、草稿和同请求重试。
-
-先读 [网关计划](PLAN-selfhosted-gateway.md)、[实施审查](https://github.com/KiriKira/gsm2sip-server/blob/b93fc9c8036108e36b2652673c1dd8ceee8d197f/docs/IMPLEMENTATION-REVIEW-2026-10-03.md) 与 [设备验收状态](docs/devices.md)。
-[本批实施状态与固定协议](docs/implementation-state.md)。
-按用户要求，本批后续增加 [Magisk 通用适配](docs/magisk-runtime.md)：模块探测、受限账户 broker 和本地数字音频配置，不再按机型自动选 preset 或以 API 31 作为整体语音门槛。
-
-Magisk 模块的模拟器选择与启动阶段验证见 [验证环境比较](docs/magisk-validation-options.md)。推荐使用 KVM AVD 验证模块挂载和启动脚本；Waydroid 的第三方 Magisk 集成仍需单独验收。
-实际采用方案的启动、停止、截图下载与费用说明见 [Android 虚拟机使用指南](docs/android-virtual-machine.md)。
-两端已增加 [Material 3 Expressive 与后台运行设置](docs/android-ui-and-background.md)，WSS 唤醒配合 HTTPS 补齐；ARI、主机内置 SIP SDK 和 Telecom 已落代码；FCM、完整切网续话及真机持续运行仍待完成。
-短信不再以 SIP MESSAGE 作为生产执行通道。不确定发送保留 `unknown`，不能自动重发或回落默认 SIM。
-
-## 多节点
-
-可同时连接多台独立服务器（例如家里的局域网机器和 VPS）：每条短信送到所有节点，主手机按节点优先级自动切换且不会重复收到；同一条短信无论经由哪个节点下发都只发送一次；启用语音后来电同时经各节点振铃、先接者胜出，同一通去电只拨一次。见 [网关多节点说明](docs/mesh.md)。
+更多资料：[界面与后台运行](docs/android-ui-and-background.md)、[实施状态](docs/implementation-state.md)、[设备验收状态](docs/devices.md)、[Magisk 适配](docs/magisk-runtime.md)、[Android 虚拟机使用指南](docs/android-virtual-machine.md)、[自动构建与固定签名](docs/releases.md)。
 
 ## 短信模式无需 root
 
 只收发短信可直接安装普通 APK；启动只申请 `READ_PHONE_STATE`、`SEND_SMS`、
 `RECEIVE_SMS`，不申请录音、拨号、默认电话角色，也不初始化 su 或 Magisk broker。
-开启后台后按需允许通知与电池优化豁免。语音权限和 root 探测仅在显式运行 SIP 诊断/启动语音时使用。
+开启后台后按需允许通知与电池优化豁免。语音权限和 root 探测仅在显式运行设备诊断并启动语音时使用。
 Android 安装器可能限制短信权限授予；没有 SEND_SMS/RECEIVE_SMS 时会报告功能不可用，
-不会通过 root 静默授权。当前没有实现完整默认短信应用角色，不能将其视作现有授权 fallback。
-普通权限无法取得稳定 SIM 身份时需要本机逐卡确认，重启后重新核对；不会回落默认卡。
-
-[功能缺口与弱网恢复审查](https://github.com/KiriKira/gsm2sip-server/blob/codex/control-plane-foundation/docs/network-and-feature-status.md)
-区分短信补齐、提醒投递、通话续接限制、主机弱网音质策略及待验收项。
-
-## 短信备份与归档
-
-两端支持密码加密备份、JSON 与 SMS Backup & Restore XML 导出/导入；导入仅进入独立归档，不恢复发送任务。网关可选择开启本机长期保留，服务器确认后仍保留归档副本。详见 [短信备份说明](docs/sms-backup.md) 与 [两端 KVM 验证与关键界面截图](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/ui-verification/README.md)。
+不会通过 root 静默授权。普通权限无法取得稳定 SIM 身份时需要本机逐卡确认，重启后重新核对；不会回落默认卡。
 
 ## 开发与初次连接
 
@@ -50,27 +27,25 @@ Android 安装器可能限制短信权限授予；没有 SEND_SMS/RECEIVE_SMS �
 ./gradlew :app:assembleDebug :app:testDebugUnitTest
 ```
 
-产物为 `app/build/outputs/apk/debug/app-debug.apk`。特权系统安装还需按设备计划检查 Magisk 与应用签名；
-没有发布签名的 release 不能直接打包。不要用卸载重装解决签名冲突而丢弃未决发送账本。
+产物为 `app/build/outputs/apk/debug/app-debug.apk`。没有发布签名的 release 不能直接打包。
+不要用卸载重装解决签名冲突而丢弃未决发送账本。
 
-1. 在服务器创建 owner，分别生成 gateway/client 一次性配对码；推荐按 server README 配置可信 HTTPS。
-   自托管在家庭局域网或 Tailscale 内的节点也可直接用 `http://` 地址（唤醒连接随之为 `ws://`），
-   服务器也可下发 UDP 上的 SIP（`sip:`、明文 RTP）；此时信令与通话音频都不加密，网络安全由部署者自行保证。
-2. 打开旧机首页的“完成设置”卡片，按顺序完成每一步；卡片会直接跳到对应设置项：
-   在“中转服务器”中填写服务器地址、设备名称和一次性配对码，点击“配对网关”。
-3. 在“SIM 卡”中点击“同步 SIM 列表”，逐卡核对本机订阅与服务器 SIM 行，再点击“确认所选 SIM”。
-4. 回到首页启用后台运行并允许通知；需要持续熄屏运行时按卡片提示豁免电池优化。
-   需要远程通话时，再按卡片“远程通话”一步从服务器获取 SIP 配置并运行设备诊断。
-5. 主机使用同一 owner 的 client 配对码连接，选择已确认的 SIM 后提交短信任务；需要后台收件提醒时开启主机后台同步并允许通知。
+1. 在服务器创建 owner，分别生成 gateway/client 一次性配对码；推荐按服务器 README 配置可信 HTTPS。
+   家庭局域网或 Tailscale 内的节点也可直接用 `http://` 地址（唤醒连接随之为 `ws://`）。
+2. 打开“状态”页的“完成设置”，按顺序完成每一步；每一步会直接跳到对应设置项：
+   在“设置 → 服务器与配对”中填写服务器地址、设备名称和一次性配对码，点击“配对网关”。
+3. 在“设置 → SIM 卡”中点击“同步 SIM 列表”，逐卡核对本机订阅与服务器 SIM 行，再点击“确认所选 SIM”。
+4. 在“设置 → 后台运行与权限”中启用后台运行并允许通知；需要持续熄屏运行时豁免电池优化。
+5. 需要远程通话时，点击“状态”页“远程通话”的“诊断并启动”：确认默认电话角色、语音权限与音频采集后再启动语音。
+6. 主手机 Madoka 使用同一 owner 的 client 配对码连接，即可收发短信、接打电话。
 
-健康 WSS 连接收到提示后同步，断开时旧机约每 30 秒补齐；失败会退避到最长 5 分钟。服务器接收任务不代表 modem 已发送，
-`submitted` 不代表对方已收到。没有可靠卡身份的确认在重启后失效，需要重新核对。
-构建最低 Android API 26。语音按实际 Telephony/Telecom 能力精确映射，公开接口不足时通过 Magisk 的受限 system-UID broker 查询；缺失或不唯一时报告不可用。音频按系统实际路由探测，不回落默认卡。
+健康 WSS 连接收到提示后同步，断开时约每 30 秒补齐；失败会退避到最长 5 分钟。服务器接收任务不代表 modem 已发送，
+`submitted` 不代表对方已收到。构建最低 Android API 26。语音按实际 Telephony/Telecom 能力精确映射，公开接口不足时通过 Magisk 的受限 system-UID broker 查询；缺失或不唯一时报告不可用。
 
 ## 原上游历史说明
 
-下面保留原项目的设备经验和旧 SIP 使用说明，供音频移植研究。它们未经过本 fork 的双卡验证，
-旧 Callagent/chan_sip 部署、SIP MESSAGE 发短信、启动时强制录音授权等描述不适用于本批三端实现。
+下面保留原项目的设备经验和旧 SIP 使用说明，仅供音频移植研究。Homura 已不含任何 SIP 代码，
+旧 Callagent/chan_sip 部署、SIP MESSAGE 发短信、启动时强制录音授权等描述均不适用。
 上游发布 APK 也不包含本批修改。
 
 <details>

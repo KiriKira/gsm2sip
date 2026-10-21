@@ -28,10 +28,10 @@ import java.util.IdentityHashMap
  * Audio defaults to stream-scoped Telephony Rx/Tx routing. Legacy mixer
  * presets require explicit local configuration through the Magisk module.
  *
- * SIP→GSM: AudioTrack (USAGE_MEDIA / deep-buffer) → incall_music →
+ * Host→GSM: AudioTrack (USAGE_MEDIA / deep-buffer) → incall_music →
  * HAL injects STREAM_MUSIC digitally into voice TX (uplink).
  *
- * GSM→SIP: VOICE_CALL capture provides digital uplink+downlink audio.
+ * GSM→host: VOICE_CALL capture provides digital uplink+downlink audio.
  *
  * ALL tinymix commands are batched into a single su call to minimise
  * JVM spawning on low-end devices.
@@ -55,7 +55,7 @@ object GsmCallManager {
      *
      * Read at STATE_DISCONNECTED and kept, because the bridge tears down
      * afterwards and the Call object may be invalidated by then — and the
-     * cause is what decides the SIP status the server is told.
+     * cause is what decides the end reason the server is told.
      */
     @Volatile var lastDisconnectCause: DisconnectCause? = null
         private set
@@ -151,7 +151,7 @@ object GsmCallManager {
                 Log.i(TAG, "Incoming GSM call detected")
                 // Silence the ringtone immediately — this is a gateway device,
                 // not a user-facing phone.  The call will be auto-answered
-                // once the SIP leg is established.
+                // once the host's media is connected.
                 try {
                     val am = service.getSystemService(Context.AUDIO_SERVICE) as AudioManager
                     am.setStreamVolume(AudioManager.STREAM_RING, 0, 0)
@@ -500,7 +500,7 @@ object GsmCallManager {
         }, "MixerDiscovery").start()
     }
 
-    /** Configure audio for GSM↔SIP bridge using the active device profile. */
+    /** Configure audio for the GSM↔host bridge using the active device profile. */
     private fun configureAudioBridge() {
         if (profile.configError != null) {
             appLog("Audio unavailable: invalid local Magisk audio configuration")
@@ -540,7 +540,7 @@ object GsmCallManager {
                 val audioManager = service.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
 
                 // Samsung HAL params (incall_music_enabled, g_call_path, etc.)
-                // are NOT set here — they fire in RtpSession.enableIncallMusic()
+                // are NOT set here — they fire in CellularAudioSession.enableIncallMusic()
                 // AFTER the AudioRecord is running.  Setting them before capture
                 // kills VOICE_CALL capture (confirmed v2.8.33).
 
@@ -632,9 +632,9 @@ object GsmCallManager {
             "\"通话时静音本机\" in settings.")
     }
 
-    /** Set audio stream volumes for the GSM↔SIP bridge.
+    /** Set audio stream volumes for the GSM↔host bridge.
      *  Called multiple times: immediately, after delayed route change,
-     *  and from RtpSession as a secondary safeguard. */
+     *  and from CellularAudioSession as a secondary safeguard. */
     fun enforceVolumes(am: AudioManager) {
         if (profile.useGenericRouting || profile.configError != null) return
         // Clear any stale ADJUST_MUTE flag from a previous call.

@@ -52,12 +52,14 @@ class MeshCoordinator(
     private val database = GatewayDatabase.get(app)
 
     /** Sync every node independently; one unreachable node never blocks another. */
-    fun syncAll(inputs: MeshHeartbeatInputs) {
-        if (CredentialStore.load(app) == null) return
+    fun syncAll(inputs: MeshHeartbeatInputs): Boolean {
+        if (CredentialStore.load(app) == null) return false
+        var anyNodeSynced = false
         database.meshNodes().forEach { node ->
             try {
                 syncNode(node, inputs)
                 database.recordMeshSync(node.gatewayId, null)
+                anyNodeSynced = true
             } catch (e: ControlApiException) {
                 database.recordMeshSync(node.gatewayId, e.code)
                 log("MESH: ${hostOf(node.controlBaseUrl)} ${e.code}")
@@ -66,6 +68,7 @@ class MeshCoordinator(
                 log("MESH: ${hostOf(node.controlBaseUrl)} sync failed")
             }
         }
+        return anyNodeSynced
     }
 
     private fun syncNode(node: GatewayDatabase.MeshNode, inputs: MeshHeartbeatInputs) {

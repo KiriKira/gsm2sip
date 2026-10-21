@@ -542,7 +542,7 @@ class GatewayService : Service() {
             return
         }
         thread(name = "gateway-control") {
-            var retryMs = CONTROL_INTERVAL_MS
+            val retrySchedule = ControlRetrySchedule(CONTROL_INTERVAL_MS, CONTROL_MAX_RETRY_MS)
             try {
                 while (!controlStop && !stopped) {
                     if (!GatewayBackgroundRuntime.allowedRecovery(this@GatewayService)) break
@@ -551,15 +551,13 @@ class GatewayService : Service() {
                             "Pair this device with the control server before background sync can resume")
                         break
                     }
-                    var nextRetryMs = retryMs
+                    var nextRetryMs = retrySchedule.currentDelayMs
                     try {
                         if (!withNetworkSyncWakeLock { syncControlPlaneOnce() }) break
                         GatewayBackgroundRuntime.markSyncSucceeded(this@GatewayService)
-                        retryMs = CONTROL_INTERVAL_MS
+                        nextRetryMs = retrySchedule.primarySucceeded()
                     } catch (e: ControlApiException) {
-                        retryMs = if (e.retryable) (retryMs * 2).coerceAtMost(CONTROL_MAX_RETRY_MS)
-                        else CONTROL_INTERVAL_MS
-                        nextRetryMs = retryMs
+                        nextRetryMs = retrySchedule.primaryFailed(e.retryable)
                         val delaySeconds = (nextRetryMs / 1000).coerceAtLeast(1)
                         broadcastLog("CONTROL: ${e.code}; HTTPS retry in ${delaySeconds}s")
                         GatewayBackgroundRuntime.recordIssue(this@GatewayService,
@@ -574,8 +572,7 @@ class GatewayService : Service() {
                             break
                         }
                     } catch (_: Exception) {
-                        retryMs = (retryMs * 2).coerceAtMost(CONTROL_MAX_RETRY_MS)
-                        nextRetryMs = retryMs
+                        nextRetryMs = retrySchedule.primaryFailed(retryable = true)
                         val delaySeconds = (nextRetryMs / 1000).coerceAtLeast(1)
                         broadcastLog("CONTROL: HTTPS sync failed; retry in ${delaySeconds}s")
                         GatewayBackgroundRuntime.recordIssue(this@GatewayService,
@@ -584,7 +581,16 @@ class GatewayService : Service() {
                     }
                     // Secondary nodes are served even when the primary is unreachable.
                     try {
-                        withNetworkSyncWakeLock { meshCoordinator.syncAll(meshHeartbeatInputs()) }
+                        nextRetryMs = syncSecondaryNodesAndRetryAfter(
+                            retrySchedule = retrySchedule,
+                            withWakeLock = { block -> withNetworkSyncWakeLock(block) },
+                            syncAll = { meshCoordinator.syncAll(meshHeartbeatInputs()) },
+                            onBackoffReset = {
+                                broadcastLog("MESH: healthy secondary keeps control polling at 30s")
+                                GatewayBackgroundRuntime.recordIssue(this@GatewayService,
+                                    "Control sync failed; primary retry in 30s while a secondary node is healthy")
+                            }
+                        )
                     } catch (_: Exception) {
                         broadcastLog("MESH: node sync failed; retrying next round")
                     }

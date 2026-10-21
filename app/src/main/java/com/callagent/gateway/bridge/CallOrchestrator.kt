@@ -884,16 +884,16 @@ class CallOrchestrator(
         }
         val businessCallId = activeBusinessCallId
         val terminalState = ledgerStateOverride ?: if (mediaBridgeEstablished) "completed" else "failed"
+        val controlEndQueued = rtcCall && businessCallId != null && terminalState != "unknown"
         bridgeState = BridgeState.TEARING_DOWN
-        if (rtcCall && businessCallId != null) {
-            if (terminalState != "unknown") rtcControl?.ended(businessCallId, terminalState)
-        }
+        if (controlEndQueued) rtcControl?.ended(checkNotNull(businessCallId), terminalState)
         activeRtcLeg = null; rtcIncoming = false; rtcCellularDispatched = false; rtcAudioStarting = false; incomingRtcLegs.clear()
         cancelPendingInboundWork()
         Log.i(TAG, "Tearing down bridge: $reason")
 
         try {
-            activeMedia?.session?.close()
+            val mediaSession = activeMedia?.session
+            if (controlEndQueued) mediaSession?.closeAfterControlEnd() else mediaSession?.close()
             activeMedia = null
             dtmfQueuedUntil = 0L
             activeAudioSession?.stop()

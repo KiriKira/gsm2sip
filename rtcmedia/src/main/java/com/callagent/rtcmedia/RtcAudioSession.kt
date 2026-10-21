@@ -233,10 +233,18 @@ class RtcAudioSession(
         try{onFailure(reason)}finally{close()}
     }
     fun awaitShutdown(timeoutMillis:Long):Boolean = worker.awaitTermination(timeoutMillis,TimeUnit.MILLISECONDS)
-    override fun close(){
+    /** Close local media after the durable call-control terminal has been queued.
+     * The control record owns remote authorization teardown; sending a parallel
+     * signaling close could make the peer observe media closure first. */
+    fun closeAfterControlEnd() = close(notifyPeer = false)
+
+    override fun close() = close(notifyPeer = true)
+
+    private fun close(notifyPeer:Boolean){
         if(!closed.compareAndSet(false,true))return
         connectionLatch.countDown();peer?.close();peer=null
-        runCatching{worker.execute {runCatching{send("close")}}};worker.shutdown()
+        if(notifyPeer)runCatching{worker.execute {runCatching{send("close")}}}
+        worker.shutdown()
         event("closed")
     }
 }

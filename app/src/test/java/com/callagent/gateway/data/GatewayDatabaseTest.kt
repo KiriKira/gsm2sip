@@ -37,13 +37,56 @@ class GatewayDatabaseTest {
         // application context between method sandboxes. Clear old handoffs
         // through the real recovery path before this method creates its fixture.
         db.recoverUnknownDispatches()
+        // The helper can retain its first application's DB path across native
+        // SQLite sandboxes. Reset this fixture's RTC rows at the real helper.
+        db.writableDatabase.delete("rtc_control_terminals",null,null)
+        db.writableDatabase.delete("rtc_cellular_slot",null,null)
+        db.writableDatabase.delete("call_winners",null,null)
         db.adoptGatewayId(gatewayA)
     }
 
     @After
     fun closeDatabase() {
+        db.writableDatabase.delete("rtc_control_terminals",null,null)
+        db.writableDatabase.delete("rtc_cellular_slot",null,null)
+        db.writableDatabase.delete("call_winners",null,null)
         db.close()
         context.deleteDatabase("gateway-data.db")
+    }
+
+    @Test
+    fun rtcWinnerAndUncertainPhysicalOccupancySurviveProcessRestart() {
+        val call=id("rtc-incoming")
+        assertTrue(db.beginCallDispatch(call,"sim",1,"incoming"))
+        assertTrue(db.reserveRtcCellularSlot(call))
+        db.addMeshNode(gatewayB,"http://backup.invalid/v1","backup")
+        assertTrue(db.claimCallWinner(call,gatewayA,"host-a"))
+        assertFalse(db.claimCallWinner(call,gatewayB,"host-b"))
+        reopen()
+        assertTrue(db.claimCallWinner(call,gatewayA,"host-a"))
+        assertFalse(db.claimCallWinner(call,gatewayB,"host-b"))
+        db.recoverDispatchingCallsToUnknown()
+        assertFalse("SIP must not bypass uncertain RTC physical occupancy",db.beginCallDispatch(id("sip-second"),"sim",1,"outgoing"))
+        assertFalse("RTC must not redial during uncertain occupancy",db.beginRtcCallDispatch(id("rtc-second"),"sim",1))
+        db.completeRtcCellular(call,"completed",listOf(gatewayA,gatewayB))
+        reopen()
+        assertEquals(listOf(call to "ended"),db.rtcTerminals(gatewayA))
+        assertEquals(listOf(call to "ended"),db.rtcTerminals(gatewayB))
+        assertTrue(db.beginRtcCallDispatch(id("rtc-second"),"sim",1))
+        assertFalse("the same business call is never replayed",db.beginRtcCallDispatch(call,"sim",1))
+    }
+
+    @Test
+    fun losingNodeTerminalIsDurableWithoutEndingThePhysicalCall() {
+        val call=id("rtc-winner")
+        assertTrue(db.beginCallDispatch(call,"sim",1,"incoming"))
+        assertTrue(db.reserveRtcCellularSlot(call))
+        db.queueRtcTerminal(call,gatewayB,"answered_elsewhere")
+        reopen()
+        assertEquals(listOf(call to "answered_elsewhere"),db.rtcTerminals(gatewayB))
+        db.acknowledgeRtcTerminal(call,gatewayB)
+        assertTrue(db.rtcTerminals(gatewayB).isEmpty())
+        assertFalse(db.beginCallDispatch(id("blocked"),"sim",1,"outgoing"))
     }
 
     @Test

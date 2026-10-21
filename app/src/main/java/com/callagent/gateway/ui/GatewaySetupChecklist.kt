@@ -44,7 +44,9 @@ object GatewaySetupChecklist {
         val batteryExempt: Boolean,
         val voiceConfigured: Boolean,
         val voiceRunning: Boolean,
-        val sipRegistered: Boolean
+        val sipRegistered: Boolean,
+        val rtcControlReady: Boolean = false,
+        val rtcConfigured: Boolean = false
     )
 
     data class Step(
@@ -101,6 +103,12 @@ object GatewaySetupChecklist {
         val voice = when {
             !input.paired -> Step(StepId.VOICE, "远程通话（需 root）", "配对后可从服务器下发 SIP 配置。",
                 Status.BLOCKED, Action.NONE, null)
+            input.voiceRunning && input.rtcControlReady -> Step(StepId.VOICE, "远程通话（需 root）",
+                "Go/RTC 已就绪，主手机可经服务器接打电话。", Status.DONE, Action.NONE, null)
+            input.voiceRunning && input.rtcConfigured -> Step(StepId.VOICE, "远程通话（需 root）",
+                "RTC 控制正在连接，请查看运行日志。", Status.WARNING, Action.NONE, null)
+            input.rtcConfigured -> Step(StepId.VOICE, "远程通话（需 root）",
+                "服务器支持 Go/RTC。运行设备诊断确认 root 与通话音频后启动。", Status.OPTIONAL, Action.START_VOICE, "诊断并启动")
             input.voiceRunning && input.sipRegistered -> Step(StepId.VOICE, "远程通话（需 root）",
                 "SIP 已注册，主手机可经服务器接打电话。", Status.DONE, Action.NONE, null)
             input.voiceRunning -> Step(StepId.VOICE, "远程通话（需 root）",

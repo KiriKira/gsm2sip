@@ -276,6 +276,10 @@ class GatewaySmsArchiveRetentionTest {
     /** Rebuild the two v5 tables because API 28 SQLite does not support DROP COLUMN. */
     private fun downgradeFixtureToVersionFive(raw: SQLiteDatabase) {
         raw.execSQL("PRAGMA foreign_keys=OFF")
+        // The v5 fixture predates the v8 RTC winner/physical occupancy journal.
+        raw.execSQL("DROP TABLE rtc_control_terminals")
+        raw.execSQL("DROP TABLE rtc_cellular_slot")
+        raw.execSQL("DROP TABLE call_winners")
 
         raw.execSQL("""CREATE TABLE inbox_v5 (
             message_id TEXT PRIMARY KEY, event_id TEXT NOT NULL UNIQUE,

@@ -41,7 +41,7 @@ The certificate fingerprint is public. Keep the keystore and passwords in the pr
 - A tag matching `vMAJOR.MINOR.PATCH` publishes a stable release whose tag and version name are the tag itself.
 - `workflow_dispatch` defaults to `publish=true`. From `main`, set it to `false` to build and verify without creating a GitHub Release. Other branches run a debug-only validation build without release signing or publication; manually dispatched tags can build a signed artifact but do not publish.
 
-The Android `versionCode` is `10000 + github.run_number` and is limited to Android's supported range of 1 through 2,100,000,000. A workflow rerun keeps the same code and release tag; a new workflow run receives a higher code. Existing GitHub Release assets are never replaced.
+Every build uses the same Android `versionCode`, 1000000000. Android refuses to install a lower versionCode but accepts an equal one, so any release can be installed over any other: rolling back is installing the older APK, and app data stays. The code sits above every earlier per-run code (`10000 + github.run_number`), so builds from before this change upgrade normally but cannot be installed over a newer one. Existing GitHub Release assets are never replaced.
 
 ## Release assets
 

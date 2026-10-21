@@ -16,6 +16,7 @@ android {
     compileSdk = 35
 
     defaultConfig {
+        testInstrumentationRunner = providers.gradleProperty("rtcLabRunner").orElse("androidx.test.runner.AndroidJUnitRunner").get()
         applicationId = "com.callagent.gateway"
         minSdk = 26
         targetSdk = 34
@@ -63,6 +64,9 @@ android {
 }
 
 dependencies {
+    implementation(project(":rtcmedia"))
+    implementation(files(rootProject.project(":rtcmedia").layout.buildDirectory.file("webrtc-sdk/external-playout.aar"))
+        .builtBy(":rtcmedia:prepareWebRtcSdk"))
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.12.2")

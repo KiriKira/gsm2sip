@@ -1,0 +1,83 @@
+--- a/org/webrtc/audio/WebRtcAudioTrack.java
++++ b/org/webrtc/audio/WebRtcAudioTrack.java
+@@ -74,0 +75,19 @@
++
++  // Probe-only external PCM sink. Configure before native initialization.
++  private volatile boolean externalPlayout;
++  private int externalSampleRate;
++  private int externalChannels;
++
++  boolean isExternalPlayoutActive() {
++    return externalPlayout && audioTrack == null && audioThread != null;
++  }
++
++  void useExternalPlayout() {
++    if (byteBuffer != null || audioThread != null) {
++      throw new IllegalStateException("Configure external playout before initialization");
++    }
++    if (audioSamplesReadyCallback == null) {
++      throw new IllegalStateException("External playout requires a PCM sink");
++    }
++    externalPlayout = true;
++  }
+@@ -102,0 +122,4 @@
++      if (externalPlayout) {
++        runExternalPlayout();
++        return;
++      }
+@@ -166,0 +190,28 @@
++    private void runExternalPlayout() {
++      Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT);
++      doAudioTrackStateCallback(AUDIO_TRACK_START);
++      ExternalPlayout.FramePacer pacer = new ExternalPlayout.FramePacer();
++      while (keepAlive) {
++        pacer.awaitNextFrame();
++        if (!keepAlive) break;
++        byteBuffer.clear();
++        nativeGetPlayoutData(nativeAudioTrack, byteBuffer.capacity());
++        if (!keepAlive) break;
++        byte[] data = new byte[byteBuffer.capacity()];
++        if (!speakerMute) {
++          ByteBuffer view = byteBuffer.duplicate();
++          view.clear();
++          view.get(data);
++        }
++        try {
++          audioSamplesReadyCallback.onWebRtcAudioTrackSamplesReady(
++              new JavaAudioDeviceModule.AudioSamples(AudioFormat.ENCODING_PCM_16BIT,
++                  externalChannels, externalSampleRate, data));
++        } catch (RuntimeException failure) {
++          keepAlive = false;
++          reportWebRtcAudioTrackError("External PCM sink failed");
++          break;
++        }
++      }
++    }
++
+@@ -213,0 +265,6 @@
++    if (externalPlayout) {
++      externalSampleRate = sampleRate;
++      externalChannels = channels;
++      initialBufferSizeInFrames = sampleRate / BUFFERS_PER_SECOND;
++      return byteBuffer.capacity();
++    }
+@@ -289,0 +347,6 @@
++    if (externalPlayout) {
++      assertTrue(audioThread == null);
++      audioThread = new AudioTrackThread("ExternalPcmPlayout");
++      audioThread.start();
++      return true;
++    }
+@@ -329,1 +392,1 @@
+-    logUnderrunCount();
++    if (!externalPlayout) logUnderrunCount();
+@@ -339,0 +403,1 @@
++    if (externalPlayout) doAudioTrackStateCallback(AUDIO_TRACK_STOP);
+@@ -365,0 +430,1 @@
++    if (externalPlayout) return false;
+@@ -499,0 +565,5 @@
++    // External PCM uses the 10 ms buffer configured by initPlayout; there is
++    // deliberately no Android AudioTrack for this JNI getter to query.
++    if (externalPlayout) {
++      return initialBufferSizeInFrames;
++    }

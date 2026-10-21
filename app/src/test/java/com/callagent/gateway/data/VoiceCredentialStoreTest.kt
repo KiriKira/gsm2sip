@@ -182,6 +182,31 @@ class VoiceCredentialStoreTest {
         assertEquals("", VoiceCredentialStore.password(context))
     }
 
+    @Test
+    fun cachedControlSessionObservesAnotherVaultRotationAndClear() {
+        val first = SessionVault("control-session", "session_v1")
+        val second = SessionVault("control-session", "session_v1")
+        val original = session("gateway-A")
+        first.save(context, original)
+        assertEquals(original, first.load(context))
+        val rotated = original.copy(accessToken = "rotated-access", refreshToken = "rotated-refresh")
+        assertTrue(second.saveIfCurrent(context, original, rotated))
+        assertEquals(rotated, first.load(context))
+        assertFalse(first.saveIfCurrent(context, original, original))
+        assertTrue(second.clearIfCurrent(context, rotated))
+        assertNull(first.load(context))
+    }
+
+    @Test
+    fun corruptedControlBlobCannotReturnCachedCredentials() {
+        val vault = SessionVault("control-session", "session_v1")
+        vault.save(context, session("gateway-A"))
+        assertTrue(vault.load(context) != null)
+        context.getSharedPreferences("control-session", 0).edit().putString("session_v1", "AA==").commit()
+        assertNull(vault.load(context))
+        assertFalse(context.getSharedPreferences("control-session", 0).contains("session_v1"))
+    }
+
     private fun session(gatewayId: String) = CredentialStore.Session(
         gatewayId = gatewayId,
         controlBaseUrl = "https://control.example.test/v1",

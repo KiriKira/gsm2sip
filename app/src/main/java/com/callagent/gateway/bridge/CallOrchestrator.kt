@@ -58,7 +58,7 @@ import java.util.concurrent.TimeUnit
  */
 class CallOrchestrator(
     private val context: Context,
-    private val sipClient: SipClient,
+    private val sipClient: SipClient?,
     private val outboundMappingResolver: (Context, String, Long) -> SimRegistry.SimMapping =
         { appContext, simId, revision -> SimRegistry.resolveForVoice(appContext, simId, revision) },
     private val outboundAudioPreparation: () -> Boolean = { GsmCallManager.prepareVoiceCallDispatch() },
@@ -89,6 +89,8 @@ class CallOrchestrator(
         GatewayDatabase.get(appContext).meshNodeSims(node)
             .firstOrNull { it.simId.equals(simId, ignoreCase = true) && it.state == "active" }?.mappingRevision
     },
+    private val audioFactory: (com.callagent.gateway.rtp.CallAudioConfiguration) -> com.callagent.gateway.rtp.CallAudioSession = { it.realSession() },
+    private val rtcAdapter: com.callagent.gateway.rtc.GatewayRtcMedia? = null,
     private val incomingAccountResolver: (Context, PhoneAccountHandle?) -> SimRegistry.SimMapping? =
         { appContext, handle -> SimRegistry.resolvePhoneAccount(appContext, handle) }
 ) : SipClient.Listener, GsmCallManager.Listener, SipCall.Listener {
@@ -120,7 +122,169 @@ class CallOrchestrator(
         if (client.listener === nodeClientListener) client.listener = null
     }
 
-    private var activeRtpSession: RtpSession? = null
+    private data class RtcControlLeg(val node: com.callagent.gateway.rtc.GatewayCallControl.Node, val snapshot: org.json.JSONObject)
+    @Volatile private var rtcControl: com.callagent.gateway.rtc.GatewayCallControl? = null
+    @Volatile private var activeRtcLeg: RtcControlLeg? = null
+    @Volatile private var rtcIncoming = false
+    @Volatile private var rtcCellularDispatched = false
+    @Volatile private var rtcAudioStarting = false
+    private val incomingRtcLegs = java.util.concurrent.ConcurrentHashMap<String,RtcControlLeg>()
+    val rtcControlReady: Boolean get() = rtcControl?.ready == true
+    val callControlTransport: String get() = when {
+        activeRtcLeg!=null || rtcIncoming -> "rtc"
+        bridgeState==BridgeState.GSM_RINGING -> "selecting"
+        sipClient==null -> "rtc"
+        else -> "sip"
+    }
+
+    fun onRtcNodeReady() {
+        telecomHandler.post{if(!stopped && bridgeState==BridgeState.IDLE)listener?.onStateChanged(BridgeState.IDLE,"RTC control ready")}
+    }
+    fun startRtcControl() {
+        check(rtcControl==null)
+        rtcControl=com.callagent.gateway.rtc.GatewayCallControl(context,this).also{it.start()}
+    }
+    fun onRtcControlLost(node: com.callagent.gateway.rtc.GatewayCallControl.Node) {
+        telecomHandler.post {
+            if(activeRtcLeg?.node===node)tearDown("RTC control authorization expired")
+        }
+    }
+    fun onRtcControlSnapshot(node: com.callagent.gateway.rtc.GatewayCallControl.Node, snapshot: org.json.JSONObject) {
+        if(stopped)return
+        val id=snapshot.getString("call_id")
+        val leg=RtcControlLeg(node,snapshot)
+        synchronized(this) {
+            if(snapshot.getString("direction")=="incoming") {
+                if(activeBusinessCallId!=id || !rtcIncoming)return
+                incomingRtcLegs[node.gatewayId]=leg
+                if(activeRtcLeg?.node===node)activeRtcLeg=leg
+                if(snapshot.optBoolean("end_requested") || snapshot.getString("state") in setOf("ended","unknown")){
+                    if(activeRtcLeg?.node===node || (activeRtcLeg==null && incomingRtcLegs.values.all{it.snapshot.optBoolean("end_requested") || it.snapshot.getString("state") in setOf("ended","unknown")})) {
+                        telecomHandler.post{if(activeBusinessCallId==id)tearDown("RTC incoming ended")}
+                    }
+                    return
+                }
+                if(snapshot.optString("candidate_client_id").isBlank() || activeRtcLeg!=null)return
+                activeRtcLeg=leg
+                val gen=generation
+                mediaWorker.execute { prepareRtcLeg(leg,gen,true) }
+                return
+            }
+            if(activeRtcLeg?.snapshot?.getString("call_id")==id){
+                activeRtcLeg=leg
+                if(snapshot.optBoolean("end_requested") || snapshot.getString("state") in setOf("ended","unknown")){
+                    telecomHandler.post{if(activeBusinessCallId==id)tearDown("RTC remote ended")}
+                }
+                return
+            }
+            if(snapshot.getString("state")!="connecting" || snapshot.optBoolean("end_requested"))return
+            // Existing dispatch rows, including recovered unknown, are never
+            // replayed into another modem operation after reconnect/restart.
+            if(bridgeState!=BridgeState.IDLE)return
+            activeRtcLeg=leg;activeBusinessCallId=id;activeGsmCall=null;activeGsmMapping=null
+            mediaBridgeEstablished=false;bridgeState=BridgeState.GSM_DIALING
+            val gen=generation
+            telecomHandler.post{if(generation==gen)listener?.onStateChanged(BridgeState.GSM_DIALING,"Preparing RTC call")}
+            mediaWorker.execute{prepareRtcLeg(leg,gen,false)}
+        }
+    }
+    private fun rtcLegCurrent(id:String,gen:Long)=!stopped && generation==gen && activeBusinessCallId==id &&
+        bridgeState !in setOf(BridgeState.IDLE,BridgeState.TEARING_DOWN) && activeRtcLeg?.snapshot?.getString("call_id")==id
+
+    private fun prepareRtcLeg(leg:RtcControlLeg,gen:Long,incoming:Boolean){
+        val snapshot=leg.snapshot;val id=snapshot.getString("call_id")
+        try{
+            val revision=if(leg.node.primary)snapshot.getLong("mapping_revision") else
+                checkNotNull(nodeRevisionResolver(context,leg.node.gatewayId,snapshot.getString("sim_id"),snapshot.getLong("mapping_revision"))){"RTC_NODE_SIM_CHANGED"}
+            val mapping=outboundMappingResolver(context,snapshot.getString("sim_id"),revision)
+            check(mapping.voiceAvailable && mapping.phoneAccountHandle!=null)
+            check(rtcLegCurrent(id,gen))
+            val pcm=com.callagent.rtcmedia.PcmBridge()
+            var admission:org.json.JSONObject?=null
+            val until=System.nanoTime()+8_000_000_000L
+            while(rtcLegCurrent(id,gen) && System.nanoTime()<until){
+                val next=leg.node.api.request("GET","/calls/$id/media",null)
+                if(next.getString("media_transport")=="webrtc"){admission=next;break}
+                Thread.sleep(150)
+            }
+            val authorized=checkNotNull(admission){"RTC_HOST_MEDIA_NOT_PREPARED"}
+            check(authorized.getString("call_control")=="rtc")
+            val binding=authorized.getJSONObject("binding")
+            check(binding.getString("call_id")==id && binding.getString("gateway_id")==leg.node.gatewayId &&
+                binding.getString("sim_id")==snapshot.getString("sim_id") && binding.getLong("mapping_revision")==snapshot.getLong("mapping_revision")){"RTC_MEDIA_BINDING_CHANGED"}
+            val media=com.callagent.rtcmedia.RtcAudioSession(context,authorized,leg.node.api,true,pcm,
+                onDigit={digit->receiveRtcDigit(digit,gen)},onFailure={reason->
+                    telecomHandler.post{if(rtcLegCurrent(id,gen))tearDown("RTC media failed: $reason")}
+                },onLog={line->listener?.onRtpStats(line)})
+            synchronized(this){
+                check(rtcLegCurrent(id,gen))
+                activeRtc=com.callagent.gateway.rtc.GatewayRtcMedia.Prepared(media,pcm)
+            }
+            media.start()
+            val connectedUntil=System.nanoTime()+20_000_000_000L
+            while(rtcLegCurrent(id,gen) && System.nanoTime()<connectedUntil && !media.isClosed){
+                if(media.awaitConnected(250))break
+            }
+            check(rtcLegCurrent(id,gen) && media.isConnected){"RTC_MEDIA_NOT_CONNECTED"}
+            val fresh=outboundMappingResolver(context,snapshot.getString("sim_id"),revision)
+            check(fresh==mapping){"RTC_SIM_CHANGED_BEFORE_DISPATCH"}
+            if(incoming){
+                val candidate=snapshot.getString("candidate_client_id")
+                // Local durable global winner precedes any per-node confirmation
+                // and the single real Telecom answer. Never claim a second node.
+                check(GatewayDatabase.get(context).claimCallWinner(id,leg.node.gatewayId,candidate)){"RTC_ANSWERED_ELSEWHERE"}
+                leg.node.control.operation(id,"winner",candidate)
+                rtcControl?.winner(id,leg.node.gatewayId)
+                telecomHandler.post{
+                    if(rtcLegCurrent(id,gen))activeGsmCall?.answer(android.telecom.VideoProfile.STATE_AUDIO_ONLY)
+                }
+            }else{
+                check(outboundAudioPreparation()){"RTC_CELLULAR_CONFIGURATION_UNAVAILABLE"}
+                leg.node.control.operation(id,"dispatch")
+                check(rtcLegCurrent(id,gen))
+                val placed=outboundCallDispatcher(context,snapshot.getString("to"),fresh){placeCall->
+                    synchronized(this){
+                        if(!rtcLegCurrent(id,gen))false
+                        else if(!GatewayDatabase.get(context).beginRtcCallDispatch(id,fresh.simId,fresh.mappingRevision))false
+                        else {activeGsmMapping=fresh;rtcCellularDispatched=true;placeCall()}
+                    }
+                }
+                check(placed){"RTC_CELLULAR_DISPATCH_UNCERTAIN"}
+            }
+            Log.i("GsmRtc","media=webrtc call_control=rtc call_id=$id event=prepared")
+        }catch(_:Throwable){
+            telecomHandler.post{if(rtcLegCurrent(id,gen))tearDown("RTC call preparation failed")}
+        }
+    }
+
+    private fun startRtcCellularAudio(call:Call){
+        val leg=activeRtcLeg?:return
+        synchronized(this){if(rtcAudioStarting)return;rtcAudioStarting=true}
+        val id=leg.snapshot.getString("call_id");val gen=generation
+        activeGsmCall=call
+        mediaWorker.execute{
+            if(!rtcLegCurrent(id,gen))return@execute
+            startRtp(0,"",0) // External PCM backend opens no SIP/RTP socket.
+            val until=System.nanoTime()+5_000_000_000L
+            while(rtcLegCurrent(id,gen) && System.nanoTime()<until && activeRtc?.session?.cellularActive!=true)Thread.sleep(50)
+            if(!rtcLegCurrent(id,gen))return@execute
+            try{
+                check(activeRtc?.session?.cellularActive==true && mediaBridgeEstablished)
+                leg.node.control.operation(id,"active")
+                telecomHandler.post{
+                    if(rtcLegCurrent(id,gen)){bridgeState=BridgeState.BRIDGED;listener?.onStateChanged(bridgeState,"Bridged (RTC)")}
+                }
+            }catch(_:Throwable){telecomHandler.post{if(rtcLegCurrent(id,gen))tearDown("RTC cellular ACTIVE failed")}}
+        }
+    }
+
+    private var activeRtpSession: com.callagent.gateway.rtp.CallAudioSession? = null
+    @Volatile private var activeRtc: com.callagent.gateway.rtc.GatewayRtcMedia.Prepared? = null
+    @Volatile private var mediaSelectedFor: SipCall? = null
+    @Volatile private var mediaPreparingFor: SipCall? = null
+    private val mediaWorker = Executors.newSingleThreadExecutor()
+    @Volatile private var dtmfQueuedUntil = 0L
+    val mediaTransport: String get() = if (activeRtc != null || activeRtcLeg!=null || rtcIncoming) "webrtc" else "sip"
     @Volatile private var activeSipCall: SipCall? = null
     @Volatile private var activeGsmCall: Call? = null
     @Volatile private var activeGsmMapping: SimRegistry.SimMapping? = null
@@ -228,7 +392,7 @@ class CallOrchestrator(
                 }
             }
         }
-        sipClient.listener = this
+        sipClient?.listener = this
         GsmCallManager.listener = this
         Log.i(TAG, "CallOrchestrator started")
     }
@@ -236,10 +400,12 @@ class CallOrchestrator(
     @Synchronized
     fun stop() {
         stopped = true
+        rtcControl?.close();rtcControl=null
         cancelPendingInboundWork()
         inboundWorker.shutdownNow()
+        mediaWorker.shutdownNow()
         tearDown("Orchestrator stopped", ledgerStateOverride = "unknown")
-        sipClient.listener = null
+        sipClient?.listener = null
         nodeClients.forEach { if (it.listener === nodeClientListener) it.listener = null }
         nodeClients.clear()
         GsmCallManager.listener = null
@@ -276,7 +442,7 @@ class CallOrchestrator(
             return intl
         }
         Log.w(TAG, "No own number known; SIP destination may loop back")
-        return sipClient.username
+        return checkNotNull(sipClient).username
     }
 
     /**
@@ -574,6 +740,17 @@ class CallOrchestrator(
             freshMapping.phoneAccountHandle == null) {
             failPendingOutbound(call, metadata, callGeneration, 409, "SIM Mapping Changed",
                 "Call rejected: SIM mapping changed during call preparation")
+            return
+        }
+        if (!isPendingOutbound(call, metadata, callGeneration)) return
+
+        try {
+            prepareCallMedia(call, metadata.callId, callGeneration) {
+                isPendingOutbound(call, metadata, callGeneration)
+            }
+        } catch (_: Throwable) {
+            failPendingOutbound(call, metadata, callGeneration, 488, "WebRTC Media Unavailable",
+                "WebRTC media preparation failed; no cellular dial or SIP audio fallback was started")
             return
         }
         if (!isPendingOutbound(call, metadata, callGeneration)) return
@@ -935,6 +1112,7 @@ class CallOrchestrator(
     override fun onGsmCallActive(call: Call) {
         Log.i(TAG, "GSM call active")
         activeGsmCall = call
+        if(activeRtcLeg!=null){startRtcCellularAudio(call);return}
 
         when (bridgeState) {
             BridgeState.SIP_CALLING, BridgeState.SIP_RINGING -> {
@@ -1100,6 +1278,62 @@ class CallOrchestrator(
 
     // ── SipCall.Listener ────────────────────────────────
 
+    private fun prepareCallMedia(call: SipCall, callId: String, gen: Long, valid: () -> Boolean) {
+        if (mediaSelectedFor === call) return
+        val prepared = rtcAdapter?.prepare(call, callId, valid,
+            publish = { next ->
+                synchronized(this) {
+                    if (stopped || generation != gen || activeSipCall !== call || !valid()) false
+                    else { activeRtc = next; true }
+                }
+            },
+            log = { line ->
+                if (line.startsWith("media=sip")) Log.i("GsmRtc", line)
+                listener?.onRtpStats(line)
+            },
+            digit = { digit -> receiveRtcDigit(digit, gen) },
+            failure = { reason ->
+                telecomHandler.post {
+                    if (generation == gen && activeSipCall === call) {
+                        listener?.onError("WebRTC media failed: $reason")
+                        tearDown("WebRTC media failed")
+                    }
+                }
+            })
+        synchronized(this) {
+            if (stopped || generation != gen || activeSipCall !== call || !valid()) {
+                prepared?.session?.close()
+                error("Media preparation retired")
+            }
+            activeRtc = prepared
+            mediaSelectedFor = call
+            mediaPreparingFor = null
+            context.getSharedPreferences("gateway-runtime-media", Context.MODE_PRIVATE).edit()
+                .putString("media_transport", mediaTransport).apply()
+        }
+        val line = "media=$mediaTransport call_control=sip call_id=$callId event=prepared"
+        Log.i("GsmRtc", line)
+        listener?.onRtpStats(line)
+    }
+
+    private fun receiveRtcDigit(digit: Char, gen: Long) {
+        telecomHandler.post {
+            val session = activeRtpSession ?: return@post
+            if (generation != gen || bridgeState != BridgeState.BRIDGED) return@post
+            val now = SystemClock.elapsedRealtime()
+            val delay = (dtmfQueuedUntil - now).coerceAtLeast(0)
+            if (delay > 5000) return@post
+            dtmfQueuedUntil = now + delay + 200
+            telecomHandler.postDelayed({
+                if (generation != gen || activeRtpSession !== session) return@postDelayed
+                session.listener?.onDtmfTone(digit, true)
+                telecomHandler.postDelayed({
+                    if (generation == gen && activeRtpSession === session) session.listener?.onDtmfTone(digit, false)
+                }, 120)
+            }, delay)
+        }
+    }
+
     override fun onCallAnswered(call: SipCall) {
         Log.i(TAG, "SIP call answered: ${call.callId}")
     }
@@ -1110,6 +1344,31 @@ class CallOrchestrator(
         settleInboundFork(call)
         if (call !== activeSipCall) {
             Log.d(TAG, "Ignoring RTP-ready callback from a stale SIP call")
+            return
+        }
+        if (rtcAdapter == null) mediaSelectedFor = call
+        if (mediaSelectedFor !== call) {
+            synchronized(this) {
+                if (mediaPreparingFor === call) return
+                mediaPreparingFor = call
+            }
+            val gen = generation
+            mediaWorker.execute {
+                try {
+                    val id = call.trustedGsmMetadata?.callId ?: activeBusinessCallId ?: error("Call authority missing")
+                    prepareCallMedia(call, id, gen) { !stopped && generation == gen && activeSipCall === call }
+                    if (!stopped && generation == gen && activeSipCall === call) {
+                        onRtpReady(call, remoteRtpAddr, remoteRtpPort, payloadType)
+                    }
+                } catch (_: Throwable) {
+                    telecomHandler.post {
+                        if (generation == gen && activeSipCall === call) {
+                            listener?.onError("WebRTC media unavailable; cellular call was not answered")
+                            tearDown("Media selection/preparation failed")
+                        }
+                    }
+                }
+            }
             return
         }
         val codecName = when (payloadType) {
@@ -1215,6 +1474,22 @@ class CallOrchestrator(
         }
         if (!isInboundFlowIdentityCurrent(gsmCall, metadata, callGeneration)) return
 
+        try {
+            // The engine choice is frozen across the complete incoming fork.
+            // Once an RTC create is attempted an error ends this call; no SIP
+            // INVITE is manufactured from a control snapshot.
+            val manager=rtcControl
+            if(manager!=null){
+                rtcIncoming=true
+                val offered=manager.offerIncoming(mapping,metadata.callId,callerNumber){isInboundFlowIdentityCurrent(gsmCall,metadata,callGeneration)}
+                if(offered){
+                    schedule(25_000){if(activeBusinessCallId==metadata.callId && bridgeState!=BridgeState.BRIDGED)tearDown("RTC incoming expired")}
+                    return
+                }
+                rtcIncoming=false
+                check(sipClient!=null){"RTC_INCOMING_PARTICIPANTS_REQUIRE_UPGRADE"}
+            }
+        }catch(_:Throwable){postInboundFlowFailure(gsmCall,metadata,callGeneration,"RTC incoming setup failed");return}
         val sipDestination: String
         val rtpPort: Int
         try {
@@ -1286,7 +1561,7 @@ class CallOrchestrator(
         try {
             val legs = mutableListOf<SipCall>()
             try {
-                legs += sipClient.makeCall(
+                legs += checkNotNull(sipClient).makeCall(
                     targetExtension = sipDestination,
                     localRtpPort = rtpPort,
                     callerIdNumber = fromUser,
@@ -1387,20 +1662,21 @@ class CallOrchestrator(
         }
 
         activeRtpSession?.stop()
-        val session = RtpSession(
+        val session = audioFactory(com.callagent.gateway.rtp.CallAudioConfiguration(
             context,
             localPort,
             remoteAddr,
             remotePort,
-            payloadType,
-            activeSipCall?.negotiatedTelephoneEventPayloadType,
-            activeSipCall?.requiresSrtp == true
-        )
+            if (activeRtc != null) RtpPacket.PT_G722 else payloadType,
+            if (activeRtc == null) activeSipCall?.negotiatedTelephoneEventPayloadType else null,
+            activeRtc == null && activeSipCall?.requiresSrtp == true,
+            activeRtc?.pcm
+        ))
 
         // Attach the negotiated SRTP keys, if this call has any.  Done before
         // start() so no packet is ever sent or accepted unprotected on a call
         // that agreed to be protected.
-        activeSipCall?.let { call ->
+        activeSipCall?.takeIf { activeRtc == null }?.let { call ->
             val local = call.localSrtpKeys
             val remote = call.remoteSrtpKeys
             if (local != null && remote != null) {
@@ -1412,6 +1688,15 @@ class CallOrchestrator(
         session.listener = object : RtpSession.Listener {
             override fun onRtpStarted() {
                 if (activeRtpSession === session) mediaBridgeEstablished = true
+                activeRtc?.session?.let { rtc ->
+                    if (!GsmCallManager.isCallActive) {
+                        tearDown("WebRTC audio cannot start before cellular ACTIVE")
+                    } else {
+                        rtc.enableAudio(true)
+                        rtc.markCellularActive()
+                        listener?.onRtpStats("media=webrtc call_control=$callControlTransport call_id=${rtc.callId} event=cellular_pcm_started rate=16000")
+                    }
+                }
                 Log.i(TAG, "RTP session started")
             }
             override fun onRtpStopped() {
@@ -1498,7 +1783,23 @@ class CallOrchestrator(
         sipStatus: Pair<Int, String>? = null,
         ledgerStateOverride: String? = null
     ) {
-        if (bridgeState == BridgeState.IDLE || bridgeState == BridgeState.TEARING_DOWN) return
+        if (bridgeState == BridgeState.IDLE) return
+        val rtcCall=activeRtcLeg!=null || rtcIncoming
+        if(bridgeState==BridgeState.TEARING_DOWN && (!rtcCall || activeGsmCall?.state!=Call.STATE_DISCONNECTED))return
+        if(rtcCall && rtcCellularDispatched && activeGsmCall==null){
+            bridgeState=BridgeState.TEARING_DOWN
+            activeRtc?.session?.close();activeRtpSession?.stop()
+            GatewayDatabase.get(context).markCallTerminal(checkNotNull(activeBusinessCallId),"unknown")
+            return // A possibly dispatched modem operation cannot be guessed ended.
+        }
+        if(rtcCall && activeGsmCall!=null && activeGsmCall?.state!=Call.STATE_DISCONNECTED){
+            bridgeState=BridgeState.TEARING_DOWN
+            activeRtc?.session?.close();activeRtpSession?.stop()
+            cancelPendingInboundWork()
+            val call=activeGsmCall
+            telecomHandler.post{runCatching{call?.disconnect()}}
+            return
+        }
         val businessCallId = activeBusinessCallId
         val terminalState = ledgerStateOverride ?: when {
             mediaBridgeEstablished -> "completed"
@@ -1506,10 +1807,19 @@ class CallOrchestrator(
             else -> "failed"
         }
         bridgeState = BridgeState.TEARING_DOWN
+        if(rtcCall && businessCallId!=null){
+            if(terminalState!="unknown")rtcControl?.ended(businessCallId,terminalState)
+        }
+        activeRtcLeg=null;rtcIncoming=false;rtcCellularDispatched=false;rtcAudioStarting=false;incomingRtcLegs.clear()
         cancelPendingInboundWork()
         Log.i(TAG, "Tearing down bridge: $reason")
 
         try {
+            activeRtc?.session?.close()
+            activeRtc = null
+            mediaSelectedFor = null
+            mediaPreparingFor = null
+            dtmfQueuedUntil = 0L
             activeRtpSession?.stop()
             activeRtpSession = null
 
@@ -1613,6 +1923,10 @@ class CallOrchestrator(
         Log.w(TAG, "Force-resetting bridge: $reason")
         val businessCallId = activeBusinessCallId
         cancelPendingInboundWork()
+        activeRtc?.session?.close()
+        activeRtc = null
+        mediaSelectedFor = null
+        mediaPreparingFor = null
         try {
             activeRtpSession?.stop()
         } catch (_: Exception) {}

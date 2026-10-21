@@ -15,3 +15,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "SipGsmGateway"
 include(":app")
+
+include(":rtcmedia")

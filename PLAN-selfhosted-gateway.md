@@ -1,5 +1,11 @@
 # PLAN — gsm2sip 双 SIM 网关 v1
 
+> 2026-10-19：独立 Go/HTTPS 呼叫控制与原生 WebRTC 已完成两台持续运行的 KVM 模拟器、三个真实 Docker 节点联合验收，并发布沿用原签名的 Debug Release。纯模式三节点不运行 Asterisk，SIP/ARI 抓包为 0；呼入/呼出双向测试 PCM、呼叫事件、TURN UDP/TCP、控制/媒体故障与 A→B→C→A 切换通过。WebRTC 开关关闭时的 SIP 来电、开启时的混合来电事件另行通过。物理蜂窝 HAL 和真实手机音频仍待真机验收。 [本批结果](docs/webrtc-independent-validation-20261019.md)。下文保留原计划背景。
+
+> 2026-10-16 后续路线：[三端 WebRTC 通话迁移计划](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/plan-webrtc.md)。
+> 本文保留 v1 原始任务与验收背景；通话迁移的实施次序和边界以新计划为准，不再先做自研 SIP。
+> UI、短信、配对、SIM、备份、多节点和后台行为必须保持；现行协议在新契约正式落地前仍有效。
+
 更新：2026-10-03。基于 [main 提交 477b7e3](https://github.com/KiriKira/gsm2sip/tree/477b7e349891928dda7b87a9b55b72c52e7eab87) 审查；以下功能均为待实现。此计划取代旧版，旧版保留在 Git 历史。
 
 协议以 [三端协议 v1](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/protocol-v1.md) 为唯一权威，联合次序见 [roadmap](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/roadmap.md)，源码差距见 [审查报告](docs/REVIEW-2026-10-03.md)。实现开始时在依赖记录锁定server协议提交；此仓库不复制wire protocol。

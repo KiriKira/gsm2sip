@@ -40,8 +40,9 @@ class RtpSession(
     private val remotePort: Int,
     private val payloadType: Int = RtpPacket.PT_PCMA,
     private val telephoneEventPayloadType: Int? = null,
-    private val requireSrtp: Boolean = false
-) {
+    private val requireSrtp: Boolean = false,
+    private val externalPcm: com.callagent.rtcmedia.PcmBridge? = null
+) : CallAudioSession {
     private val running = AtomicBoolean(false)
     private val mediaFailureReported = AtomicBoolean(false)
     /** The four loop threads, so [stop] can wait for them to leave the
@@ -86,8 +87,8 @@ class RtpSession(
     // own rollover counters, and each is touched by exactly one thread --
     // send by the capture loop, receive by the receive loop.
 
-    @Volatile var srtpSend: SrtpContext? = null
-    @Volatile var srtpRecv: SrtpContext? = null
+    @Volatile override var srtpSend: SrtpContext? = null
+    @Volatile override var srtpRecv: SrtpContext? = null
 
     /** Packets dropped because they failed authentication. */
     @Volatile var srtpAuthFailures = 0L
@@ -173,6 +174,14 @@ class RtpSession(
     // no usable frames. Remaining digital sources are tried first; acoustic
     // inputs only appear when the local profile explicitly allows them.
     private val silentSourceIds = mutableSetOf<Int>()
+    // Set once every permitted source has been judged silent.  Digital
+    // capture cannot tell a dead source from a quiet line: on an incoming
+    // call nobody has to speak in the first seconds after answer (there is
+    // no ringback, unlike an outgoing call), so every source "fails" and the
+    // call used to be torn down about five seconds in.  Once the list is
+    // exhausted the preferred source is reopened and kept; silence from then
+    // on is dead air, never a reason to end the call.
+    @Volatile private var holdCaptureSource = false
     @Volatile private var currentSourceId: Int = -1
     @Volatile private var currentSourceIsDigital: Boolean = false
     private data class SourceConfig(
@@ -200,7 +209,7 @@ class RtpSession(
     private val RATE_MIN_PERCENT = 85L
     private val SILENCE_FRAME_LIMIT get() = profile.captureSilenceFrames
 
-    var listener: Listener? = null
+    override var listener: Listener? = null
 
     interface Listener {
         fun onRtpStarted()
@@ -212,8 +221,8 @@ class RtpSession(
         fun onRtpStats(stats: String) {}  // Periodic detailed stats
     }
 
-    fun start() {
-        if (requireSrtp && (srtpSend == null || srtpRecv == null)) {
+    override fun start() {
+        if (externalPcm == null && requireSrtp && (srtpSend == null || srtpRecv == null)) {
             listener?.onRtpError("SRTP was required but keys were not installed")
             return
         }
@@ -235,9 +244,10 @@ class RtpSession(
             return
         }
         if (running.getAndSet(true)) return
-        Log.i(TAG, "Starting RTP session: local=$localPort remote=$remoteAddr:$remotePort pt=$payloadType")
+        Log.i(TAG, if (externalPcm == null) "Starting RTP session: local=$localPort remote=$remoteAddr:$remotePort pt=$payloadType"
+            else "Starting WebRTC cellular PCM bridge at 16 kHz; SIP RTP socket is disabled")
 
-        try {
+        if (externalPcm == null) try {
             socket = DatagramSocket(null).apply {
                 reuseAddress = true
                 bind(InetSocketAddress(localPort))
@@ -275,7 +285,7 @@ class RtpSession(
         }
 
         // Send initial RTP keepalive to punch NAT pinhole before audio starts
-        try {
+        if (externalPcm == null) try {
             val remoteInet = InetAddress.getByName(remoteAddr)
             val silence = RtpPacket(payloadType, 0, 0, txSsrc, ByteArray(160)).encode()
             sendRtp(silence, remoteInet, remotePort)
@@ -285,8 +295,15 @@ class RtpSession(
         }
 
         lastRtpReceivedTime = System.currentTimeMillis()
-        workers = listOf(
-            loopThread("RTP-Recv-$localPort") { receiveLoop() },
+        externalPcm?.onDecodedFrame = { frame ->
+            if (running.get()) {
+                if (!jitterBuffer.offer(frame)) { jitterBuffer.poll(); jitterBuffer.offer(frame); rxDropped++ }
+                rxPacketCount++
+                lastRtpReceivedTime = System.currentTimeMillis()
+            }
+        }
+        workers = listOfNotNull(
+            if (externalPcm == null) loopThread("RTP-Recv-$localPort") { receiveLoop() } else null,
             loopThread("RTP-Play-$localPort") { playbackLoop() },
             loopThread("RTP-Capt-$localPort") { captureInitAndLoop() },
             loopThread("RTP-Timeout-$localPort") { timeoutLoop() }
@@ -592,7 +609,16 @@ class RtpSession(
             if (!running.get()) return
 
             // Build source list, filtering out sources that produced silence
-            val configs = buildCaptureConfigs(wideband)
+            var configs = buildCaptureConfigs(wideband)
+            if (configs.isEmpty() && silentSourceIds.isNotEmpty() && !holdCaptureSource) {
+                val msg = "Every capture source was silent (${silentSourceIds.size}); the line may just be " +
+                    "quiet — keeping the preferred source instead of ending the call"
+                Log.w(TAG, msg)
+                listener?.onRtpStats(msg)
+                holdCaptureSource = true
+                silentSourceIds.clear()
+                configs = buildCaptureConfigs(wideband)
+            }
             if (configs.isEmpty()) {
                 Log.e(TAG, "All capture sources produced silence — no working source found")
                 break
@@ -755,6 +781,7 @@ class RtpSession(
      * over seamlessly when AudioRecord finally initializes.
      */
     private fun sendSilencePackets(durationMs: Long, defaultRemoteInet: InetAddress) {
+        if (externalPcm != null) return
         val intervalMs = 20L  // one RTP frame = 20ms
         val end = System.currentTimeMillis() + durationMs
 
@@ -795,7 +822,8 @@ class RtpSession(
      * tearDown(), which runs on the main thread via the Telecom callback;
      * blocking there for up to four joins is how ANRs happen.
      */
-    fun stop() {
+    override fun stop() {
+        externalPcm?.clear()
         if (!running.getAndSet(false)) return
         Log.i(TAG, "Stopping RTP session on port $localPort")
         telephoneEvents?.reset()
@@ -972,7 +1000,7 @@ class RtpSession(
                 // to stall does so from the start.  A proven source is still
                 // eligible -- "proven" only means it produced sound, which is
                 // exactly the state this failure hides behind.
-                if (!rateChecked) {
+                if (!rateChecked && !holdCaptureSource) {
                     val elapsed = System.currentTimeMillis() - captureStartMs
                     if (elapsed >= RATE_CHECK_AFTER_MS) {
                         rateChecked = true
@@ -1014,7 +1042,7 @@ class RtpSession(
                             Log.w(TAG, "Source $audioSourceName low audio (no-echo): rawCapRMS=$rawCaptureRms silence=${silenceFrameCount}/${SILENCE_FRAME_LIMIT} frames")
                         }
                         if (silenceFrameCount >= SILENCE_FRAME_LIMIT) {
-                            if (sourceProven) {
+                            if (sourceProven || holdCaptureSource) {
                                 // Dead air, not a dead source.  Tearing the
                                 // AudioRecord down here and blacklisting the
                                 // source was catastrophic mid-call: with
@@ -1102,8 +1130,13 @@ class RtpSession(
                         shouldForward = false
                         echoGatedFrames++
                     }
-                } else if (rawCaptureRms < noiseGateThreshold) {
+                } else if (externalPcm == null && rawCaptureRms < noiseGateThreshold) {
                     // Noise gate: only modem digital noise, no caller speech.
+                    // Not on WebRTC: the listener there is a person, and a
+                    // per-frame hard gate zeroes every quiet 20 ms of speech
+                    // (syllable tails, soft consonants) -- on the generic
+                    // profile's 300 threshold nearly half the frames of a
+                    // normal call, heard as a constant fast stutter.
                     shouldForward = false
                     noiseGatedFrames++
                 } else {
@@ -1128,6 +1161,12 @@ class RtpSession(
                 } else {
                     java.util.Arrays.fill(pcmBuf, 0, read, 0.toByte())
                     captureRms = 0
+                }
+
+                if (externalPcm != null) {
+                    externalPcm.capture(pcmBuf, captureRate)
+                    txPacketCount++
+                    continue
                 }
 
                 // Encode based on codec and capture sample rate.
@@ -1273,7 +1312,7 @@ class RtpSession(
                         "drop=$rxDropped under=$underruns trim=$trimmedFrames " +
                         "gates:echo=$echoGatedFrames noise=$noiseGatedFrames fwd=$forwardedFrames dt=$doubleTalkFrames" +
                         getCpuStats()
-                Log.i(TAG, "RTP: $stats")
+                Log.i(TAG, "${if (externalPcm == null) "RTP" else "WebRTC PCM frames"}: $stats")
                 listener?.onRtpStats(stats)
 
                 val elapsed = System.currentTimeMillis() - lastRtpReceivedTime
@@ -1418,14 +1457,14 @@ class RtpSession(
     }
 
     /** Mute or unmute the agent towards the caller. */
-    fun setAgentMuted(on: Boolean) {
+    override fun setAgentMuted(on: Boolean) {
         agentMuted = on
         Log.i(TAG, if (on) "Agent MUTED towards caller" else "Agent unmuted")
         listener?.onRtpStats(if (on) "Agent muted" else "Agent unmuted")
     }
 
     /** Turn the speaker monitor on or off mid-call.  Safe to call repeatedly. */
-    fun setMonitorEnabled(on: Boolean) {
+    override fun setMonitorEnabled(on: Boolean) {
         if (on) {
             if (monitorTrack != null) return
             try {
@@ -1595,7 +1634,7 @@ class RtpSession(
 
                 // Decode based on codec.  G.722 outputs 16 kHz natively;
                 // PCMA always decodes to 8 kHz (playbackRate==8000).
-                val pcm = when (payloadType) {
+                val pcm = if (externalPcm != null) encoded else when (payloadType) {
                     RtpPacket.PT_G722 -> g722Decoder.decodeToBytes(encoded)
                     RtpPacket.PT_PCMA -> {
                         if (playbackRate == 8000) PcmaCodec.decode8k(encoded)

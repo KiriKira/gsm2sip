@@ -1,0 +1,12 @@
+{
+  "batch": "20261019-independent-go-rtc",
+  "branch": "ci/webrtc-sip-debug-20261017",
+  "main_commits": {
+    "gsm2sip": "2437f6a9508d67a48b48bd5dcc8529ac7e2b7e17",
+    "gsm2sip-server": "b15b8df5be574589d30ed4141f334b4e8f587cd4",
+    "gsm2sip-client-android": "1a7188918bddbfeadc4c92c77ed8381dcc0d2308"
+  },
+  "transport": "Go/HTTPS RTC control + native WebRTC; optional existing SIP compatibility",
+  "webrtc": "Independent call control, real Android virtual modem/Telecom and native synthetic-PCM joint validation; physical HAL audio requires handset validation",
+  "android_debug_signing": "Published Android debug builds use the existing repository Release signing secret; local instrumentation uses a separate lab key and is never published"
+}

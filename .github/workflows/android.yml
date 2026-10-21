@@ -27,10 +27,58 @@ jobs:
       - run: bash -n build.sh tools/check-device.sh magisk/install.sh magisk/service.sh
       - run: sh tools/test-magisk-runtime.sh
       - run: SKIP_INSTALL=1 bash build.sh debug
+      - name: Record debug build identity
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          info = json.loads(Path('debug-batch.json').read_text())
+          info.update(source_commit=os.environ['GITHUB_SHA'], run_url=os.environ['GITHUB_SERVER_URL'] + '/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + os.environ['GITHUB_RUN_ID'])
+          info['sha256'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in Path('app/build/outputs/apk/debug').glob('*.apk')}
+          if Path('gateway-magisk.zip').exists():
+              info['sha256']['gateway-magisk.zip'] = hashlib.sha256(Path('gateway-magisk.zip').read_bytes()).hexdigest()
+          Path('BUILD-INFO.json').write_text(json.dumps(info, indent=2) + '\n')
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: gateway-development-apk
           path: |
             app/build/outputs/apk/debug/app-debug.apk
             gateway-magisk.zip
+            BUILD-INFO.json
+            DEBUG-BATCH.md
+          if-no-files-found: error
+
+  webrtc-probe:
+    name: Isolated synthetic WebRTC probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+      - uses: gradle/actions/setup-gradle@v4
+      - run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - run: python3 -m unittest discover -s probes/webrtc/tools -p 'test_*.py'
+      - run: bash gradlew -p probes/webrtc assembleDebug testDebugUnitTest --no-daemon --max-workers=2
+      - name: Hash probe APK and record source
+        run: |
+          sha256sum probes/webrtc/build/outputs/apk/debug/*.apk > probes/webrtc/build/SHA256SUMS
+          git rev-parse HEAD > probes/webrtc/build/SOURCE-COMMIT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webrtc-synthetic-probe
+          path: |
+            probes/webrtc/build/outputs/apk/debug/*.apk
+            probes/webrtc/build/webrtc-sdk/provenance.json
+            probes/webrtc/build/test-results/testDebugUnitTest/
+            probes/webrtc/build/SHA256SUMS
+            probes/webrtc/build/SOURCE-COMMIT
+            probes/webrtc/README.md
           if-no-files-found: error

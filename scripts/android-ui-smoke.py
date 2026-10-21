@@ -25,6 +25,7 @@ import xml.etree.ElementTree as ET
 
 ADB_TIMEOUT_SECONDS = 30
 UI_WAIT_SECONDS = 45
+SUPPLEMENTAL_TIMEOUT_SECONDS = 180
 SYNTHETIC_SERVER = "https://ui-smoke.invalid"
 SYNTHETIC_DEVICE = "UI_Smoke_Fold_35"
 EXPECTED_CHECKS = (
@@ -1472,6 +1473,103 @@ class Smoke:
         self.test_fold_unfold()
         self.test_cutout()
         self.test_backup_ui()
+        if self.args.supplemental_test_apk:
+            self.test_supplemental_group4()
+
+    def test_supplemental_group4(self) -> None:
+        """Optionally run the separately built restore/layout supplement on this AVD."""
+        if self.args.scenario != "gateway":
+            self.record("group4_supplement", "fail", "the supplemental runner targets the Gateway app")
+            return
+
+        # The official UI journey exercises fold/unfold on the main screen and
+        # backup screen. Re-issue the emulator's real unfold command directly
+        # before the wide-layout supplement so its 720dp assertion starts from
+        # a known open posture. Keep the actual device-state and display data
+        # alongside the screenshots; never emulate wide mode with `wm size`.
+        unfold = self.command(["emu", "unfold"], timeout=ADB_TIMEOUT_SECONDS,
+                              label="group4_unfold_preflight")
+        unfold_text = str(unfold.stdout) + unfold.stderr.decode("utf-8", errors="replace")
+        self.wait(6)
+        unfolded = self.device_snapshot("group4_preflight_unfolded")
+        open_state = bool(re.search(r"\bname\s*=\s*['\"]?OPENED\b", unfolded["state"], re.IGNORECASE))
+        preflight_ok = unfold.returncode == 0 and open_state
+        detail = (f"unfold exit={unfold.returncode}; output={unfold_text.strip()!r}; "
+                  f"wm size={unfolded['size']!r}; committed state={unfolded['state']!r}")
+        self.record("group4_unfold_preflight", "pass" if preflight_ok else "fail", detail)
+        if not preflight_ok:
+            self.record("group4_supplement", "fail",
+                        "supplement requires the emulator's real OPENED state; see group4_preflight_unfolded_device_snapshot.txt")
+            return
+        try:
+            self.capture("group4-preflight-unfolded")
+        except Exception as exc:
+            self.record("group4_supplement", "fail",
+                        f"could not capture the unfolded preflight screen: {type(exc).__name__}: {exc}")
+            return
+
+        apk = Path(self.args.supplemental_test_apk).resolve()
+        evidence = self.artifacts / "group4-supplement"
+        evidence.mkdir(parents=True, exist_ok=True)
+        if not apk.is_file():
+            self.record("group4_supplement", "fail", f"test APK not found: {apk}")
+            return
+
+        install = self.command(["install", "-r", str(apk)], timeout=ADB_TIMEOUT_SECONDS,
+                               label="install_group4_test_apk")
+        if install.returncode != 0:
+            self.record("group4_supplement", "fail", f"test APK install failed: {str(install.stderr).strip()}")
+            return
+
+        component = f"{self.package}.test/com.callagent.lab.GatewayUiGroup4Instrumentation"
+        run = self.command(["shell", "am", "instrument", "-w", "-r", component],
+                           timeout=SUPPLEMENTAL_TIMEOUT_SECONDS, label="run_group4_instrumentation")
+        run_text = str(run.stdout) + "\n" + str(run.stderr)
+        (evidence / "instrumentation.log").write_text(run_text, encoding="utf-8")
+        if run.returncode != 0:
+            self.record("group4_supplement", "fail", f"instrumentation exited {run.returncode}; see group4-supplement/instrumentation.log")
+            return
+
+        report_command = self.command(["shell", "run-as", self.package, "cat", "files/ui-group4-report.json"],
+                                     timeout=ADB_TIMEOUT_SECONDS, label="read_group4_report")
+        if report_command.returncode != 0:
+            self.record("group4_supplement", "fail", "could not read the instrumentation report; see group4-supplement/instrumentation.log")
+            return
+        try:
+            result = json.loads(str(report_command.stdout))
+        except (json.JSONDecodeError, TypeError) as exc:
+            self.record("group4_supplement", "fail", f"could not read instrumentation report ({exc}); see group4-supplement/instrumentation.log")
+            return
+        (evidence / "report.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+
+        screenshot_errors: list[str] = []
+        for image in result.get("screenshots", []):
+            name = image.get("name", "")
+            if not re.fullmatch(r"settings-(top|middle|bottom|part-\d{2})|records-(all|incoming|outgoing)|logs", name):
+                continue
+            pulled = self.command(["exec-out", "run-as", self.package, "cat", f"files/ui-group4/{name}.png"],
+                                  binary=True, timeout=ADB_TIMEOUT_SECONDS,
+                                  label=f"pull_group4_{name}")
+            if pulled.returncode != 0 or not pulled.stdout:
+                screenshot_errors.append(name)
+            else:
+                (evidence / f"{name}.png").write_bytes(pulled.stdout)
+
+        expected_images = {"settings-top", "settings-middle", "settings-bottom", "records-all",
+                           "records-incoming", "records-outgoing", "logs"}
+        saved_images = {image.get("name") for image in result.get("screenshots", [])}
+        missing_images = sorted(expected_images - saved_images)
+        report_status = result.get("status")
+        if report_status == "PASS" and not screenshot_errors and not missing_images:
+            self.record("group4_supplement", "pass",
+                        f"state/layout checks passed; {len(saved_images)} dark screenshots saved under group4-supplement/")
+        else:
+            detail = f"instrumentation report status={report_status!r}"
+            if screenshot_errors:
+                detail += f"; screenshot pull failures={screenshot_errors}"
+            if missing_images:
+                detail += f"; missing screenshots={missing_images}"
+            self.record("group4_supplement", "fail", detail)
 
     def finish(self, fatal: str | None = None) -> int:
         if fatal:
@@ -1554,6 +1652,8 @@ def parse_args() -> argparse.Namespace:
                         help="expected Android API level (defaults to 35 to preserve existing workflows)")
     parser.add_argument("--artifact-dir", default="artifacts/android-ui-smoke")
     parser.add_argument("--serial", help="ADB serial; defaults to ANDROID_SERIAL or emulator-5554")
+    parser.add_argument("--supplemental-test-apk",
+                        help="optional Gateway Group 4 androidTest APK, run after the strict UI smoke on the same device")
     return parser.parse_args()
 
 

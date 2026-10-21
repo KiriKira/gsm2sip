@@ -866,7 +866,9 @@ class Smoke:
             gateway_home = self.find_node(root, "navHome") if self.args.scenario == "gateway" else None
             if gateway_home is not None and self.find_node(root, entry_id) is None:
                 self.tap_id(root, "navHome")
-                root = self.wait_for_app_tree(lambda tree: self.find_node(tree, entry_id) is not None,
+                # The status page is long; the entry may sit below the fold,
+                # where UIAutomator does not report it until scrolled to.
+                root = self.wait_for_app_tree(lambda tree: self.find_node(tree, "tabHome") is not None,
                                               "gateway_home_sms_backup")
             root = self.ensure_node_visible(root, entry_id)
             root = self.capture(f"main-backup-entry-{self.args.scenario}")

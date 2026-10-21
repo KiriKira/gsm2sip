@@ -30,7 +30,10 @@ class GatewayMaterialLayoutTest {
             val navigation = main.findViewById<View>(R.id.bottomNavigation)
             assertTrue(navigation is BottomNavigationView)
             assertEquals(3, (navigation as BottomNavigationView).menu.size())
-            assertFalse(main.findViewById<EditText>(R.id.etControlPairingCode).isSaveEnabled)
+            val code = main.findViewById<EditText>(R.id.etControlPairingCode)
+            assertFalse(code.isSaveEnabled)
+            assertTrue("the one-time pairing code must be masked",
+                code.transformationMethod is android.text.method.PasswordTransformationMethod)
             for (page in listOf(R.id.tabHome, R.id.tabTraffic, R.id.tabConfig, R.id.tabLogs)) {
                 assertNotNull(main.findViewById<View>(page))
             }

@@ -572,7 +572,9 @@ class MainActivity : AppCompatActivity() {
             id = R.id.etControlPairingCode
             isSaveEnabled = false
             isSaveFromParentEnabled = false
-            setSingleLine(true)
+            // Not setSingleLine(): it replaces the password transformation
+            // and would show the one-time code in clear text.
+            maxLines = 1
         }
         form.addView(codeField)
         controlPairButton = button("配对网关").apply {

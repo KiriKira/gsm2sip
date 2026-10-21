@@ -129,7 +129,9 @@ class MeshNodesSection(
         val edit = TextInputEditText(layout.context).apply {
             inputType = type
             isSaveEnabled = false
-            setSingleLine(true)
+            // Not setSingleLine(): it would replace the password
+            // transformation of the pairing code field.
+            maxLines = 1
         }
         layout.addView(edit)
         return layout to edit

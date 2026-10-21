@@ -72,9 +72,35 @@ class GatewayJointInstrumentation:Instrumentation(){
             if(!reuse)api.pair(config.getString("pairing_code"),"RTC joint emulator gateway")
             val paired=checkNotNull(CredentialStore.load(targetContext))
             stage="bind_emulated_sim"
-            val snapshot=SimRegistry.snapshot(targetContext,includeVoice=true)
+            var snapshot=SimRegistry.snapshot(targetContext,includeVoice=true)
             check(snapshot.subscriptions.isNotEmpty()){"emulator_sim_missing"}
             check(snapshot.subscriptions.all{it.voiceAvailable}){"real_emulator_telecom_account_unavailable"}
+            // A fingerprint-less virtual SIM needs explicit local confirmation
+            // after an AVD reboot. The lab operator identifies the retained
+            // modem/card; use the normal proposal/confirmation contracts and
+            // registry checks, keeping its original server SIM UUID.
+            val retainedSim=config.optString("reconfirm_retained_emulator_sim")
+            if(retainedSim.isNotEmpty()){
+                check(reuse && snapshot.ownerGatewayId==paired.gatewayId)
+                val previous=snapshot.mappings.single()
+                val subscription=snapshot.subscriptions.single()
+                check(previous.simId==retainedSim && previous.subscriptionId==subscription.subscriptionId && previous.slotIndex==subscription.slotIndex)
+                val operation=UUID.fromString(config.getString("reconfirm_operation_id")).toString()
+                val mappings=JSONArray().put(JSONObject().put("slot_index",subscription.slotIndex)
+                    .put("label","Emulated SIM").put("carrier_name",subscription.carrierName).put("phone_number",JSONObject.NULL)
+                    .put("existing_sim_id",retainedSim).put("same_sim_verified",true))
+                val proposal=api.proposeSimBindings(operation,mappings)
+                check(proposal.mappings.single().simId==retainedSim)
+                api.confirmSimBindings(proposal.operationId,JSONArray().put(JSONObject().put("sim_id",retainedSim)
+                    .put("confirmed",true).put("slot_index",subscription.slotIndex)))
+                if(snapshot.mappingRevision<proposal.mappingRevision){
+                    SimRegistry.confirmMappings(targetContext,listOf(SimRegistry.SimBindingConfirmation(retainedSim,subscription.subscriptionId)),proposal.mappingRevision)
+                }
+                snapshot=SimRegistry.snapshot(targetContext,includeVoice=true)
+                check(snapshot.mappings.single().identityState!=SimRegistry.IdentityState.UNVERIFIED)
+                config.remove("reconfirm_retained_emulator_sim");config.remove("reconfirm_operation_id")
+                targetContext.filesDir.resolve("joint-fixture.json").writeText(config.toString())
+            }
             val confirmed=if(reuse){
                 check(snapshot.ownerGatewayId==paired.gatewayId){"resume_gateway_identity_changed"}
                 check(snapshot.ownerControlBaseUrl==paired.controlBaseUrl){"resume_gateway_origin_changed"}

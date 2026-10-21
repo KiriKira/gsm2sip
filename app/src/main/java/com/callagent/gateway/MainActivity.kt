@@ -345,7 +345,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(14), dp(8), dp(14), dp(8))
             isClickable = true
             isFocusable = true
-            minHeight = dp(40)
+            minHeight = dp(48)
             gravity = Gravity.CENTER_VERTICAL
             setOnClickListener { onStatusPillClicked() }
         }

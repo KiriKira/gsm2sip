@@ -1452,16 +1452,18 @@ class Smoke:
         self.record("emulator_boot", "pass", f"device {self.serial} boot completed")
         device_info = {
             "requested_avd_profile": self.args.device_profile,
+            "expected_api": self.args.expected_api,
             "sdk": self.shell("getprop", "ro.build.version.sdk", label="device_api_level"),
             "release": self.shell("getprop", "ro.build.version.release", label="device_android_release"),
             "model": self.shell("getprop", "ro.product.model", label="device_model"),
             "fingerprint": self.shell("getprop", "ro.build.fingerprint", label="device_fingerprint"),
         }
         (self.artifacts / "device_metadata.json").write_text(json.dumps(device_info, indent=2) + "\n", encoding="utf-8")
-        if device_info["sdk"] == "35":
+        if device_info["sdk"] == str(self.args.expected_api):
             self.record("emulator_api_level", "pass", f"API {device_info['sdk']} / {device_info['release']}; profile={self.args.device_profile}")
         else:
-            self.record("emulator_api_level", "fail", f"expected API 35, observed {device_info['sdk']!r}")
+            self.record("emulator_api_level", "fail",
+                        f"expected API {self.args.expected_api}, observed {device_info['sdk']!r}")
         self.check_apk_install()
         self.launch()
         self.refuse_system_prompts()
@@ -1493,6 +1495,7 @@ class Smoke:
             "scope": "unpaired host UI and shared SMS backup screen" if self.args.scenario == "host"
                      else "unpaired gateway UI and shared SMS backup screen",
             "device_profile": self.args.device_profile,
+            "expected_api": self.args.expected_api,
             "package": self.package,
             "serial": self.serial,
             "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -1517,7 +1520,7 @@ class Smoke:
             json.dumps(screenshot_manifest, indent=2) + "\n", encoding="utf-8"
         )
         summary = [f"# Android UI smoke: {overall.upper()}", "", f"- Scenario: `{self.args.scenario}`",
-                   f"- Scope: {result['scope']}", f"- Device profile: `{self.args.device_profile}` (API 35 expected)",
+                   f"- Scope: {result['scope']}", f"- Device profile: `{self.args.device_profile}` (API {self.args.expected_api} expected)",
                    "- This covers the unpaired UI path only; it does not establish paired dashboard, SIM, call, or physical foldable-device behavior.",
                    "- Only the generated synthetic SMS Backup & Restore fixture is imported into the local read-only archive; no real session or call is created, and nothing is sent or written to the system SMS provider.",
                    "- Rotation, fold, and cutout checks include the backup screen and synthetic-only inputs.",
@@ -1547,6 +1550,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--package", required=True, help="Android application ID")
     parser.add_argument("--scenario", required=True, choices=("host", "gateway"))
     parser.add_argument("--device-profile", default="unspecified", help="AVD profile configured by the caller")
+    parser.add_argument("--expected-api", type=int, default=35,
+                        help="expected Android API level (defaults to 35 to preserve existing workflows)")
     parser.add_argument("--artifact-dir", default="artifacts/android-ui-smoke")
     parser.add_argument("--serial", help="ADB serial; defaults to ANDROID_SERIAL or emulator-5554")
     return parser.parse_args()

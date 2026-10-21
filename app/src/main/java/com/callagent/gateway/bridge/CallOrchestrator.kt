@@ -27,6 +27,23 @@ import java.util.concurrent.Future
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
+/** Use fresh call-control authority before classifying a closed RTC leg as a media failure. */
+internal fun rtcCallHasTerminalIntent(readControlSnapshot: () -> JSONObject?): Boolean {
+    val snapshot = runCatching(readControlSnapshot).getOrNull() ?: return false
+    return snapshot.optBoolean("end_requested") || snapshot.optString("state") == "ended"
+}
+
+/** Deliver the reconciled result only while it still belongs to the active call generation. */
+internal fun dispatchRtcClosureIfCurrent(
+    isCurrent: () -> Boolean,
+    remoteEnd: Boolean,
+    onRemoteEnd: () -> Unit,
+    onMediaFailure: () -> Unit
+) {
+    if (!isCurrent()) return
+    if (remoteEnd) onRemoteEnd() else onMediaFailure()
+}
+
 /**
  * Bridges one cellular call at a time to a host through server call control
  * and native WebRTC audio.
@@ -165,7 +182,38 @@ class CallOrchestrator(
                 binding.getString("sim_id") == snapshot.getString("sim_id") && binding.getLong("mapping_revision") == snapshot.getLong("mapping_revision")) { "RTC_MEDIA_BINDING_CHANGED" }
             val media = RtcAudioSession(context, authorized, leg.node.api, true, pcm,
                 onDigit = { digit -> receiveRtcDigit(digit, gen) }, onFailure = { reason ->
-                    telecomHandler.post { if (rtcLegCurrent(id, gen)) tearDown("Media failed: $reason") }
+                    if (reason == "server_authorization_closed") {
+                        // Control state owns the cellular call; media closure can race ahead of
+                        // its 750 ms poll. Read that authority off Telecom's thread and outside
+                        // the orchestrator lock, then fence delivery to this call generation.
+                        val queued = runCatching {
+                            terminalReconcileWorker.execute {
+                                if (rtcLegCurrent(id, gen)) {
+                                    val remoteEnd = rtcCallHasTerminalIntent { leg.node.control.get(id) }
+                                    telecomHandler.post {
+                                        dispatchRtcClosureIfCurrent(
+                                            isCurrent = { rtcLegCurrent(id, gen) },
+                                            remoteEnd = remoteEnd,
+                                            onRemoteEnd = { tearDown("Remote ended") },
+                                            onMediaFailure = { tearDown("Media failed: $reason") }
+                                        )
+                                    }
+                                }
+                            }
+                        }.isSuccess
+                        if (!queued) {
+                            telecomHandler.post {
+                                dispatchRtcClosureIfCurrent(
+                                    isCurrent = { rtcLegCurrent(id, gen) },
+                                    remoteEnd = false,
+                                    onRemoteEnd = {},
+                                    onMediaFailure = { tearDown("Media failed: $reason") }
+                                )
+                            }
+                        }
+                    } else {
+                        telecomHandler.post { if (rtcLegCurrent(id, gen)) tearDown("Media failed: $reason") }
+                    }
                 }, onLog = { line -> listener?.onAudioStats(line) })
             synchronized(this) {
                 check(rtcLegCurrent(id, gen))
@@ -232,6 +280,9 @@ class CallOrchestrator(
     private var activeAudioSession: com.callagent.gateway.audio.CallAudioSession? = null
     @Volatile private var activeMedia: PreparedMedia? = null
     private val mediaWorker = Executors.newSingleThreadExecutor()
+    private val terminalReconcileWorker: ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "rtc-terminal-reconcile").apply { isDaemon = true }
+    }
     @Volatile private var dtmfQueuedUntil = 0L
     @Volatile private var activeGsmCall: Call? = null
     @Volatile private var activeGsmMapping: SimRegistry.SimMapping? = null
@@ -326,6 +377,7 @@ class CallOrchestrator(
         cancelPendingInboundWork()
         inboundWorker.shutdownNow()
         mediaWorker.shutdownNow()
+        terminalReconcileWorker.shutdownNow()
         tearDown("Orchestrator stopped", ledgerStateOverride = "unknown")
         GsmCallManager.listener = null
         timers.shutdownNow()

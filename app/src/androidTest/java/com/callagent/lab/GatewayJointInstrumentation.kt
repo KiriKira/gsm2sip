@@ -42,10 +42,14 @@ class GatewayJointInstrumentation:Instrumentation(){
     }
     override fun onStart(){
         var activity:Activity?=null
+        var automation:android.app.UiAutomation?=null
         val result=JSONObject().put("scope","real_gateway_service_rtc_telecom_with_synthetic_cellular_pcm")
         try{
             check(android.os.Build.SUPPORTED_ABIS.contains("x86_64")){"emulator_only"}
-            uiAutomation.adoptShellPermissionIdentity()
+            // Only shell permissions are needed here. Leave accessibility free
+            // for the UI smoke runner while this long-lived fixture is active.
+            automation=getUiAutomation(if(android.os.Build.VERSION.SDK_INT>=31)
+                android.app.UiAutomation.FLAG_DONT_USE_ACCESSIBILITY else 0).also{it.adoptShellPermissionIdentity()}
             val telecom=targetContext.getSystemService(android.telecom.TelecomManager::class.java)
             val telephony=targetContext.getSystemService(android.telephony.TelephonyManager::class.java)
             val accountDiagnostics=JSONArray()
@@ -133,7 +137,7 @@ class GatewayJointInstrumentation:Instrumentation(){
             result.put("status","PASS")
         }catch(failure:Throwable){result.put("status","FAIL").put("error",failure.javaClass.simpleName+":"+failure.message)}
         finally{
-            runCatching{uiAutomation.dropShellPermissionIdentity()}
+            runCatching{automation?.dropShellPermissionIdentity()}
             GatewayService.orchestratorFactoryForInstrumentation=null
             runCatching{onMain{GatewayService.stop(targetContext);activity?.finish()}}
             tones.forEach{it.close()};result.put("stage",stage)

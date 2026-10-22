@@ -50,9 +50,9 @@ internal fun dispatchRtcClosureIfCurrent(
  *
  * INBOUND (someone calls a SIM in this phone):
  *   1. GSM rings → the call is offered to every paired server node
- *   2. A host accepts → its WebRTC media connects → this phone commits the
- *      host as the durable winner and answers the GSM call
- *   3. GSM goes active → cellular PCM flows over WebRTC
+ *   2. A host accepts → WebRTC SDP is committed → this phone commits the
+ *      host as the durable winner and answers GSM while ICE connects
+ *   3. GSM and WebRTC both go active → cellular PCM flows over WebRTC
  *
  * OUTBOUND (a host dials through a SIM here):
  *   1. A host reserves the call; its control snapshot reaches this phone
@@ -221,23 +221,36 @@ class CallOrchestrator(
             }
             media.start()
             val connectedUntil = System.nanoTime() + 20_000_000_000L
-            while (rtcLegCurrent(id, gen) && System.nanoTime() < connectedUntil && !media.isClosed) {
-                if (media.awaitConnected(250)) break
-            }
-            check(rtcLegCurrent(id, gen) && media.isConnected) { "RTC_MEDIA_NOT_CONNECTED" }
-            val fresh = outboundMappingResolver(context, snapshot.getString("sim_id"), revision)
-            check(fresh == mapping) { "RTC_SIM_CHANGED_BEFORE_DISPATCH" }
             if (incoming) {
+                while (rtcLegCurrent(id, gen) && System.nanoTime() < connectedUntil && !media.isClosed) {
+                    if (media.awaitNegotiated(250)) break
+                }
+                check(rtcLegCurrent(id, gen) && !media.isClosed && media.awaitNegotiated(0)) { "RTC_MEDIA_NOT_NEGOTIATED" }
+                val fresh = outboundMappingResolver(context, snapshot.getString("sim_id"), revision)
+                check(fresh == mapping) { "RTC_SIM_CHANGED_BEFORE_DISPATCH" }
                 val candidate = snapshot.getString("candidate_client_id")
-                // Local durable global winner precedes any per-node confirmation
-                // and the single real Telecom answer. Never claim a second node.
+                // Committed SDP authorizes winner confirmation. Waiting for ICE
+                // here can consume the cellular ringing window. PCM still waits
+                // for both peer connectivity and the real GSM ACTIVE callback.
                 check(GatewayDatabase.get(context).claimCallWinner(id, leg.node.gatewayId, candidate)) { "RTC_ANSWERED_ELSEWHERE" }
                 leg.node.control.operation(id, "winner", candidate)
                 rtcControl?.winner(id, leg.node.gatewayId)
                 telecomHandler.post {
-                    if (rtcLegCurrent(id, gen)) activeGsmCall?.answer(android.telecom.VideoProfile.STATE_AUDIO_ONLY)
+                    if (rtcLegCurrent(id, gen)) {
+                        activeGsmCall?.let { call ->
+                            Log.i("GsmRtc", "media=webrtc call_control=rtc call_id=$id event=cellular_answer_requested")
+                            call.answer(android.telecom.VideoProfile.STATE_AUDIO_ONLY)
+                        }
+                    }
                 }
-            } else {
+            }
+            while (rtcLegCurrent(id, gen) && System.nanoTime() < connectedUntil && !media.isClosed) {
+                if (media.awaitConnected(250)) break
+            }
+            check(rtcLegCurrent(id, gen) && media.isConnected) { "RTC_MEDIA_NOT_CONNECTED" }
+            if (!incoming) {
+                val fresh = outboundMappingResolver(context, snapshot.getString("sim_id"), revision)
+                check(fresh == mapping) { "RTC_SIM_CHANGED_BEFORE_DISPATCH" }
                 check(outboundAudioPreparation()) { "RTC_CELLULAR_CONFIGURATION_UNAVAILABLE" }
                 leg.node.control.operation(id, "dispatch")
                 check(rtcLegCurrent(id, gen))

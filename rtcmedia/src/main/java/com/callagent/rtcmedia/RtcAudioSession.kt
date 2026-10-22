@@ -53,6 +53,7 @@ class RtcAudioSession(
     private val closed=AtomicBoolean()
     private val started=AtomicBoolean()
     private val failed=AtomicBoolean()
+    private val negotiationLatch=CountDownLatch(1)
     private val connectionLatch=CountDownLatch(1)
     @Volatile private var peer:NativePeer?=null
     @Volatile var isConnected=false;private set
@@ -202,6 +203,9 @@ class RtcAudioSession(
             try {
                 val response=api.request("POST","/rtc/legs/$legId",command)
                 revision=response.getJSONObject("ack").getLong("revision")
+                // The server's winner authorization requires committed SDP,
+                // not completion of ICE gathering or peer connectivity.
+                if(kind=="answer")negotiationLatch.countDown()
                 if(kind!="candidate")event("${kind}_committed")
                 return
             }catch(failure:MediaApiException){
@@ -211,6 +215,8 @@ class RtcAudioSession(
             }
         }
     }
+    /** Gateway answer SDP is durably acknowledged; cellular winner CAS may now run. */
+    fun awaitNegotiated(timeoutMillis:Long):Boolean = negotiationLatch.await(timeoutMillis,TimeUnit.MILLISECONDS) && !closed.get()
     fun awaitConnected(timeoutMillis:Long):Boolean = connectionLatch.await(timeoutMillis,TimeUnit.MILLISECONDS) && peer?.isConnected==true && !closed.get()
     fun enableAudio(enabled:Boolean){desiredAudio=enabled;if(!closed.get())peer?.enableAudio(enabled)}
     fun mute(muted:Boolean){desiredMute=muted;if(!closed.get())peer?.mute(muted)}

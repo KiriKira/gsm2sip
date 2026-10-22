@@ -63,7 +63,7 @@ jobs:
             prerelease=false
           else
             tag="build-${GITHUB_RUN_NUMBER}-${sha7}"
-            version_name="0.4.0-${tag}"
+            version_name="0.4.1-${tag}"
             release_name="$tag"
             prerelease=true
             if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
@@ -335,7 +335,7 @@ jobs:
           fi
           {
             echo "GSM_RELEASE_VERSION_CODE=$version_code"
-            echo "GSM_RELEASE_VERSION_NAME=0.4.0-debug-build-${GITHUB_RUN_NUMBER}"
+            echo "GSM_RELEASE_VERSION_NAME=0.4.1-debug-build-${GITHUB_RUN_NUMBER}"
           } >> "$GITHUB_ENV"
       - name: Test gateway and build debuggable APK plus Magisk module
         run: |

@@ -396,7 +396,10 @@ class GatewayService : Service() {
                 GatewayBackgroundRuntime.userStopped(this)
             )
             if (mayRestore) {
-                if (startControlGateway()) return START_STICKY
+                if (startControlGateway()) {
+                    restoreVoiceIfReady()
+                    return START_STICKY
+                }
                 stopSelf(startId)
                 return START_NOT_STICKY
             }
@@ -408,7 +411,7 @@ class GatewayService : Service() {
         }
         when (intent?.action) {
             ACTION_START -> startGateway(intent)
-            ACTION_CONTROL_START -> startControlGateway()
+            ACTION_CONTROL_START -> if (startControlGateway()) restoreVoiceIfReady()
             ACTION_STOP -> stopGateway(userInitiated = true)
             ACTION_RELOAD_STATS -> reloadStats()
             ACTION_STATUS -> broadcastCurrentStatus()
@@ -1231,6 +1234,15 @@ class GatewayService : Service() {
         broadcastStatus(orchestrator?.bridgeState?.name ?: "IDLE", "Stats reloaded")
     }
 
+    /** Brings voice back after a reboot, upgrade or process restart once the
+     * user has started it, without the diagnostics tap, when the Magisk module
+     * and every permission the diagnostics checked are still in place. */
+    private fun restoreVoiceIfReady() {
+        if (voiceRuntimeStarted || initializing.get() || !GatewayBackgroundRuntime.mayAutoRestoreVoice(this)) return
+        broadcastLog("VOICE: restoring voice started earlier")
+        startGateway(Intent(this, GatewayService::class.java).setAction(ACTION_START))
+    }
+
     private fun startGateway(intent: Intent?) {
         val paired=CredentialStore.load(this)
         if(paired==null || (!stopped && orchestrator!=null)){startGatewayConfigured(intent);return}
@@ -2029,7 +2041,8 @@ class GatewayService : Service() {
         }
 
         fun start(context: Context): Boolean {
-            if (!GatewayBackgroundRuntime.recordExplicitEnable(context)) return false
+            if (!GatewayBackgroundRuntime.recordExplicitEnable(context) ||
+                !GatewayBackgroundRuntime.recordVoiceEnabled(context)) return false
             val intent = Intent(context, GatewayService::class.java).apply { action = ACTION_START }
             return try {
                 context.startForegroundService(intent)

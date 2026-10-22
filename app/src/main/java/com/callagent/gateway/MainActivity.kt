@@ -1868,8 +1868,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * A join link lists one-time gateway pairing codes for several server
-     * nodes. Unpaired, the first entry is the primary pairing (SIMs are then
+     * A join link lists join codes for several server nodes; both phones scan
+     * the same one. Unpaired, the first entry is the primary pairing (SIMs are then
      * confirmed as usual) and the rest become other nodes; paired, every
      * entry is added as another node.
      */
@@ -1878,9 +1878,9 @@ class MainActivity : AppCompatActivity() {
         if (!JoinLink.isJoinLink(link)) return
         // One-time secrets: never keep them in the intent for a recreate.
         source?.data = null
-        val entries = JoinLink.parse(link!!, "gateway")
+        val entries = JoinLink.parse(link!!)
         if (entries == null) {
-            Toast.makeText(this, "这个加入链接无效，或不是给旧手机用的。", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "这个加入链接无效或已过时，请在服务器上重新生成。", Toast.LENGTH_LONG).show()
             return
         }
         val paired = CredentialStore.load(this) != null
@@ -2600,15 +2600,7 @@ class MainActivity : AppCompatActivity() {
 
     /** Called only from the visible, explicitly selected voice diagnostic. */
     private fun requestVoicePermissions(): Boolean {
-        val permissions = mutableListOf(
-            Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.READ_PHONE_STATE,
-            Manifest.permission.CALL_PHONE,
-            Manifest.permission.ANSWER_PHONE_CALLS,
-            Manifest.permission.READ_CALL_LOG
-        )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) permissions.add(Manifest.permission.READ_PHONE_NUMBERS)
-        return requestMissingPermissions(permissions, REQ_VOICE_PERMS)
+        return requestMissingPermissions(GatewayBackgroundRuntime.VOICE_PERMISSIONS, REQ_VOICE_PERMS)
     }
 
     private fun requestMissingPermissions(permissions: List<String>, requestCode: Int): Boolean {

@@ -25,6 +25,7 @@ import xml.etree.ElementTree as ET
 
 ADB_TIMEOUT_SECONDS = 30
 UI_WAIT_SECONDS = 45
+SUPPLEMENTAL_TIMEOUT_SECONDS = 180
 SYNTHETIC_SERVER = "https://ui-smoke.invalid"
 SYNTHETIC_DEVICE = "UI_Smoke_Fold_35"
 EXPECTED_CHECKS = (
@@ -552,7 +553,7 @@ class Smoke:
     def app_specific_fields(self) -> tuple[str, str, str | None]:
         if self.args.scenario == "host":
             return "pairing_server", "pairing_device_name", None
-        return "etControlUrl", "etControlDeviceName", "btnHomeMenu"
+        return "etControlUrl", "etControlDeviceName", "navSettings"
 
     def open_settings_if_needed(self, root: ET.Element) -> ET.Element:
         server_id, _, trigger = self.app_specific_fields()
@@ -560,13 +561,11 @@ class Smoke:
         if self.args.scenario == "gateway":
             if server_node is None or not self.node_is_on_screen(server_node):
                 menu = next((node for node in self.nodes(root)
-                             if node.attrib.get("resource-id", "").endswith("/btnHomeMenu")), None)
-                if menu is None and trigger:
-                    menu = next((n for n in self.nodes(root) if n.attrib.get("content-desc", "") == "Menu"), None)
+                             if node.attrib.get("resource-id", "").endswith(f"/{trigger}")), None)
                 if menu is None:
-                    self.record("settings_navigation", "fail", "gateway home screen Menu control is missing")
-                    raise RuntimeError("Gateway home screen Menu control is missing")
-                self.tap_node(menu, "gateway_settings_menu")
+                    self.record("settings_navigation", "fail", "gateway Settings navigation item is missing")
+                    raise RuntimeError("Gateway Settings navigation item is missing")
+                self.tap_node(menu, "gateway_settings_navigation")
                 root = self.wait_for_app_tree(lambda tree: self.find_node(tree, server_id) is not None,
                                               "gateway_control_pairing_form")
                 self.record("settings_navigation", "pass", "opened Control server pairing from the visible gateway UI")
@@ -600,7 +599,7 @@ class Smoke:
                     else "gateway Control server pairing form reports 未配对")
         code_id = "pairing_code" if self.args.scenario == "host" else "etControlPairingCode"
         code_node = self.find_node(root, code_id)
-        code_hint = "一次性配对码" if self.args.scenario == "host" else "粘贴服务器生成的 gateway 配对码"
+        code_hint = "一次性配对码"
         if code_node is None:
             self.record("pairing_code_untouched", "blocked", "pairing code field is not exposed in the current UI hierarchy")
         elif (code_node.attrib.get("password", "false") != "true" or
@@ -865,11 +864,12 @@ class Smoke:
         entry_id = self.backup_entry_id()
         try:
             root = self.capture("main_backup_entry_preflight")
-            gateway_back = self.find_node(root, "btnConfigBack") if self.args.scenario == "gateway" else None
-            if gateway_back is not None and self.node_is_on_screen(gateway_back):
-                root = self.ensure_node_visible(root, "btnConfigBack")
-                self.tap_id(root, "btnConfigBack")
-                root = self.wait_for_app_tree(lambda tree: self.find_node(tree, entry_id) is not None,
+            gateway_home = self.find_node(root, "navHome") if self.args.scenario == "gateway" else None
+            if gateway_home is not None and self.find_node(root, entry_id) is None:
+                self.tap_id(root, "navHome")
+                # The status page is long; the entry may sit below the fold,
+                # where UIAutomator does not report it until scrolled to.
+                root = self.wait_for_app_tree(lambda tree: self.find_node(tree, "tabHome") is not None,
                                               "gateway_home_sms_backup")
             root = self.ensure_node_visible(root, entry_id)
             root = self.capture(f"main-backup-entry-{self.args.scenario}")
@@ -1453,16 +1453,18 @@ class Smoke:
         self.record("emulator_boot", "pass", f"device {self.serial} boot completed")
         device_info = {
             "requested_avd_profile": self.args.device_profile,
+            "expected_api": self.args.expected_api,
             "sdk": self.shell("getprop", "ro.build.version.sdk", label="device_api_level"),
             "release": self.shell("getprop", "ro.build.version.release", label="device_android_release"),
             "model": self.shell("getprop", "ro.product.model", label="device_model"),
             "fingerprint": self.shell("getprop", "ro.build.fingerprint", label="device_fingerprint"),
         }
         (self.artifacts / "device_metadata.json").write_text(json.dumps(device_info, indent=2) + "\n", encoding="utf-8")
-        if device_info["sdk"] == "35":
+        if device_info["sdk"] == str(self.args.expected_api):
             self.record("emulator_api_level", "pass", f"API {device_info['sdk']} / {device_info['release']}; profile={self.args.device_profile}")
         else:
-            self.record("emulator_api_level", "fail", f"expected API 35, observed {device_info['sdk']!r}")
+            self.record("emulator_api_level", "fail",
+                        f"expected API {self.args.expected_api}, observed {device_info['sdk']!r}")
         self.check_apk_install()
         self.launch()
         self.refuse_system_prompts()
@@ -1471,6 +1473,106 @@ class Smoke:
         self.test_fold_unfold()
         self.test_cutout()
         self.test_backup_ui()
+        if self.args.supplemental_test_apk:
+            self.test_supplemental_group4()
+
+    def test_supplemental_group4(self) -> None:
+        """Optionally run the separately built restore/layout supplement on this AVD."""
+        if self.args.scenario != "gateway":
+            self.record("group4_supplement", "fail", "the supplemental runner targets the Gateway app")
+            return
+
+        # The official UI journey exercises fold/unfold on the main screen and
+        # backup screen. Re-issue the emulator's real unfold command directly
+        # before the wide-layout supplement so its 720dp assertion starts from
+        # a known open posture. Keep the actual device-state and display data
+        # alongside the screenshots; never emulate wide mode with `wm size`.
+        unfold = self.command(["emu", "unfold"], timeout=ADB_TIMEOUT_SECONDS,
+                              label="group4_unfold_preflight")
+        unfold_text = str(unfold.stdout) + unfold.stderr.decode("utf-8", errors="replace")
+        self.wait(6)
+        unfolded = self.device_snapshot("group4_preflight_unfolded")
+        committed_lines = [line for line in unfolded["state"].split(" | ")
+                           if re.search(r"\bmCommittedState\s*=", line, re.IGNORECASE)]
+        committed_state = committed_lines[0] if committed_lines else ""
+        open_state = bool(re.search(r"\bname\s*=\s*['\"]?OPENED\b", committed_state, re.IGNORECASE))
+        preflight_ok = unfold.returncode == 0 and open_state
+        detail = (f"unfold exit={unfold.returncode}; output={unfold_text.strip()!r}; "
+                  f"wm size={unfolded['size']!r}; committed state={committed_state!r}")
+        self.record("group4_unfold_preflight", "pass" if preflight_ok else "fail", detail)
+        if not preflight_ok:
+            self.record("group4_supplement", "fail",
+                        "supplement requires the emulator's real OPENED state; see group4_preflight_unfolded_device_snapshot.txt")
+            return
+        try:
+            self.capture("group4-preflight-unfolded")
+        except Exception as exc:
+            self.record("group4_supplement", "fail",
+                        f"could not capture the unfolded preflight screen: {type(exc).__name__}: {exc}")
+            return
+
+        apk = Path(self.args.supplemental_test_apk).resolve()
+        evidence = self.artifacts / "group4-supplement"
+        evidence.mkdir(parents=True, exist_ok=True)
+        if not apk.is_file():
+            self.record("group4_supplement", "fail", f"test APK not found: {apk}")
+            return
+
+        install = self.command(["install", "-r", str(apk)], timeout=ADB_TIMEOUT_SECONDS,
+                               label="install_group4_test_apk")
+        if install.returncode != 0:
+            self.record("group4_supplement", "fail", f"test APK install failed: {str(install.stderr).strip()}")
+            return
+
+        component = f"{self.package}.test/com.callagent.lab.GatewayUiGroup4Instrumentation"
+        run = self.command(["shell", "am", "instrument", "-w", "-r", component],
+                           timeout=SUPPLEMENTAL_TIMEOUT_SECONDS, label="run_group4_instrumentation")
+        run_text = str(run.stdout) + "\n" + str(run.stderr)
+        (evidence / "instrumentation.log").write_text(run_text, encoding="utf-8")
+        if run.returncode != 0:
+            self.record("group4_supplement", "fail", f"instrumentation exited {run.returncode}; see group4-supplement/instrumentation.log")
+            return
+
+        report_command = self.command(["shell", "run-as", self.package, "cat", "files/ui-group4-report.json"],
+                                     timeout=ADB_TIMEOUT_SECONDS, label="read_group4_report")
+        if report_command.returncode != 0:
+            self.record("group4_supplement", "fail", "could not read the instrumentation report; see group4-supplement/instrumentation.log")
+            return
+        try:
+            result = json.loads(str(report_command.stdout))
+        except (json.JSONDecodeError, TypeError) as exc:
+            self.record("group4_supplement", "fail", f"could not read instrumentation report ({exc}); see group4-supplement/instrumentation.log")
+            return
+        (evidence / "report.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+
+        screenshot_errors: list[str] = []
+        for image in result.get("screenshots", []):
+            name = image.get("name", "")
+            if not re.fullmatch(r"settings-(top|middle|bottom|part-\d{2})|records-(all|incoming|outgoing)|logs", name):
+                continue
+            pulled = self.command(["exec-out", "run-as", self.package, "cat", f"files/ui-group4/{name}.png"],
+                                  binary=True, timeout=ADB_TIMEOUT_SECONDS,
+                                  label=f"pull_group4_{name}")
+            if pulled.returncode != 0 or not pulled.stdout:
+                screenshot_errors.append(name)
+            else:
+                (evidence / f"{name}.png").write_bytes(pulled.stdout)
+
+        expected_images = {"settings-top", "settings-middle", "settings-bottom", "records-all",
+                           "records-incoming", "records-outgoing", "logs"}
+        saved_images = {image.get("name") for image in result.get("screenshots", [])}
+        missing_images = sorted(expected_images - saved_images)
+        report_status = result.get("status")
+        if report_status == "PASS" and not screenshot_errors and not missing_images:
+            self.record("group4_supplement", "pass",
+                        f"state/layout checks passed; {len(saved_images)} dark screenshots saved under group4-supplement/")
+        else:
+            detail = f"instrumentation report status={report_status!r}"
+            if screenshot_errors:
+                detail += f"; screenshot pull failures={screenshot_errors}"
+            if missing_images:
+                detail += f"; missing screenshots={missing_images}"
+            self.record("group4_supplement", "fail", detail)
 
     def finish(self, fatal: str | None = None) -> int:
         if fatal:
@@ -1494,6 +1596,7 @@ class Smoke:
             "scope": "unpaired host UI and shared SMS backup screen" if self.args.scenario == "host"
                      else "unpaired gateway UI and shared SMS backup screen",
             "device_profile": self.args.device_profile,
+            "expected_api": self.args.expected_api,
             "package": self.package,
             "serial": self.serial,
             "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -1518,7 +1621,7 @@ class Smoke:
             json.dumps(screenshot_manifest, indent=2) + "\n", encoding="utf-8"
         )
         summary = [f"# Android UI smoke: {overall.upper()}", "", f"- Scenario: `{self.args.scenario}`",
-                   f"- Scope: {result['scope']}", f"- Device profile: `{self.args.device_profile}` (API 35 expected)",
+                   f"- Scope: {result['scope']}", f"- Device profile: `{self.args.device_profile}` (API {self.args.expected_api} expected)",
                    "- This covers the unpaired UI path only; it does not establish paired dashboard, SIM, call, or physical foldable-device behavior.",
                    "- Only the generated synthetic SMS Backup & Restore fixture is imported into the local read-only archive; no real session or call is created, and nothing is sent or written to the system SMS provider.",
                    "- Rotation, fold, and cutout checks include the backup screen and synthetic-only inputs.",
@@ -1548,8 +1651,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--package", required=True, help="Android application ID")
     parser.add_argument("--scenario", required=True, choices=("host", "gateway"))
     parser.add_argument("--device-profile", default="unspecified", help="AVD profile configured by the caller")
+    parser.add_argument("--expected-api", type=int, default=35,
+                        help="expected Android API level (defaults to 35 to preserve existing workflows)")
     parser.add_argument("--artifact-dir", default="artifacts/android-ui-smoke")
     parser.add_argument("--serial", help="ADB serial; defaults to ANDROID_SERIAL or emulator-5554")
+    parser.add_argument("--supplemental-test-apk",
+                        help="optional Gateway Group 4 androidTest APK, run after the strict UI smoke on the same device")
     return parser.parse_args()
 
 

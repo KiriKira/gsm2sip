@@ -1,5 +1,7 @@
 # 网关多节点（mesh）
 
+> **0.4.0 起**：网关已改名 Homura，SIP/RTP/SRTP/STUN 代码全部移除，通话只走服务器 HTTPS 呼叫控制与 WebRTC。本文中有关 SIP、Asterisk、ARI 的内容是历史记录。
+
 总体设计见 server 仓库 [docs/mesh.md](https://github.com/KiriKira/gsm2sip-server/blob/main/docs/mesh.md)。本文只说明旧手机一侧的实现。
 
 ## 主节点与其他节点
@@ -20,31 +22,28 @@
 | 节点 SIM 失效 | 节点心跳撤销 SIM 或返回 `SIM_MAPPING_CHANGED` 时清空该节点绑定，下一轮从主节点已确认 SIM 重新绑定；节点命令的 revision 必须等于该节点当前 revision，并在本地按主节点 revision 解析同一张物理 SIM，否则失败关闭。 |
 | 节点互不阻塞 | 每轮同步先处理主节点，再逐个处理其他节点；任一节点失败只记录在该节点状态里。主节点不可达时其他节点照常同步。 |
 
-## 通话（第二阶段）
+## 通话
 
-- 主节点启用语音后，每个其他节点在同步时自动开通自己的 SIP 端点（`/devices/self/sip-config` +
-  `sip-credentials/rotate`，重试键先落盘），凭据按节点加密保存（`MeshVoiceStore`）。语音运行时
-  为每个节点建立独立的 SIP 注册（`MeshVoiceClients`；默认 TLS + SRTP，节点的 SIP 配置声明
-  `transport: "udp"` 时改用 UDP 与明文 RTP，适合局域网或 Tailscale 内的节点），节点心跳上报该节点自己的
-  `sip_registered`，所以主手机在哪个节点上都能看到“可通话”。
-- **来电**：GSM 来电同时经主节点和每个已注册、已绑定该 SIM 的节点发出 INVITE（相同 `call_id`，
-  各带该节点的 SIM revision）。最先接通的一路胜出，其余用 CANCEL 取消；若取消与对方的 200 交叉，
-  先 ACK 再 BYE，不留下悬空对话。某一路失败而其他路仍在振铃时不结束通话。
-- **去电**：任一节点授权的 INVITE 都会被接受；节点授权的 revision 必须等于该节点当前绑定，
-  再按主节点 revision 解析同一张物理 SIM。通话账本以 `call_id` 唯一，同一通电话经其他节点
-  再到达时不会第二次拨号（主手机在多节点配置下自行铸造 `call_id`）。
-- 无论经过几个节点，旧手机同一时间只桥接一通电话；忙时返回 486。
+- 语音运行时为主节点和每个其他节点各运行一条 HTTPS 呼叫控制循环（`rtc/GatewayCallControl.kt`），
+  向每个节点登记 RTC 能力；不再开通或注册 SIP 端点。
+- **来电**：GSM 来电同时在每个就绪、已绑定该 SIM 的节点上创建同一 `call_id` 的来电（各带该节点的
+  SIM revision）。某个节点创建失败时跳过该节点，只要有一个节点成功就继续振铃。最先在主手机接听并接通
+  WebRTC 媒体的一路胜出：旧手机先在本地账本记录胜出节点，再通知该节点并接听 GSM；其余节点收到
+  `answered_elsewhere`。
+- **去电**：任一节点授权的去电都会被接受；节点授权的 revision 必须等于该节点当前绑定，
+  再按主节点 revision 解析同一张物理 SIM。通话账本以 `call_id` 唯一，同一通电话不会第二次拨号。
+- 无论经过几个节点，旧手机同一时间只桥接一通电话；忙时直接拒绝新的 GSM 来电。
 
 ## 一次加入多个节点
 
 设置页之外，旧手机也接受 `gsm2sip://join?...&role=gateway` 链接（服务器仓库
 `scripts/mesh-join-link.py --role gateway URL=CODE ...` 生成，相机扫码打开）。未配对时与第一个服务器
 配对（随后照常确认 SIM），其余加为其他节点；已配对时全部加为其他节点。“其他节点”列表显示每个节点
-是否已开通并注册通话。
+的同步状态。
 
 ## 当前限制
 
 - 其他节点目前只走 HTTPS 轮询（与控制循环同周期，约 30 秒）；主节点仍有 WSS 唤醒。
-- 来电在每个节点各发一路 SIP，会占用各节点的 SIP 连接；两端需能访问该节点配置的 SIP 与媒体端口。
+- 来电在每个节点各创建一路；主手机与旧手机都需能访问该节点的 HTTPS 与 TURN 端口。
 - 节点地址推荐 HTTPS，也接受 `http://`（含加入链接），仅应在可信局域网或 Tailscale 内使用。
 - 移除节点后，尚未上传到该节点的副本保留在本地，不会转给其他节点（其他节点已各有一份）。

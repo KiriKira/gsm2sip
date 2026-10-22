@@ -27,13 +27,10 @@ class GatewayBackgroundPolicyTest {
     @Test
     fun stickyRestartCannotResumeVoiceAndTaskManagerStopNeedsNewEnable() {
         assertFalse(GatewayBackgroundPolicy.mayRestoreVoice(
-            intentAction = null, sipConfigured = true, explicitStartAction = "voice-start"
+            intentAction = null, explicitStartAction = "voice-start"
         ))
         assertTrue(GatewayBackgroundPolicy.mayRestoreVoice(
-            intentAction = "voice-start", sipConfigured = true, explicitStartAction = "voice-start"
-        ))
-        assertFalse(GatewayBackgroundPolicy.mayRestoreVoice(
-            intentAction = "voice-start", sipConfigured = false, explicitStartAction = "voice-start"
+            intentAction = "voice-start", explicitStartAction = "voice-start"
         ))
         assertTrue(GatewayBackgroundPolicy.isTaskManagerStopAfterEnable(200, 100, 10, 10))
         assertFalse(GatewayBackgroundPolicy.isTaskManagerStopAfterEnable(99, 100, 10, 10))

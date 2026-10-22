@@ -1,5 +1,7 @@
 # Signed Android releases
 
+Homura 0.4.0 is the first release without SIP. Its package name is unchanged, so it installs over earlier gateway releases, and an earlier release can be installed back over it (see the versionCode note below). The server must be upgraded first; see the server repository's `docs/release-0.4.md` for the order and the rollback steps.
+
 The release workflow builds the APK with the repository's fixed Android signing key, verifies its certificate and package metadata, and packages those exact APK bytes inside the Magisk ZIP. It fails before building if the signing secrets or certificate pin are missing or do not match. CI never creates a replacement signing key.
 
 ## Configure signing once
@@ -37,7 +39,7 @@ The certificate fingerprint is public. Keep the keystore and passwords in the pr
 
 ## Build and publication triggers
 
-- Every push to `main` runs tests, lint, Magisk checks, and a signed release build. It publishes a prerelease named `build-<run number>-<short commit>`.
+- Every push to `main` runs tests, lint, Magisk checks, and a signed release build. It publishes a prerelease named `build-<run number>-<short commit>` with version name `0.4.0-build-<run number>-<short commit>`.
 - A tag matching `vMAJOR.MINOR.PATCH` publishes a stable release whose tag and version name are the tag itself.
 - `workflow_dispatch` defaults to `publish=true`. From `main`, set it to `false` to build and verify without creating a GitHub Release. Other branches run a debug-only validation build without release signing or publication; manually dispatched tags can build a signed artifact but do not publish.
 

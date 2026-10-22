@@ -27,7 +27,6 @@ object GatewaySetupChecklist {
         ENABLE_BACKGROUND,
         OPEN_BATTERY,
         OPEN_NOTIFICATIONS,
-        CONFIGURE_VOICE,
         START_VOICE,
         NONE
     }
@@ -42,11 +41,8 @@ object GatewaySetupChecklist {
         val backgroundRunning: Boolean,
         val notificationsEnabled: Boolean,
         val batteryExempt: Boolean,
-        val voiceConfigured: Boolean,
         val voiceRunning: Boolean,
-        val sipRegistered: Boolean,
-        val rtcControlReady: Boolean = false,
-        val rtcConfigured: Boolean = false
+        val callControlReady: Boolean
     )
 
     data class Step(
@@ -101,22 +97,14 @@ object GatewaySetupChecklist {
         }
 
         val voice = when {
-            !input.paired -> Step(StepId.VOICE, "远程通话（需 root）", "配对后可从服务器下发 SIP 配置。",
+            !input.paired -> Step(StepId.VOICE, "远程通话（需 root）", "配对后可启用远程通话。",
                 Status.BLOCKED, Action.NONE, null)
-            input.voiceRunning && input.rtcControlReady -> Step(StepId.VOICE, "远程通话（需 root）",
-                "Go/RTC 已就绪，主手机可经服务器接打电话。", Status.DONE, Action.NONE, null)
-            input.voiceRunning && input.rtcConfigured -> Step(StepId.VOICE, "远程通话（需 root）",
-                "RTC 控制正在连接，请查看运行日志。", Status.WARNING, Action.NONE, null)
-            input.rtcConfigured -> Step(StepId.VOICE, "远程通话（需 root）",
-                "服务器支持 Go/RTC。运行设备诊断确认 root 与通话音频后启动。", Status.OPTIONAL, Action.START_VOICE, "诊断并启动")
-            input.voiceRunning && input.sipRegistered -> Step(StepId.VOICE, "远程通话（需 root）",
-                "SIP 已注册，主手机可经服务器接打电话。", Status.DONE, Action.NONE, null)
+            input.voiceRunning && input.callControlReady -> Step(StepId.VOICE, "远程通话（需 root）",
+                "通话控制已就绪，主手机可经服务器接打电话。", Status.DONE, Action.NONE, null)
             input.voiceRunning -> Step(StepId.VOICE, "远程通话（需 root）",
-                "SIP 正在连接；若长时间未注册，请查看日志。", Status.WARNING, Action.NONE, null)
-            input.voiceConfigured -> Step(StepId.VOICE, "远程通话（需 root）",
-                "已有 SIP 配置。运行设备诊断确认 root 与通话音频后启动。", Status.OPTIONAL, Action.START_VOICE, "诊断并启动")
+                "通话控制正在连接；若长时间未就绪，请查看运行日志。", Status.WARNING, Action.NONE, null)
             else -> Step(StepId.VOICE, "远程通话（需 root）",
-                "仅收发短信可跳过。需要通话时从服务器获取 SIP 配置。", Status.OPTIONAL, Action.CONFIGURE_VOICE, "获取 SIP 配置")
+                "仅收发短信可跳过。运行设备诊断确认 root 与通话音频后启动。", Status.OPTIONAL, Action.START_VOICE, "诊断并启动")
         }
 
         val steps = listOf(pair, sims, background, voice)

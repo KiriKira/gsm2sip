@@ -29,6 +29,7 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
     private val closed=AtomicBoolean()
     private val nodes=ConcurrentHashMap<String,Node>()
     private val workers=ConcurrentHashMap<String,java.util.concurrent.ScheduledExecutorService>()
+    private val incomingOffers=ConcurrentHashMap<String,IncomingForkCoordinator>()
     private val reconciler=Executors.newSingleThreadScheduledExecutor { Thread(it,"RTC-Gateway-Nodes") }
     val ready: Boolean get()=nodes.values.any{it.ready}
     fun start(){reconciler.scheduleWithFixedDelay(::reconcile,0,10,TimeUnit.SECONDS)}
@@ -52,6 +53,9 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
             worker.scheduleWithFixedDelay({poll(node,client)},0,750,TimeUnit.MILLISECONDS)
         }
         (nodes.keys-wanted).forEach{id->workers.remove(id)?.shutdownNow();nodes.remove(id)}
+        runCatching{orchestrator.reconcileUnresolvedCellular()}.onFailure{
+            Log.w("GsmRtc","event=unknown_call_reconcile_failed error=${it.javaClass.simpleName}")
+        }
     }
     private fun poll(node:Node,client:ControlApiClient){
         if(closed.get())return
@@ -80,42 +84,69 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
             if(System.nanoTime()-node.lastSeen>15_000_000_000L)orchestrator.onRtcControlLost(node)
         }
     }
-    /** False means choose the SIP compatibility adapter BEFORE any invite.
-     * Once an RTC invitation is committed, errors end this call; never re-fork
-     * it over SIP. */
-    fun offerIncoming(mapping:SimRegistry.SimMapping,id:String,number:String,valid:()->Boolean):Boolean{
-        val candidates=nodes.values.toList()
-        if(candidates.isEmpty()||candidates.any{!it.checked||!it.supported}){
-            Log.i("GsmRtc","call_id=$id event=incoming_policy call_control=sip reason=node_capability_unknown_or_legacy")
-            return false
-        }
-        val eligible=candidates.filter{it.ready}
-        if(eligible.isEmpty())return false
-        if(eligible.any{it.api.request("GET","/rtc/control/incoming-policy",null).getString("call_control")!="rtc"}){
-            Log.i("GsmRtc","call_id=$id event=incoming_policy call_control=sip reason=participant_requires_compatibility")
-            return false
-        }
-        Log.i("GsmRtc","call_id=$id event=incoming_policy call_control=rtc nodes=${eligible.size}")
-        // All nodes selected RTC. A later race is a failed call, never permission
-        // to invite a second set of candidates using another control engine.
+    /** Offers the ringing cellular call to every ready node. A definite create
+     * failure is left out; an ambiguous response still counts as a possible offer.
+     * Once offered, errors end this call; it is never offered a second time. */
+    fun offerIncoming(mapping:SimRegistry.SimMapping,id:String,number:String,valid:()->Boolean){
+        val eligible=nodes.values.filter{it.supported && it.ready}
+        check(eligible.isNotEmpty()){"RTC_NO_READY_NODE"}
         check(GatewayDatabase.get(context).reserveRtcCellularSlot(id)){"RTC_CELLULAR_OCCUPIED"}
-        eligible.forEach{node->
-            check(valid()){"RTC_INCOMING_RETIRED"}
-            val revision=if(node.primary)mapping.mappingRevision else GatewayDatabase.get(context).meshNodeSims(node.gatewayId)
-                .firstOrNull{it.simId.equals(mapping.simId,true)&&it.state=="active"}?.mappingRevision
-            checkNotNull(revision){"RTC_NODE_SIM_NOT_BOUND"}
-            val snapshot=node.control.create(id,node.gatewayId,mapping.simId,revision,
-                "",true,number.takeIf{it.isNotBlank()})
-            orchestrator.onRtcControlSnapshot(node,snapshot)
+        val fork=IncomingForkCoordinator(eligible.map{it.gatewayId})
+        check(incomingOffers.putIfAbsent(id,fork)==null){"RTC_INCOMING_ALREADY_OFFERED"}
+        var offered=0
+        try {
+            for(node in eligible){
+                check(valid()){"RTC_INCOMING_RETIRED"}
+                if(!fork.beginCreate(node.gatewayId))break
+                var requestAttempted=false
+                var snapshot:JSONObject?=null
+                var failure:Throwable?=null
+                try{
+                    val revision=if(node.primary)mapping.mappingRevision else GatewayDatabase.get(context).meshNodeSims(node.gatewayId)
+                        .firstOrNull{it.simId.equals(mapping.simId,true)&&it.state=="active"}?.mappingRevision
+                    checkNotNull(revision){"RTC_NODE_SIM_NOT_BOUND"}
+                    requestAttempted=true
+                    snapshot=node.control.create(id,node.gatewayId,mapping.simId,revision,
+                        "",true,number.takeIf{it.isNotBlank()})
+                }catch(error:Throwable){failure=error}
+
+                val outcome=when{
+                    snapshot!=null->IncomingForkCoordinator.CreateOutcome.CREATED
+                    !requestAttempted->IncomingForkCoordinator.CreateOutcome.REJECTED
+                    failure?.let(::mayHaveCommittedCreate)==true->IncomingForkCoordinator.CreateOutcome.UNKNOWN
+                    else->IncomingForkCoordinator.CreateOutcome.REJECTED
+                }
+                val deliveries=fork.completeCreate(node.gatewayId,outcome)
+                deliveries.forEach{GatewayDatabase.get(context).queueRtcTerminal(id,it.nodeGatewayId,it.kind)}
+
+                if(snapshot!=null){
+                    offered++
+                    try{orchestrator.onRtcControlSnapshot(node,snapshot!!)}catch(error:Exception){
+                        Log.w("GsmRtc","call_id=$id event=incoming_snapshot_failed node=${node.gatewayId.take(8)} error=${error.javaClass.simpleName}")
+                    }
+                }else{
+                    Log.w("GsmRtc","call_id=$id event=incoming_offer_failed node=${node.gatewayId.take(8)} error=${failure?.javaClass?.simpleName?:"CreateRejected"}")
+                }
+            }
+            check(offered>0){"RTC_INCOMING_NOT_OFFERED"}
+            Log.i("GsmRtc","call_id=$id event=incoming_offered nodes=$offered")
+        }finally{
+            fork.finishOffers()
+            incomingOffers.remove(id,fork)
         }
-        return true
     }
     fun winner(id:String,winningNode:String){
-        nodes.values.filter{it.supported && it.gatewayId!=winningNode}.forEach{node->GatewayDatabase.get(context).queueRtcTerminal(id,node.gatewayId,"answered_elsewhere")}
+        val deliveries=incomingOffers[id]?.winner(winningNode)
+            ?:nodes.values.filter{it.supported && it.gatewayId!=winningNode}.map{IncomingForkCoordinator.TerminalDelivery(it.gatewayId,"answered_elsewhere")}
+        deliveries.forEach{GatewayDatabase.get(context).queueRtcTerminal(id,it.nodeGatewayId,it.kind)}
     }
     fun ended(id:String,state:String){
-        GatewayDatabase.get(context).completeRtcCellular(id,state,nodes.values.filter{it.supported}.map{it.gatewayId})
+        val fork=incomingOffers[id]
+        val terminalNodes=fork?.ended()?.map{it.nodeGatewayId}
+            ?:nodes.values.filter{it.supported}.map{it.gatewayId}
+        GatewayDatabase.get(context).completeRtcCellular(id,state,terminalNodes)
     }
+
     override fun close(){
         if(!closed.compareAndSet(false,true))return
         reconciler.shutdownNow();workers.values.forEach{it.shutdownNow()};workers.clear();nodes.clear()

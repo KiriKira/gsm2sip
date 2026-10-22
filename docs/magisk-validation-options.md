@@ -1,5 +1,7 @@
 # Magisk 模块验证环境调研
 
+> **0.4.0 起**：网关已改名 Homura，SIP/RTP/SRTP/STUN 代码全部移除，通话只走服务器 HTTPS 呼叫控制与 WebRTC。本文中有关 SIP、Asterisk、ARI 的内容是历史记录。
+
 实际采用的 GitHub Actions + KVM AVD 如何启动、下载结果、停止和复用，见 [Android 虚拟机使用指南](android-virtual-machine.md)。本页保留环境比较与详细验收证据。
 
 ## 最新实测结果（2026-10-05）

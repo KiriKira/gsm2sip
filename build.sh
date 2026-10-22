@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Build script for SIP-GSM Gateway APK + Magisk module.
+# Build script for the Homura gateway APK + Magisk module.
 #
 # Prerequisites:
 #   sudo ./setup.sh    # run once to install JDK, Android SDK, etc.
@@ -253,7 +253,7 @@ install_to_device() {
 
 # ── Main ─────────────────────────────────────────────
 
-echo "=== SIP-GSM Gateway Build ==="
+echo "=== Homura Gateway Build ==="
 echo ""
 
 check_java
@@ -280,4 +280,4 @@ echo "  Push gateway-magisk.zip and install via Magisk Manager, then reboot."
 echo "  The module includes the APK; avoid a second APK installation/signature conflict."
 echo "  Voice diagnostics request microphone/phone permissions and the default phone role."
 echo "  Root probe: su -c '/data/adb/modules/sip-gsm-gateway/bin/gsm2sipctl probe'"
-echo "  Calling requires configured server/host SIP and ARI plus validated cellular audio."
+echo "  Calling requires server RTC call control plus validated cellular audio."

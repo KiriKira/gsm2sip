@@ -13,7 +13,7 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "SipGsmGateway"
+rootProject.name = "Homura"
 include(":app")
 
 include(":rtcmedia")

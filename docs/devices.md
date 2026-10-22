@@ -1,5 +1,7 @@
 # Device validation ledger
 
+> **0.4.0 起**：网关已改名 Homura，SIP/RTP/SRTP/STUN 代码全部移除，通话只走服务器 HTTPS 呼叫控制与 WebRTC。本文中有关 SIP、Asterisk、ARI 的内容是历史记录。
+
 No target dual-SIM device has been connected to this development environment.
 The existing README's historical single-device audio reports are not evidence
 that the current three-component system works on either target SIM.

@@ -1199,7 +1199,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
     }
 
     /** Commit call identity and dispatching state atomically before Telecom or
-     * SIP work. Existing IDs, including recovered unknown rows, cannot dispatch again. */
+     * call control work. Existing IDs, including recovered unknown rows, cannot dispatch again. */
     fun beginCallDispatch(callId: String, simId: String, mappingRevision: Long, direction: String): Boolean =
         beginCallDispatchInternal(callId,simId,mappingRevision,direction,false)
 
@@ -1246,6 +1246,13 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             db.setTransactionSuccessful()
         } finally {db.endTransaction()}
     }
+    /** RTC calls whose cellular outcome was lost with the process or with call
+     * control. They keep the cellular slot until the call is known to be gone. */
+    fun unresolvedRtcCellularCalls(): List<String> = readableDatabase.rawQuery(
+        "SELECT l.call_id FROM rtc_cellular_slot s JOIN call_ledger l ON l.call_id=s.call_id WHERE l.state='unknown'",null
+    ).use{c->buildList{while(c.moveToNext())add(c.getString(0))}}
+    /** The primary pairing and every active mesh node, whether or not it is reachable now. */
+    fun callControlNodeIds(): List<String> = listOfNotNull(activeGatewayId())+meshNodes().map{it.gatewayId}
     fun acknowledgeRtcTerminal(callId: String,node: String) {
         writableDatabase.delete("rtc_control_terminals","call_id=? AND node_gateway_id=?",arrayOf(callId,node))
     }

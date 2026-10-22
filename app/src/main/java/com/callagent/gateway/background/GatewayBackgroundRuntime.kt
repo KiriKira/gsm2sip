@@ -298,8 +298,8 @@ internal object GatewayBackgroundPolicy {
     fun pairingIssue(sessionPresent: Boolean): String? =
         if (sessionPresent) null else "Pair this device with the control server"
 
-    fun mayRestoreVoice(intentAction: String?, sipConfigured: Boolean, explicitStartAction: String): Boolean =
-        intentAction == explicitStartAction && sipConfigured
+    fun mayRestoreVoice(intentAction: String?, explicitStartAction: String): Boolean =
+        intentAction == explicitStartAction
 
     fun holdVoiceLease(voiceRuntimeStarted: Boolean, callActive: Boolean): Boolean =
         voiceRuntimeStarted && callActive

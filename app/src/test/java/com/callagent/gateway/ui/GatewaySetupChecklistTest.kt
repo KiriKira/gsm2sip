@@ -13,8 +13,8 @@ class GatewaySetupChecklistTest {
     private val ready = Input(
         paired = true, smsPermissionsGranted = true, activeSimCount = 2, detectedSimCount = 2,
         proposalPending = false, backgroundEnabled = true, backgroundRunning = true,
-        notificationsEnabled = true, batteryExempt = true, voiceConfigured = false,
-        voiceRunning = false, sipRegistered = false
+        notificationsEnabled = true, batteryExempt = true,
+        voiceRunning = false, callControlReady = false
     )
 
     private fun step(input: Input, id: StepId) = GatewaySetupChecklist.build(input).steps.first { it.id == id }
@@ -48,12 +48,13 @@ class GatewaySetupChecklistTest {
     }
 
     @Test
-    fun voiceIsOptionalUntilRegistered() {
+    fun voiceIsOptionalUntilCallControlIsReady() {
         assertEquals("网关已就绪 · 短信", GatewaySetupChecklist.build(ready).headline)
-        assertEquals(Action.CONFIGURE_VOICE, step(ready, StepId.VOICE).action)
-        assertEquals(Action.START_VOICE, step(ready.copy(voiceConfigured = true), StepId.VOICE).action)
-        assertEquals(Status.WARNING, step(ready.copy(voiceConfigured = true, voiceRunning = true), StepId.VOICE).status)
-        val full = GatewaySetupChecklist.build(ready.copy(voiceConfigured = true, voiceRunning = true, sipRegistered = true))
+        assertEquals(Action.START_VOICE, step(ready, StepId.VOICE).action)
+        assertEquals(Status.OPTIONAL, step(ready, StepId.VOICE).status)
+        assertEquals(Status.WARNING, step(ready.copy(voiceRunning = true), StepId.VOICE).status)
+        assertEquals(Status.BLOCKED, step(ready.copy(paired = false), StepId.VOICE).status)
+        val full = GatewaySetupChecklist.build(ready.copy(voiceRunning = true, callControlReady = true))
         assertEquals("网关已就绪 · 短信与通话", full.headline)
     }
 }

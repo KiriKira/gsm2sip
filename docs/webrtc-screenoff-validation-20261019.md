@@ -1,5 +1,7 @@
 # 熄屏与同版本备用切换验证
 
+> **0.4.0 起**：网关已改名 Homura，SIP/RTP/SRTP/STUN 代码全部移除，通话只走服务器 HTTPS 呼叫控制与 WebRTC。本文中有关 SIP、Asterisk、ARI 的内容是历史记录。
+
 状态：PASS。Host `918ac34702778830b4a6441695238cf060e17e3c`；Gateway `740ca46bdf60fdae71d1059ccd6fa75513467a93`；Server `751f1a1540c62102811ae56fe3106c556e15f226`。
 
 本批修复 Go/RTC 轮询缺少 CPU 唤醒锁的问题。按三端一起升级、备用节点运行相同服务端版本验收；所有源码包含复核的 main。

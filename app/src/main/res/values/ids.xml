@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- View ids for the programmatic Homura screens. UI smoke tests and
+     instrumentation find controls by these names. -->
+<resources>
+    <item name="rootWindow" type="id" />
+    <item name="tabHome" type="id" />
+    <item name="tabTraffic" type="id" />
+    <item name="tabConfig" type="id" />
+    <item name="tabLogs" type="id" />
+    <item name="bottomNavigation" type="id" />
+    <item name="tvHomeStatusPill" type="id" />
+    <item name="homeCallCard" type="id" />
+    <item name="btnHomeMute" type="id" />
+    <item name="btnHomeSnoop" type="id" />
+    <item name="btnHomeEnd" type="id" />
+    <item name="btnHomeSmsBackup" type="id" />
+    <item name="tvNetMobile" type="id" />
+    <item name="tvNetWifi" type="id" />
+    <item name="tvSimSummary" type="id" />
+    <item name="btnStartGatewayDiagnostics" type="id" />
+    <item name="homeTrafficList" type="id" />
+    <item name="trafficFilter" type="id" />
+    <item name="btnFilterAll" type="id" />
+    <item name="btnFilterIncoming" type="id" />
+    <item name="btnFilterOutgoing" type="id" />
+    <item name="btnCfgClearRecents" type="id" />
+    <item name="etControlUrl" type="id" />
+    <item name="etControlDeviceName" type="id" />
+    <item name="etControlPairingCode" type="id" />
+    <item name="btnControlPair" type="id" />
+    <item name="btnControlRepair" type="id" />
+    <item name="tvControlStatus" type="id" />
+    <item name="btnMeshAdd" type="id" />
+    <item name="btnSimPropose" type="id" />
+    <item name="tvSimStatus" type="id" />
+    <item name="llSimBindings" type="id" />
+    <item name="btnSimConfirm" type="id" />
+    <item name="sbCfgAgentVolume" type="id" />
+    <item name="swCfgSilenceHandset" type="id" />
+    <item name="btnEnableSmsRecovery" type="id" />
+    <item name="btnScanSmsRecovery" type="id" />
+    <item name="btnCfgSmsBackup" type="id" />
+    <item name="swBackgroundEnabled" type="id" />
+    <item name="btnOpenNotificationSettings" type="id" />
+    <item name="btnOpenBatterySettings" type="id" />
+    <item name="btnCfgLogs" type="id" />
+    <item name="btnLogsBack" type="id" />
+    <item name="btnLogsCopy" type="id" />
+    <item name="btnLogsClear" type="id" />
+    <item name="svLog" type="id" />
+    <item name="tvLog" type="id" />
+</resources>

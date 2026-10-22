@@ -3,18 +3,17 @@ package com.callagent.gateway.bridge
 import android.telecom.TelecomManager
 
 /**
- * The GSM caller's number as it goes into the SIP From header.
+ * The GSM caller's number as the gateway log describes it.
  *
  * Android hands the number over as the network wrote it, which can include
- * spaces, dashes or brackets that a SIP URI user part cannot carry. A caller
- * with no number becomes "anonymous" rather than an empty user part, which
- * leaves the server with no number at all.
+ * spaces, dashes or brackets. A caller with no number is shown as
+ * "anonymous" rather than an empty string.
  */
 internal object CallerId {
     const val ANONYMOUS = "anonymous"
 
     /** Digits, a leading + and the * # keys; null when no number is left. */
-    fun sipUser(number: String?): String? {
+    fun normalized(number: String?): String? {
         val raw = number?.trim().orEmpty()
         if (raw.isEmpty() || raw.equals("unknown", ignoreCase = true)) return null
         val cleaned = buildString {
@@ -28,15 +27,15 @@ internal object CallerId {
         return cleaned.takeIf { value -> value.count { it in '0'..'9' } >= 2 }
     }
 
-    fun displayName(sipUser: String): String = if (sipUser == ANONYMOUS) "Anonymous" else sipUser
+    fun displayName(number: String): String = if (number == ANONYMOUS) "Anonymous" else number
 
     /**
-     * For the gateway's own log: the number exactly as Android gave it, what
-     * goes into the From header, and the network's presentation flag.
+     * For the gateway's own log: the number exactly as Android gave it, its
+     * normalized form, and the network's presentation flag.
      */
     fun describe(number: String?, presentation: Int?): String {
-        val sent = sipUser(number) ?: ANONYMOUS
-        return "from \"${number.orEmpty()}\", sent as $sent, presentation ${presentationName(presentation)}"
+        val sent = normalized(number) ?: ANONYMOUS
+        return "from \"${number.orEmpty()}\", normalized $sent, presentation ${presentationName(presentation)}"
     }
 
     private fun presentationName(presentation: Int?): String = when (presentation) {

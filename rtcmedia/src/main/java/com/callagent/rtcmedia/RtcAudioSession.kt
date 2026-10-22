@@ -53,6 +53,7 @@ class RtcAudioSession(
     private val closed=AtomicBoolean()
     private val started=AtomicBoolean()
     private val failed=AtomicBoolean()
+    private val negotiationLatch=CountDownLatch(1)
     private val connectionLatch=CountDownLatch(1)
     @Volatile private var peer:NativePeer?=null
     @Volatile var isConnected=false;private set
@@ -202,6 +203,9 @@ class RtcAudioSession(
             try {
                 val response=api.request("POST","/rtc/legs/$legId",command)
                 revision=response.getJSONObject("ack").getLong("revision")
+                // The server's winner authorization requires committed SDP,
+                // not completion of ICE gathering or peer connectivity.
+                if(kind=="answer")negotiationLatch.countDown()
                 if(kind!="candidate")event("${kind}_committed")
                 return
             }catch(failure:MediaApiException){
@@ -211,6 +215,8 @@ class RtcAudioSession(
             }
         }
     }
+    /** Gateway answer SDP is durably acknowledged; cellular winner CAS may now run. */
+    fun awaitNegotiated(timeoutMillis:Long):Boolean = negotiationLatch.await(timeoutMillis,TimeUnit.MILLISECONDS) && !closed.get()
     fun awaitConnected(timeoutMillis:Long):Boolean = connectionLatch.await(timeoutMillis,TimeUnit.MILLISECONDS) && peer?.isConnected==true && !closed.get()
     fun enableAudio(enabled:Boolean){desiredAudio=enabled;if(!closed.get())peer?.enableAudio(enabled)}
     fun mute(muted:Boolean){desiredMute=muted;if(!closed.get())peer?.mute(muted)}
@@ -233,10 +239,18 @@ class RtcAudioSession(
         try{onFailure(reason)}finally{close()}
     }
     fun awaitShutdown(timeoutMillis:Long):Boolean = worker.awaitTermination(timeoutMillis,TimeUnit.MILLISECONDS)
-    override fun close(){
+    /** Close local media after the durable call-control terminal has been queued.
+     * The control record owns remote authorization teardown; sending a parallel
+     * signaling close could make the peer observe media closure first. */
+    fun closeAfterControlEnd() = close(notifyPeer = false)
+
+    override fun close() = close(notifyPeer = true)
+
+    private fun close(notifyPeer:Boolean){
         if(!closed.compareAndSet(false,true))return
         connectionLatch.countDown();peer?.close();peer=null
-        runCatching{worker.execute {runCatching{send("close")}}};worker.shutdown()
+        if(notifyPeer)runCatching{worker.execute {runCatching{send("close")}}}
+        worker.shutdown()
         event("closed")
     }
 }

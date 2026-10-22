@@ -1,5 +1,7 @@
 # Magisk 通用适配
 
+> **0.4.0 起**：网关已改名 Homura，SIP/RTP/SRTP/STUN 代码全部移除，通话只走服务器 HTTPS 呼叫控制与 WebRTC。本文中有关 SIP、Asterisk、ARI 的内容是历史记录。
+
 本批按用户要求先实现 Magisk 通用能力层，不按手机型号自动选配置，也不
 以 API 31 为整体语音门槛。APK 仍沿用最低 API 26 的构建基线；具体系统
 方法按存在性和权限探测。主机与 server 的 SIP/ARI 尚未完成。

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <style name="Theme.SipGsmGateway.Base" parent="Theme.Material3Expressive.DayNight.NoActionBar">
+    <style name="Theme.Homura.Base" parent="Theme.Material3Expressive.DayNight.NoActionBar">
         <item name="colorPrimary">@color/m3_primary</item>
         <item name="colorOnPrimary">@color/m3_on_primary</item>
         <item name="colorPrimaryContainer">@color/m3_primary_container</item>
@@ -37,46 +37,5 @@
         <item name="materialAlertDialogTheme">@style/ThemeOverlay.Material3Expressive.MaterialAlertDialog</item>
     </style>
 
-    <style name="Theme.SipGsmGateway" parent="Theme.SipGsmGateway.Base" />
-
-    <style name="DialButton">
-        <item name="android:layout_height">64dp</item>
-        <item name="android:layout_margin">4dp</item>
-        <item name="android:gravity">center</item>
-        <item name="android:textSize">24sp</item>
-        <item name="android:textColor">?attr/colorOnSurface</item>
-        <item name="android:background">@drawable/dial_button_bg</item>
-        <item name="android:clickable">true</item>
-        <item name="android:focusable">true</item>
-    </style>
-
-    <style name="CfgLabel">
-        <item name="android:layout_width">match_parent</item>
-        <item name="android:layout_height">wrap_content</item>
-        <item name="android:textStyle">bold</item>
-        <item name="android:textColor">?attr/colorOnSurfaceVariant</item>
-        <item name="android:layout_marginTop">14dp</item>
-    </style>
-
-    <!-- Section heading inside Settings; groups pairing, SIMs, voice, SMS and advanced SIP. -->
-    <style name="CfgSection">
-        <item name="android:layout_width">match_parent</item>
-        <item name="android:layout_height">wrap_content</item>
-        <item name="android:textAppearance">?attr/textAppearanceTitleMedium</item>
-        <item name="android:textColor">?attr/colorPrimary</item>
-        <item name="android:accessibilityHeading" tools:targetApi="p">true</item>
-    </style>
-
-    <style name="CfgField">
-        <item name="android:layout_width">match_parent</item>
-        <item name="android:layout_height">wrap_content</item>
-        <item name="android:minHeight">56dp</item>
-        <item name="android:textColor">?attr/colorOnSurface</item>
-        <item name="android:textColorHint">?attr/colorOutline</item>
-        <item name="android:background">@drawable/input_bg</item>
-        <item name="android:paddingHorizontal">12dp</item>
-        <item name="android:paddingVertical">12dp</item>
-        <item name="android:layout_marginTop">4dp</item>
-        <item name="android:importantForAutofill">no</item>
-    </style>
+    <style name="Theme.Homura" parent="Theme.Homura.Base" />
 </resources>

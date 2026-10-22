@@ -1,5 +1,7 @@
 # 三端实施状态
 
+> **0.4.0 起**：网关已改名 Homura，SIP/RTP/SRTP/STUN 代码全部移除，通话只走服务器 HTTPS 呼叫控制与 WebRTC。本文中有关 SIP、Asterisk、ARI 的内容是历史记录。
+
 权威服务端协议固定为 `8b83ae8f613fd7f27ea8e4f3aa1b2148f22c1606`：
 [wire addendum](https://github.com/KiriKira/gsm2sip-server/blob/8b83ae8f613fd7f27ea8e4f3aa1b2148f22c1606/docs/server-wire-addendum.md)、
 [OpenAPI](https://github.com/KiriKira/gsm2sip-server/blob/8b83ae8f613fd7f27ea8e4f3aa1b2148f22c1606/openapi/openapi.yaml) 与

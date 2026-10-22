@@ -6,7 +6,7 @@ import org.json.JSONObject
 import java.util.UUID
 
 /**
- * One received SMS, on its way to the SIP server.
+ * One received SMS, on its way to the control server.
  *
  * [id] is generated on arrival and travels with the message as X-SMS-Id.  It
  * is the server's idempotency key: a MESSAGE whose response is lost gets sent
@@ -28,7 +28,7 @@ data class PendingSms(
 /**
  * Durable queue of received SMS that have not been handed to the server yet.
  *
- * An SMS arrives whether or not SIP is registered — during a reconnect, in the
+ * An SMS arrives whether or not the control server is reachable — during a reconnect, in the
  * seconds after a reboot, while the modem has no data — and the message is the
  * only copy.  It is written to disk before any send is attempted, and removed
  * only once the server has answered 2xx.

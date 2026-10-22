@@ -9,7 +9,7 @@ val releaseVersionCode = providers.environmentVariable("GSM_RELEASE_VERSION_CODE
 require(releaseVersionCode in 1..2_100_000_000) {
     "GSM_RELEASE_VERSION_CODE must be in Android's supported range 1..2100000000"
 }
-val releaseVersionName = providers.environmentVariable("GSM_RELEASE_VERSION_NAME").orNull ?: "1.4.0-dev"
+val releaseVersionName = providers.environmentVariable("GSM_RELEASE_VERSION_NAME").orNull ?: "0.4.0-dev"
 
 android {
     namespace = "com.callagent.gateway"

@@ -28,4 +28,6 @@
     <color name="m3_surface_container">#EEEFF6</color>
     <color name="m3_surface_container_high">#E8E9F0</color>
     <color name="m3_surface_container_highest">#E2E3EA</color>
+    <!-- Matches the dark field around the launcher artwork. -->
+    <color name="ic_launcher_background">#2B2B36</color>
 </resources>

@@ -32,7 +32,7 @@ WSS `/v1/ws` 只接收 `sync_required` 提示，不承载短信正文、执行�
 
 0.4 起通话只使用服务器呼叫控制与 WebRTC；主机的 self-managed Telecom、CallStyle 通知与通话前台服务保留，实现状态见[三端实施状态](implementation-state.md)。实际通话使用对应 Telecom/phoneCall 与麦克风权限；不使用空闲 microphone/phoneCall FGS 保活，也不开机录音。WSS 连通或进程常驻不能作为来电验收依据。
 
-当前无 GMS 路线不依赖 Firebase。GMS 设备可后续增加 FCM 高优先级呼入唤醒，校验时效并通过 HTTPS 查询呼叫状态；FCM 的注册、推送凭据和呼叫流程尚未实现。两台真机仍需测试熄屏、Doze、重启、Wi-Fi/移动网络切换、通知拒绝、用户停止以及两卡短信；本机测试不能证明真实锁屏来电及时性。
+旧手机不使用 FCM：语音运行时常驻前台服务，命令与来电走 HTTPS 轮询与 WSS 唤醒。0.4.1 起 FCM 只用于唤醒主手机（Madoka），见主机仓库同名文档。两台真机仍需测试熄屏、Doze、重启、Wi-Fi/移动网络切换、通知拒绝、用户停止以及两卡短信；本机测试不能证明真实锁屏来电及时性。
 
 ## 官方依据
 

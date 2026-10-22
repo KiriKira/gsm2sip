@@ -9,6 +9,7 @@ import android.os.SystemClock
 import android.telecom.Call
 import android.telecom.DisconnectCause
 import android.telecom.PhoneAccountHandle
+import android.telecom.TelecomManager
 import android.util.Log
 import com.callagent.gateway.audio.CellularAudioSession
 import com.callagent.gateway.data.GatewayDatabase
@@ -84,6 +85,12 @@ class CallOrchestrator(
             SimRegistry.snapshot(appContext).mappingRevision
         } else null
     },
+    /** Whether Telecom still has a cellular call on this phone, ours or not. */
+    private val cellularCallPresent: (Context) -> Boolean = { appContext ->
+        (GsmCallManager.activeCall != null && GsmCallManager.activeCallState != Call.STATE_DISCONNECTED) ||
+            appContext.checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED ||
+            try { appContext.getSystemService(TelecomManager::class.java).isInCall } catch (_: SecurityException) { true }
+    },
     private val audioFactory: (com.callagent.gateway.audio.CallAudioConfiguration) -> com.callagent.gateway.audio.CallAudioSession = { it.realSession() },
     private val incomingAccountResolver: (Context, PhoneAccountHandle?) -> SimRegistry.SimMapping? =
         { appContext, handle -> SimRegistry.resolvePhoneAccount(appContext, handle) }
@@ -98,6 +105,8 @@ class CallOrchestrator(
     @Volatile private var rtcIncoming = false
     @Volatile private var rtcCellularDispatched = false
     @Volatile private var rtcAudioStarting = false
+    /** When teardown began for a dispatch Telecom has not reported yet. */
+    @Volatile private var dispatchUnseenSince = 0L
     private val incomingRtcLegs = ConcurrentHashMap<String, RtcControlLeg>()
     val rtcControlReady: Boolean get() = rtcControl?.ready == true
 
@@ -114,6 +123,37 @@ class CallOrchestrator(
         telecomHandler.post {
             if (activeRtcLeg?.node === node) tearDown("Call control authorization expired")
         }
+    }
+
+    /** Ends calls the ledger left `unknown` once no cellular call can still exist.
+     *
+     *  The server keeps such a call, and this gateway keeps the cellular slot,
+     *  until the gateway reports the cellular END. When the process died or
+     *  call control expired mid-call, nothing else ever reports it, and the
+     *  held slot then refuses every later call in both directions. */
+    fun reconcileUnresolvedCellular() {
+        if (stopped) return
+        if (bridgeState == BridgeState.IDLE && GatewayDatabase.get(context).unresolvedRtcCellularCalls().isEmpty()) return
+        telecomHandler.post { try {
+            if (stopped || cellularCallPresent(context)) return@post
+            synchronized(this) {
+                if (bridgeState == BridgeState.TEARING_DOWN && rtcCellularDispatched && activeGsmCall == null &&
+                    SystemClock.elapsedRealtime() - dispatchUnseenSince >= UNSEEN_DISPATCH_SETTLE_MS) {
+                    tearDown("Dispatched call never reached Telecom", ledgerStateOverride = "unknown", dispatchUnseen = true)
+                }
+                if (bridgeState != BridgeState.IDLE) return@post
+                val db = GatewayDatabase.get(context)
+                val unresolved = db.unresolvedRtcCellularCalls()
+                if (unresolved.isEmpty()) return@post
+                val nodes = db.callControlNodeIds()
+                unresolved.forEach { id ->
+                    db.completeRtcCellular(id, "failed", nodes)
+                    Log.i("GsmRtc", "call_id=$id event=unknown_call_released nodes=${nodes.size}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("GsmRtc", "event=unknown_call_reconcile_failed error=${e.javaClass.simpleName}")
+        } }
     }
 
     fun onRtcControlSnapshot(node: GatewayCallControl.Node, snapshot: JSONObject) {
@@ -617,6 +657,10 @@ class CallOrchestrator(
         // even if the call never reaches ACTIVE (e.g. wrong number, rejected)
         if (activeGsmCall == null && bridgeState != BridgeState.IDLE) {
             activeGsmCall = call
+            // Teardown of this dispatch began before Telecom reported the call.
+            if (bridgeState == BridgeState.TEARING_DOWN && state != Call.STATE_DISCONNECTED) {
+                runCatching { call.disconnect() }
+            }
         }
 
         if (state == Call.STATE_DISCONNECTED && bridgeState != BridgeState.IDLE && call === activeGsmCall) {
@@ -876,16 +920,20 @@ class CallOrchestrator(
     @Synchronized
     private fun tearDown(
         reason: String,
-        ledgerStateOverride: String? = null
+        ledgerStateOverride: String? = null,
+        dispatchUnseen: Boolean = false
     ) {
         if (bridgeState == BridgeState.IDLE) return
         val rtcCall = activeRtcLeg != null || rtcIncoming
-        if (bridgeState == BridgeState.TEARING_DOWN && (!rtcCall || activeGsmCall?.state != Call.STATE_DISCONNECTED)) return
-        if (rtcCall && rtcCellularDispatched && activeGsmCall == null) {
-            bridgeState = BridgeState.TEARING_DOWN
-            activeMedia?.session?.close(); activeAudioSession?.stop()
-            GatewayDatabase.get(context).markCallTerminal(checkNotNull(activeBusinessCallId), "unknown")
-            return // A possibly dispatched modem operation cannot be guessed ended.
+        if (!dispatchUnseen) {
+            if (bridgeState == BridgeState.TEARING_DOWN && (!rtcCall || activeGsmCall?.state != Call.STATE_DISCONNECTED)) return
+            if (rtcCall && rtcCellularDispatched && activeGsmCall == null) {
+                bridgeState = BridgeState.TEARING_DOWN
+                dispatchUnseenSince = SystemClock.elapsedRealtime()
+                activeMedia?.session?.close(); activeAudioSession?.stop()
+                GatewayDatabase.get(context).markCallTerminal(checkNotNull(activeBusinessCallId), "unknown")
+                return // A possibly dispatched modem operation cannot be guessed ended.
+            }
         }
         if (rtcCall && activeGsmCall != null && activeGsmCall?.state != Call.STATE_DISCONNECTED) {
             bridgeState = BridgeState.TEARING_DOWN
@@ -949,5 +997,7 @@ class CallOrchestrator(
         private const val INCOMING_OFFER_TIMEOUT_MS = 25_000L
         /** Longest a single keypress may hold a tone on the GSM call. */
         private const val MAX_DTMF_TONE_MS = 2_000L
+        /** How long a dispatch may stay unreported by Telecom before it counts as never placed. */
+        private const val UNSEEN_DISPATCH_SETTLE_MS = 30_000L
     }
 }

@@ -53,6 +53,9 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
             worker.scheduleWithFixedDelay({poll(node,client)},0,750,TimeUnit.MILLISECONDS)
         }
         (nodes.keys-wanted).forEach{id->workers.remove(id)?.shutdownNow();nodes.remove(id)}
+        runCatching{orchestrator.reconcileUnresolvedCellular()}.onFailure{
+            Log.w("GsmRtc","event=unknown_call_reconcile_failed error=${it.javaClass.simpleName}")
+        }
     }
     private fun poll(node:Node,client:ControlApiClient){
         if(closed.get())return

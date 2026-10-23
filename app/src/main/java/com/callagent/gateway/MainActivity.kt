@@ -2016,7 +2016,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun restorePendingSimProposalInBackground(expectedSession: CredentialStore.Session) {
-        val saved = runCatching { GatewayDatabase.get(this).pendingSimProposal() }.getOrNull() ?: return
+        val snapshot = runCatching { SimRegistry.snapshot(this) }.getOrNull() ?: return
+        val saved = runCatching { GatewayDatabase.get(this).pendingSimProposal(snapshot.mappingRevision) }.getOrNull() ?: return
         try {
             val json = JSONObject(saved.second)
             val revision = json.getLong("mapping_revision")
@@ -2026,7 +2027,6 @@ class MainActivity : AppCompatActivity() {
                 ServerMapping(m.getString("sim_id"), m.getInt("slot_index"), m.getString("state"), m.getLong("mapping_revision"))
             }
             val proposal = MappingProposal(saved.first, revision, mappings)
-            val snapshot = runCatching { SimRegistry.snapshot(this) }.getOrNull() ?: return
             val selected = json.optJSONObject("selected") ?: JSONObject()
             val restoredSelections = mutableMapOf<String, SimRegistry.SimSubscription>()
             selected.keys().forEach { simId ->

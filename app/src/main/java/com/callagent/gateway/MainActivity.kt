@@ -2195,8 +2195,16 @@ class MainActivity : AppCompatActivity() {
                     refreshBackgroundStatus()
                 }
             } catch (e: Exception) {
-                val detail = (e as? ControlApiException)?.code ?: "SIM_CONFIRM_FAILED"
-                runOnUiThread { setControlBusy(false, simMessage = "SIM 确认失败：$detail") }
+                // Name the cause, never just "failed": the local SIM check and the network fail differently.
+                val detail = when (e) {
+                    is ControlApiException -> e.code
+                    is SimRegistry.SimMappingException -> "${e.code.name}（${e.message}）"
+                    else -> "SIM_CONFIRM_FAILED（${e.javaClass.simpleName}）"
+                }
+                runOnUiThread {
+                    setControlBusy(false, simMessage = "SIM 确认失败：$detail")
+                    appendLog("SIM 确认失败：$detail")
+                }
             }
         }, "gateway-sim-confirm").start()
     }

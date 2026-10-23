@@ -47,6 +47,38 @@ class InboundResolutionTest {
         }
     }
 
+    @Test fun anIncomingCallThatCannotBeOfferedIsLeftRingingAndNotOfferedTwice() {
+        val context = RuntimeEnvironment.getApplication()
+        shadowOf(context).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        val invocations = AtomicInteger()
+        // No verified SIM mapping: the call cannot be offered to the hosts.
+        val orchestrator = CallOrchestrator(context) { _, _ -> invocations.incrementAndGet(); null }
+        try {
+            val call = ringingCall()
+            orchestrator.onIncomingGsmCall(call, "redacted")
+            val worker = ReflectionHelpers.getField<ExecutorService>(orchestrator, "inboundWorker")
+            worker.submit {}.get(2, TimeUnit.SECONDS)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(CallOrchestrator.BridgeState.IDLE, orchestrator.bridgeState)
+            val released = ReflectionHelpers.getField<MutableSet<Call>>(orchestrator, "releasedCalls")
+            assertTrue("the caller should hear an unanswered phone, not a rejection", call in released)
+            assertEquals(Call.STATE_RINGING, call.state)
+
+            orchestrator.onIncomingGsmCall(call, "redacted")
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals("a released call is never offered again", 1, invocations.get())
+
+            orchestrator.onGsmCallStateChanged(call, Call.STATE_DISCONNECTED)
+            assertFalse(call in released)
+            orchestrator.onIncomingGsmCall(ringingCall(), "redacted")
+            worker.submit {}.get(2, TimeUnit.SECONDS)
+            assertEquals("the next call is offered as usual", 2, invocations.get())
+        } finally {
+            orchestrator.stop()
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+    }
+
     private fun withBlockedResolver(
         test: (CallOrchestrator, MutableList<String>, CountDownLatch, AtomicInteger) -> Unit
     ) {

@@ -86,7 +86,7 @@ class ControlApiClient(
 
     /** A join code pairs either phone, so the claim names this one's role. */
     private fun claimBody(pairingCode: String, deviceName: String) = JSONObject()
-        .put("pairing_code", pairingCode).put("device_name", deviceName).put("role", "gateway")
+        .put("pairing_code", pairingCode).put("device_name", clampDeviceName(deviceName)).put("role", "gateway")
 
     /**
      * The first heartbeat already carries what the server supports, notably
@@ -441,4 +441,11 @@ class ControlApiClient(
             return value
         }
     }
+}
+
+/** The server allows 100 characters (code points) for a device name. */
+internal fun clampDeviceName(name: String): String {
+    val trimmed = name.trim()
+    return if (trimmed.codePointCount(0, trimmed.length) <= 100) trimmed
+    else trimmed.substring(0, trimmed.offsetByCodePoints(0, 100))
 }

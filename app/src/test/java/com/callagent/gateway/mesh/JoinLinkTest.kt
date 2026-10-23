@@ -33,6 +33,21 @@ class JoinLinkTest {
     }
 
     @Test
+    fun parsesTheLinkTheServerPrints() {
+        // mahogsm-admin join create, with Go's url.QueryEscape.
+        val link = "mahogsm://join?v=2&n=http%3A%2F%2F10.0.2.2%3A18099%23ploJ03-uNhC72fo_2eJ5UmmXraYDke_5fOovll7J2YY"
+        assertEquals(listOf(JoinEntry("http://10.0.2.2:18099", "ploJ03-uNhC72fo_2eJ5UmmXraYDke_5fOovll7J2YY")), JoinLink.parse(link))
+    }
+
+    @Test
+    fun deviceNamesAreClampedInCharacters() {
+        assertEquals("Pixel 3", com.callagent.gateway.net.clampDeviceName("  Pixel 3 "))
+        assertEquals("网".repeat(100), com.callagent.gateway.net.clampDeviceName("网".repeat(150)))
+        val emoji = "\uD83D\uDCF1".repeat(120)
+        assertEquals(100, com.callagent.gateway.net.clampDeviceName(emoji).let { it.codePointCount(0, it.length) })
+    }
+
+    @Test
     fun acceptsPlainHttpNodesOnALanOrTailnet() {
         val lan = listOf(JoinEntry("http://192.168.1.10:8080", "AB12-CD34"), JoinEntry("https://vps.example.com", "ZXCV-9876"))
         assertEquals(lan, JoinLink.parse(JoinLink.build(lan)))

@@ -888,7 +888,17 @@ class GatewayService : Service() {
             broadcastLog("CALL: microphone foreground mode is not permitted yet")
             return
         }
-        startForegroundMode(true, status)
+        try {
+            startForegroundMode(true, status)
+        } catch (_: SecurityException) {
+            // Android may refuse microphone use to a service it saw start in
+            // the background (an automatic restore after a reboot or upgrade).
+            // Keep the service and the cellular call alive and say what helps.
+            runCatching { startForegroundMode(false, status) }
+            GatewayBackgroundRuntime.recordIssue(this,
+                "Android did not allow the microphone for this call; open the app and start voice once")
+            broadcastLog("CALL: Android refused microphone foreground mode for a background-started service")
+        }
     }
 
     private fun syncControlPlaneOnce() {

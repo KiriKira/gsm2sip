@@ -56,9 +56,8 @@ class InboundResolutionTest {
         try {
             val call = ringingCall()
             orchestrator.onIncomingGsmCall(call, "redacted")
-            val worker = ReflectionHelpers.getField<ExecutorService>(orchestrator, "inboundWorker")
-            worker.submit {}.get(2, TimeUnit.SECONDS)
-            shadowOf(Looper.getMainLooper()).idle()
+            // The resolver runs on a pool, so wait for its outcome itself.
+            awaitMainLooper { orchestrator.bridgeState == CallOrchestrator.BridgeState.IDLE }
             assertEquals(CallOrchestrator.BridgeState.IDLE, orchestrator.bridgeState)
             val released = ReflectionHelpers.getField<MutableSet<Call>>(orchestrator, "releasedCalls")
             assertTrue("the caller should hear an unanswered phone, not a rejection", call in released)
@@ -71,11 +70,20 @@ class InboundResolutionTest {
             orchestrator.onGsmCallStateChanged(call, Call.STATE_DISCONNECTED)
             assertFalse(call in released)
             orchestrator.onIncomingGsmCall(ringingCall(), "redacted")
-            worker.submit {}.get(2, TimeUnit.SECONDS)
+            awaitMainLooper { invocations.get() == 2 }
             assertEquals("the next call is offered as usual", 2, invocations.get())
         } finally {
             orchestrator.stop()
             shadowOf(Looper.getMainLooper()).idle()
+        }
+    }
+
+    private fun awaitMainLooper(done: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (System.nanoTime() < deadline) {
+            shadowOf(Looper.getMainLooper()).idle()
+            if (done()) return
+            Thread.sleep(10)
         }
     }
 

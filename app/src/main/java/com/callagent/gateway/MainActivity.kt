@@ -1868,8 +1868,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * A join link lists one-time gateway pairing codes for several server
-     * nodes. Unpaired, the first entry is the primary pairing (SIMs are then
+     * A join link lists join codes for several server nodes; both phones scan
+     * the same one. Unpaired, the first entry is the primary pairing (SIMs are then
      * confirmed as usual) and the rest become other nodes; paired, every
      * entry is added as another node.
      */
@@ -1878,9 +1878,9 @@ class MainActivity : AppCompatActivity() {
         if (!JoinLink.isJoinLink(link)) return
         // One-time secrets: never keep them in the intent for a recreate.
         source?.data = null
-        val entries = JoinLink.parse(link!!, "gateway")
+        val entries = JoinLink.parse(link!!)
         if (entries == null) {
-            Toast.makeText(this, "这个加入链接无效，或不是给旧手机用的。", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "这个加入链接无效或已过时，请在服务器上重新生成。", Toast.LENGTH_LONG).show()
             return
         }
         val paired = CredentialStore.load(this) != null
@@ -2016,7 +2016,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun restorePendingSimProposalInBackground(expectedSession: CredentialStore.Session) {
-        val saved = runCatching { GatewayDatabase.get(this).pendingSimProposal() }.getOrNull() ?: return
+        val snapshot = runCatching { SimRegistry.snapshot(this) }.getOrNull() ?: return
+        val saved = runCatching { GatewayDatabase.get(this).pendingSimProposal(snapshot.mappingRevision) }.getOrNull() ?: return
         try {
             val json = JSONObject(saved.second)
             val revision = json.getLong("mapping_revision")
@@ -2026,7 +2027,6 @@ class MainActivity : AppCompatActivity() {
                 ServerMapping(m.getString("sim_id"), m.getInt("slot_index"), m.getString("state"), m.getLong("mapping_revision"))
             }
             val proposal = MappingProposal(saved.first, revision, mappings)
-            val snapshot = runCatching { SimRegistry.snapshot(this) }.getOrNull() ?: return
             val selected = json.optJSONObject("selected") ?: JSONObject()
             val restoredSelections = mutableMapOf<String, SimRegistry.SimSubscription>()
             selected.keys().forEach { simId ->
@@ -2195,8 +2195,16 @@ class MainActivity : AppCompatActivity() {
                     refreshBackgroundStatus()
                 }
             } catch (e: Exception) {
-                val detail = (e as? ControlApiException)?.code ?: "SIM_CONFIRM_FAILED"
-                runOnUiThread { setControlBusy(false, simMessage = "SIM 确认失败：$detail") }
+                // Name the cause, never just "failed": the local SIM check and the network fail differently.
+                val detail = when (e) {
+                    is ControlApiException -> e.code
+                    is SimRegistry.SimMappingException -> "${e.code.name}（${e.message}）"
+                    else -> "SIM_CONFIRM_FAILED（${e.javaClass.simpleName}）"
+                }
+                runOnUiThread {
+                    setControlBusy(false, simMessage = "SIM 确认失败：$detail")
+                    appendLog("SIM 确认失败：$detail")
+                }
             }
         }, "gateway-sim-confirm").start()
     }
@@ -2600,15 +2608,7 @@ class MainActivity : AppCompatActivity() {
 
     /** Called only from the visible, explicitly selected voice diagnostic. */
     private fun requestVoicePermissions(): Boolean {
-        val permissions = mutableListOf(
-            Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.READ_PHONE_STATE,
-            Manifest.permission.CALL_PHONE,
-            Manifest.permission.ANSWER_PHONE_CALLS,
-            Manifest.permission.READ_CALL_LOG
-        )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) permissions.add(Manifest.permission.READ_PHONE_NUMBERS)
-        return requestMissingPermissions(permissions, REQ_VOICE_PERMS)
+        return requestMissingPermissions(GatewayBackgroundRuntime.VOICE_PERMISSIONS, REQ_VOICE_PERMS)
     }
 
     private fun requestMissingPermissions(permissions: List<String>, requestCode: Int): Boolean {

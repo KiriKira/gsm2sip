@@ -184,7 +184,8 @@ object MeshPairing {
         val primary = CredentialStore.load(app)
             ?: throw ControlApiException("PAIRING_REQUIRED", "请先完成主节点配对并确认 SIM")
         val probe = ControlApiClient(app, controlBaseUrl)
-        if (MeshCoordinator.MESH_EXTENSION !in probe.capabilities()) {
+        val extensions = probe.capabilities()
+        if (MeshCoordinator.MESH_EXTENSION !in extensions) {
             throw ControlApiException("MESH_UNSUPPORTED", "该服务器版本不支持多节点，请先升级服务器")
         }
         val session = probe.pairMeshNode(pairingCode, deviceName)
@@ -192,6 +193,7 @@ object MeshPairing {
             throw ControlApiException("MESH_DUPLICATE_NODE", "这就是主节点，不需要再次添加")
         }
         MeshVaults.forNode(session.gatewayId).save(app, session)
+        probe.rememberExtensions(session.gatewayId, extensions)
         val host = MeshCoordinator.hostOf(session.controlBaseUrl)
         if (!GatewayDatabase.get(app).addMeshNode(session.gatewayId, session.controlBaseUrl, host)) {
             throw ControlApiException("MESH_DUPLICATE_NODE", "该节点已在列表中")

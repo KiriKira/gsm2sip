@@ -340,6 +340,13 @@ class CallOrchestrator(
     @Volatile private var activeGsmCall: Call? = null
     @Volatile private var activeGsmMapping: SimRegistry.SimMapping? = null
     @Volatile private var activeBusinessCallId: String? = null
+    /**
+     * Incoming cellular calls this gateway gave up on without answering.
+     * They are left ringing, like an unanswered phone, so the caller hears
+     * ringback until they or the network give up instead of a hang-up.
+     * Their later callbacks are not ours to act on.
+     */
+    private val releasedCalls = java.util.Collections.newSetFromMap(java.util.WeakHashMap<Call, Boolean>())
     private var pendingInboundCall: Call? = null
     private var pendingInboundCallId: String? = null
     private var pendingInboundGeneration = -1L
@@ -481,6 +488,10 @@ class CallOrchestrator(
             Log.d(TAG, "Ignoring duplicate incoming callback for the reserved GSM call")
             return
         }
+        if (call in releasedCalls) {
+            Log.d(TAG, "Ignoring callback for an incoming call left unanswered")
+            return
+        }
 
         if (stopped || !isRingingOrActive(call)) {
             Log.w(TAG, "Ignoring incoming callback for a stopped or ended GSM call")
@@ -494,9 +505,9 @@ class CallOrchestrator(
         }
 
         if (!hasRecordAudioPermission()) {
-            Log.w(TAG, "Rejecting GSM call because microphone permission is unavailable")
-            rejectOrDisconnect(call)
-            listener?.onError("Call rejected: microphone permission is not granted")
+            Log.w(TAG, "Leaving GSM call unanswered because microphone permission is unavailable")
+            leaveUnanswered(call)
+            listener?.onError("Call not offered: microphone permission is not granted")
             return
         }
 
@@ -534,7 +545,7 @@ class CallOrchestrator(
         } catch (e: Exception) {
             Log.e(TAG, "Could not schedule SIM account resolution: ${e.javaClass.simpleName}")
             failPendingInbound(call, callId, callGeneration,
-                "Call rejected: SIM account mapping is unavailable")
+                "Call not offered: SIM account mapping is unavailable")
         }
     }
 
@@ -556,9 +567,9 @@ class CallOrchestrator(
             return
         }
         if (mapping == null) {
-            Log.w(TAG, "Incoming GSM call has no verified SIM account mapping; rejecting")
+            Log.w(TAG, "Incoming GSM call has no verified SIM account mapping; leaving it unanswered")
             failPendingInbound(call, callId, callGeneration,
-                "Call rejected: SIM account mapping is unavailable")
+                "Call not offered: SIM account mapping is unavailable")
             return
         }
 
@@ -569,12 +580,12 @@ class CallOrchestrator(
                 callId, mapping.simId, mapping.mappingRevision, "incoming"
             )
         } catch (e: Exception) {
-            Log.e(TAG, "Call ledger unavailable; rejecting incoming GSM call")
+            Log.e(TAG, "Call ledger unavailable; leaving incoming GSM call unanswered")
             false
         }
         if (!recorded) {
             failPendingInbound(call, callId, callGeneration,
-                "Call rejected: durable call ledger is unavailable")
+                "Call not offered: durable call ledger is unavailable")
             return
         }
 
@@ -584,7 +595,7 @@ class CallOrchestrator(
 
         Log.i(TAG, "GSM call is ringing; offering it to the hosts")
         if (!submitInboundFlow(call, mapping, callId, number, callGeneration)) {
-            tearDown("Could not offer the incoming call")
+            tearDown("Could not offer the incoming call", leaveRinging = true)
         }
     }
 
@@ -597,7 +608,7 @@ class CallOrchestrator(
     ) {
         if (!isPendingInbound(call, callId, callGeneration)) return
         listener?.onError(error)
-        tearDown(error)
+        tearDown(error, leaveRinging = true)
     }
 
     private fun isPendingInbound(call: Call, callId: String, callGeneration: Long): Boolean =
@@ -619,6 +630,15 @@ class CallOrchestrator(
         inboundFlowTask = null
     }
 
+    /** Stops handling [call] without rejecting it; it rings on until the caller or network ends it. */
+    @android.annotation.SuppressLint("MissingPermission") // The default dialer may silence the ringer.
+    private fun leaveUnanswered(call: Call) {
+        releasedCalls.add(call)
+        Log.i(TAG, "Leaving the GSM call unanswered")
+        // This phone sits unattended; it should not ring out loud in the drawer.
+        runCatching { context.getSystemService(TelecomManager::class.java)?.silenceRinger() }
+    }
+
     private fun rejectOrDisconnect(call: Call) {
         try {
             when (call.state) {
@@ -638,6 +658,7 @@ class CallOrchestrator(
 
     /** GSM call is now active (answered) */
     override fun onGsmCallActive(call: Call) {
+        if (call in releasedCalls) return
         Log.i(TAG, "GSM call active")
         activeGsmCall = call
         if (activeRtcLeg != null) startRtcCellularAudio(call)
@@ -652,6 +673,10 @@ class CallOrchestrator(
             else -> "OTHER($state)"
         }
         Log.d(TAG, "GSM state: $stateStr")
+        if (call in releasedCalls) {
+            if (state == Call.STATE_DISCONNECTED) releasedCalls.remove(call)
+            return
+        }
 
         // Track the GSM call object as soon as we see it, so teardown works
         // even if the call never reaches ACTIVE (e.g. wrong number, rejected)
@@ -669,6 +694,7 @@ class CallOrchestrator(
     }
 
     override fun onGsmCallEnded(call: Call) {
+        if (releasedCalls.remove(call)) return
         Log.i(TAG, "GSM call ended")
         if (call === activeGsmCall) {
             tearDown("GSM call ended (${describeDisconnect(GsmCallManager.lastDisconnectCause)})")
@@ -744,7 +770,7 @@ class CallOrchestrator(
             rtcIncoming = true
             manager.offerIncoming(mapping, callId, callerNumber) { isInboundFlowIdentityCurrent(gsmCall, callId, mapping.simId, callGeneration) }
             schedule(INCOMING_OFFER_TIMEOUT_MS) {
-                if (activeBusinessCallId == callId && bridgeState != BridgeState.BRIDGED) tearDown("Incoming call was not answered in time")
+                if (activeBusinessCallId == callId && bridgeState != BridgeState.BRIDGED) tearDown("Incoming call was not answered in time", leaveRinging = true)
             }
         } catch (_: Throwable) {
             postInboundFlowFailure(gsmCall, callId, mapping.simId, callGeneration, "Incoming call could not be offered")
@@ -791,7 +817,7 @@ class CallOrchestrator(
         telecomHandler.post {
             synchronized(this) {
                 if (!isInboundFlowIdentityCurrent(gsmCall, callId, simId, callGeneration)) return@synchronized
-                tearDown(reason)
+                tearDown(reason, leaveRinging = true)
             }
         }
     }
@@ -918,12 +944,25 @@ class CallOrchestrator(
     // ── Teardown ────────────────────────────────────────
 
     @Synchronized
+    /**
+     * [leaveRinging]: the incoming call was not answered here (no host took
+     * it in time, or it could not be offered). If it still rings it is left
+     * ringing rather than rejected, so the caller hears an unanswered phone.
+     */
     private fun tearDown(
         reason: String,
         ledgerStateOverride: String? = null,
-        dispatchUnseen: Boolean = false
+        dispatchUnseen: Boolean = false,
+        leaveRinging: Boolean = false
     ) {
         if (bridgeState == BridgeState.IDLE) return
+        val unanswered = activeGsmCall?.takeIf {
+            leaveRinging && !mediaBridgeEstablished && runCatching { it.state == Call.STATE_RINGING }.getOrDefault(false)
+        }
+        if (unanswered != null) {
+            leaveUnanswered(unanswered)
+            activeGsmCall = null
+        }
         val rtcCall = activeRtcLeg != null || rtcIncoming
         if (!dispatchUnseen) {
             if (bridgeState == BridgeState.TEARING_DOWN && (!rtcCall || activeGsmCall?.state != Call.STATE_DISCONNECTED)) return

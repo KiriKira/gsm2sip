@@ -92,6 +92,11 @@ object SimRegistry {
         fun isNewProposal(currentRevision: Long, proposedRevision: Long): Boolean =
             proposedRevision > currentRevision
 
+        fun completeProposalMayReplaceOldBinding(
+            oldIdentityState: IdentityState,
+            oldSimIncludedInProposal: Boolean
+        ): Boolean = oldIdentityState == IdentityState.UNVERIFIED && !oldSimIncludedInProposal
+
         fun resyncRevisionIsAcceptable(currentRevision: Long, serverRevision: Long): Boolean =
             serverRevision >= currentRevision
 
@@ -432,7 +437,8 @@ object SimRegistry {
             }
             val other = state.mappings.values.firstOrNull {
                 it.simId != simId && it.subscriptionId == confirmation.subscriptionId &&
-                    !Policy.fingerprintMismatch(it.fingerprint, selected.fingerprint)
+                    !Policy.fingerprintMismatch(it.fingerprint, selected.fingerprint) &&
+                    !Policy.completeProposalMayReplaceOldBinding(it.identityState, it.simId in canonical)
             }
             if (other != null) {
                 throw SimMappingException(ErrorCode.SIM_ALREADY_MAPPED, "Selected SIM is already bound to another server SIM id")

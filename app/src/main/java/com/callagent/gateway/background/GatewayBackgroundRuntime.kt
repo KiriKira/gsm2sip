@@ -40,6 +40,7 @@ object GatewayBackgroundRuntime {
     private const val KEY_CONNECTION = "background_connection_label"
     private const val KEY_LAST_SYNC = "background_last_sync_at"
     private const val KEY_ISSUE = "background_issue"
+    private const val KEY_VOICE_ENABLED = "background_voice_enabled"
 
     const val NOTIFICATION_PERMISSION_REQUEST_CODE = 0x4757
 
@@ -222,6 +223,7 @@ object GatewayBackgroundRuntime {
             .putBoolean(KEY_OPTED_IN, false)
             .putBoolean(KEY_USER_STOPPED, true)
             .putBoolean(KEY_TASK_MANAGER_STOPPED, true)
+            .putBoolean(KEY_VOICE_ENABLED, false)
             .putString(KEY_CONNECTION, "Stopped")
             .putString(KEY_ISSUE, "Android stopped the gateway from Task Manager. Enable it again in the app to resume.")
             .commit()
@@ -235,6 +237,46 @@ object GatewayBackgroundRuntime {
         0L
     }
 
+    /** The user started voice from the visible diagnostics flow; restore it
+     * after reboots, upgrades and process restarts until they stop the gateway. */
+    internal fun recordVoiceEnabled(context: Context): Boolean =
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_VOICE_ENABLED, true).commit()
+
+    /**
+     * Whether voice may start without the user: background operation is
+     * allowed, the user has not stopped voice, and everything the diagnostics
+     * check holds. The Magisk module's privileged audio permission is the sign
+     * that the module is installed and mounted; with it and the phone role, an
+     * installation that never recorded a choice counts as wanting voice.
+     */
+    internal fun mayAutoRestoreVoice(context: Context): Boolean {
+        val app = context.applicationContext
+        if (!app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_VOICE_ENABLED, true)) return false
+        if (!allowedRecovery(app) || CredentialStore.load(app) == null) return false
+        val telecom = app.getSystemService(Context.TELECOM_SERVICE) as? android.telecom.TelecomManager
+        return GatewayBackgroundPolicy.voiceReadyWithoutUser(
+            voiceEnabled = true,
+            defaultDialer = telecom?.defaultDialerPackage == app.packageName,
+            missingPermissions = (VOICE_PERMISSIONS + MODULE_PERMISSION).count {
+                app.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+            }
+        )
+    }
+
+    /** Runtime permissions the voice diagnostics request. */
+    val VOICE_PERMISSIONS: List<String> = buildList {
+        add(android.Manifest.permission.RECORD_AUDIO)
+        add(android.Manifest.permission.READ_PHONE_STATE)
+        add(android.Manifest.permission.CALL_PHONE)
+        add(android.Manifest.permission.ANSWER_PHONE_CALLS)
+        add(android.Manifest.permission.READ_CALL_LOG)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) add(android.Manifest.permission.READ_PHONE_NUMBERS)
+    }
+
+    /** Granted only to the privileged app the Magisk module installs. */
+    private const val MODULE_PERMISSION = "android.permission.CAPTURE_AUDIO_OUTPUT"
+
     internal fun userStopped(context: Context): Boolean =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getBoolean(KEY_USER_STOPPED, false)
@@ -246,6 +288,7 @@ object GatewayBackgroundRuntime {
             .putBoolean(KEY_OPTED_IN, false)
             .putBoolean(KEY_USER_STOPPED, true)
             .putBoolean(KEY_TASK_MANAGER_STOPPED, false)
+            .putBoolean(KEY_VOICE_ENABLED, false)
             .putString(KEY_CONNECTION, "Stopped")
             .remove(KEY_ISSUE)
             .commit()
@@ -300,6 +343,9 @@ internal object GatewayBackgroundPolicy {
 
     fun mayRestoreVoice(intentAction: String?, explicitStartAction: String): Boolean =
         intentAction == explicitStartAction
+
+    fun voiceReadyWithoutUser(voiceEnabled: Boolean, defaultDialer: Boolean, missingPermissions: Int): Boolean =
+        voiceEnabled && defaultDialer && missingPermissions == 0
 
     fun holdVoiceLease(voiceRuntimeStarted: Boolean, callActive: Boolean): Boolean =
         voiceRuntimeStarted && callActive

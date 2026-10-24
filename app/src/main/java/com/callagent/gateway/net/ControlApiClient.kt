@@ -65,8 +65,7 @@ class ControlApiClient(
     private val base = normalizeBase(baseUrl)
 
     fun pair(pairingCode: String, deviceName: String): PairResult {
-        val response = request("POST", "/v1/pairings/claim", JSONObject()
-            .put("pairing_code", pairingCode).put("device_name", deviceName), authenticated = false)
+        val response = request("POST", "/v1/pairings/claim", claimBody(pairingCode, deviceName), authenticated = false)
         val role = response.optString("role")
         if (role != "gateway") throw ControlApiException("PAIRING_ROLE_MISMATCH", "该配对码不是网关角色")
         val id = response.optString("device_id")
@@ -81,7 +80,22 @@ class ControlApiClient(
             GatewayDatabase.get(app).adoptGatewayId(id)
         } ?: throw ControlApiException("SESSION_CHANGED","配对身份已变化")
         if (changedOwner || identityChanged) SimRegistry.resetForGatewayChange(app,id,base)
+        rememberExtensions(id)
         return PairResult(id, role)
+    }
+
+    /** A join code pairs either phone, so the claim names this one's role. */
+    private fun claimBody(pairingCode: String, deviceName: String) = JSONObject()
+        .put("pairing_code", pairingCode).put("device_name", clampDeviceName(deviceName)).put("role", "gateway")
+
+    /**
+     * The first heartbeat already carries what the server supports, notably
+     * the install ID: the main phone checks it before it accepts this server
+     * as a node, so it must not wait for a later heartbeat round.
+     */
+    fun rememberExtensions(gatewayId: String, extensions: Set<String>? = null) {
+        val known = extensions ?: runCatching { capabilities() }.getOrNull() ?: return
+        ControlExtensions.record(app, gatewayId, base, known)
     }
 
     /**
@@ -90,8 +104,7 @@ class ControlApiClient(
      * that node's own vault.
      */
     fun pairMeshNode(pairingCode: String, deviceName: String): CredentialStore.Session {
-        val response = request("POST", "/v1/pairings/claim", JSONObject()
-            .put("pairing_code", pairingCode).put("device_name", deviceName), authenticated = false)
+        val response = request("POST", "/v1/pairings/claim", claimBody(pairingCode, deviceName), authenticated = false)
         if (response.optString("role") != "gateway") throw ControlApiException("PAIRING_ROLE_MISMATCH", "该配对码不是网关角色")
         val id = response.optString("device_id").lowercase()
         if (id.isBlank()) throw ControlApiException("INVALID_RESPONSE", "服务器未返回设备 ID")
@@ -428,4 +441,11 @@ class ControlApiClient(
             return value
         }
     }
+}
+
+/** The server allows 100 characters (code points) for a device name. */
+internal fun clampDeviceName(name: String): String {
+    val trimmed = name.trim()
+    return if (trimmed.codePointCount(0, trimmed.length) <= 100) trimmed
+    else trimmed.substring(0, trimmed.offsetByCodePoints(0, 100))
 }

@@ -55,6 +55,41 @@ class GatewayDatabaseTest {
     }
 
     @Test
+    fun supersededSimProposalCannotReappearAfterConfirmationAndRestart() {
+        db.saveSimProposal(id("old-proposal"), """{"mapping_revision":8}""")
+        val latest = id("new-proposal")
+        db.saveSimProposal(latest, """{"mapping_revision":17}""")
+        reopen()
+        assertEquals(latest, db.pendingSimProposal(16)!!.first)
+        db.clearSimProposal(latest)
+        reopen()
+        assertNull(db.pendingSimProposal(17))
+        assertEquals(gatewayA, db.activeGatewayId())
+    }
+
+    @Test
+    fun legacyStaleSimProposalsAreRemovedWithoutRollingBackLocalRevision() {
+        listOf(3L, 8L).forEach { revision ->
+            db.writableDatabase.execSQL(
+                "INSERT INTO sim_proposals(operation_id,payload,updated_at) VALUES(?,?,?)",
+                arrayOf(id("legacy-$revision"), """{"mapping_revision":$revision}""", revision)
+            )
+        }
+        assertNull(db.pendingSimProposal(16))
+        reopen()
+        assertNull(db.pendingSimProposal())
+        assertEquals(gatewayA, db.activeGatewayId())
+    }
+
+    @Test
+    fun equalRevisionProposalRemainsAvailableForInterruptedConfirmationRecovery() {
+        val operation = id("equal-proposal")
+        db.saveSimProposal(operation, """{"mapping_revision":16}""")
+        reopen()
+        assertEquals(operation, db.pendingSimProposal(16)!!.first)
+    }
+
+    @Test
     fun rtcWinnerAndUncertainPhysicalOccupancySurviveProcessRestart() {
         val call=id("rtc-incoming")
         assertTrue(db.beginCallDispatch(call,"sim",1,"incoming"))

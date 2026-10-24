@@ -1185,14 +1185,43 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
     fun discardHeartbeat(gatewayId: String, sequence: Long) = completeHeartbeat(gatewayId, sequence)
 
     fun saveSimProposal(operationId: String, payload: String) {
-        writableDatabase.insertWithOnConflict("sim_proposals", null, ContentValues().apply {
-            put("operation_id", operationId); put("payload", payload); put("updated_at", System.currentTimeMillis())
-        }, SQLiteDatabase.CONFLICT_REPLACE)
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            // Only one complete proposal can be current. Older operations must
+            // not reappear after the newest proposal has been confirmed.
+            db.delete("sim_proposals", "operation_id!=?", arrayOf(operationId))
+            db.insertWithOnConflict("sim_proposals", null, ContentValues().apply {
+                put("operation_id", operationId); put("payload", payload); put("updated_at", System.currentTimeMillis())
+            }, SQLiteDatabase.CONFLICT_REPLACE)
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
     }
 
-    fun pendingSimProposal(): Pair<String, String>? = readableDatabase.rawQuery(
-        "SELECT operation_id,payload FROM sim_proposals ORDER BY updated_at DESC LIMIT 1", null
-    ).use { if (it.moveToFirst()) it.getString(0) to it.getString(1) else null }
+    fun pendingSimProposal(currentMappingRevision: Long = 0): Pair<String, String>? {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val saved = db.rawQuery(
+                "SELECT operation_id,payload FROM sim_proposals ORDER BY updated_at DESC", null
+            ).use { cursor -> buildList {
+                while (cursor.moveToNext()) add(cursor.getString(0) to cursor.getString(1))
+            } }
+            var pending: Pair<String, String>? = null
+            saved.forEach { proposal ->
+                val revision = runCatching { JSONObject(proposal.second).getLong("mapping_revision") }.getOrNull()
+                if (revision == null || revision < currentMappingRevision) {
+                    db.delete("sim_proposals", "operation_id=?", arrayOf(proposal.first))
+                } else if (pending == null) {
+                    // Equal revisions may still require local adoption after
+                    // an interrupted confirmation; do not discard them here.
+                    pending = proposal
+                }
+            }
+            db.setTransactionSuccessful()
+            return pending
+        } finally { db.endTransaction() }
+    }
 
     fun clearSimProposal(operationId: String) {
         writableDatabase.delete("sim_proposals", "operation_id=?", arrayOf(operationId))

@@ -98,4 +98,12 @@ class GatewayBackgroundPolicyTest {
         assertTrue(GatewayBackgroundPolicy.WIFI_LOCK_MAX_LEASE_MS <=
             GatewayBackgroundPolicy.VOICE_WAKE_LEASE_TIMEOUT_MS)
     }
+
+    @Test
+    fun voiceComesBackWithoutATapOnlyWhenEverythingTheDiagnosticsCheckHolds() {
+        assertTrue(GatewayBackgroundPolicy.voiceReadyWithoutUser(voiceEnabled = true, defaultDialer = true, missingPermissions = 0))
+        assertFalse("stopped by the user", GatewayBackgroundPolicy.voiceReadyWithoutUser(false, true, 0))
+        assertFalse("phone role lost", GatewayBackgroundPolicy.voiceReadyWithoutUser(true, false, 0))
+        assertFalse("module or a permission missing", GatewayBackgroundPolicy.voiceReadyWithoutUser(true, true, 1))
+    }
 }

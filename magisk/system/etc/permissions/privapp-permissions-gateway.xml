@@ -24,5 +24,11 @@
         <permission name="android.permission.REGISTER_SIM_SUBSCRIPTION" />
         <permission name="android.permission.BIND_INCALL_SERVICE" />
         <permission name="android.permission.BIND_TELECOM_CONNECTION_SERVICE" />
+
+        <!-- Background start: lets voice restored after a reboot or upgrade use the
+             microphone in calls. Allowed here first; the app requests it only in a
+             later release, so an app update can never outrun this module (an
+             unlisted privileged request stops the phone from booting). -->
+        <permission name="android.permission.START_ACTIVITIES_FROM_BACKGROUND" />
     </privapp-permissions>
 </permissions>

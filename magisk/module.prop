@@ -1,6 +1,6 @@
 id=sip-gsm-gateway
 name=Homura Gateway Runtime
-version=v0.4.1
-versionCode=441
+version=v0.4.2
+versionCode=442
 author=callagent
 description=Generic root telephony broker and read-only audio capability probe for the Homura gateway

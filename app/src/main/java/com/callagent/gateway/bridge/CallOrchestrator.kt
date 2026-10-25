@@ -639,6 +639,26 @@ class CallOrchestrator(
         runCatching { context.getSystemService(TelecomManager::class.java)?.silenceRinger() }
     }
 
+    /**
+     * Closes native media and cellular audio away from this object's monitor.
+     * tearDown() holds the monitor and runs on the Telecom main thread, so a
+     * media close that blocks (WebRTC waits on its own threads) must not hold
+     * it: that once kept the main thread waiting until Android killed the app.
+     */
+    private fun closeMediaOffThread(
+        session: RtcAudioSession?,
+        afterControlEnd: Boolean,
+        audio: com.callagent.gateway.audio.CallAudioSession?
+    ) {
+        if (session == null && audio == null) return
+        val close = {
+            runCatching { if (afterControlEnd) session?.closeAfterControlEnd() else session?.close() }
+            runCatching { audio?.stop() }
+            Unit
+        }
+        runCatching { mediaCloser.execute(close) }.onFailure { close() }
+    }
+
     private fun rejectOrDisconnect(call: Call) {
         try {
             when (call.state) {
@@ -969,14 +989,14 @@ class CallOrchestrator(
             if (rtcCall && rtcCellularDispatched && activeGsmCall == null) {
                 bridgeState = BridgeState.TEARING_DOWN
                 dispatchUnseenSince = SystemClock.elapsedRealtime()
-                activeMedia?.session?.close(); activeAudioSession?.stop()
+                closeMediaOffThread(activeMedia?.session, afterControlEnd = false, activeAudioSession)
                 GatewayDatabase.get(context).markCallTerminal(checkNotNull(activeBusinessCallId), "unknown")
                 return // A possibly dispatched modem operation cannot be guessed ended.
             }
         }
         if (rtcCall && activeGsmCall != null && activeGsmCall?.state != Call.STATE_DISCONNECTED) {
             bridgeState = BridgeState.TEARING_DOWN
-            activeMedia?.session?.close(); activeAudioSession?.stop()
+            closeMediaOffThread(activeMedia?.session, afterControlEnd = false, activeAudioSession)
             cancelPendingInboundWork()
             val call = activeGsmCall
             telecomHandler.post { runCatching { call?.disconnect() } }
@@ -992,11 +1012,9 @@ class CallOrchestrator(
         Log.i(TAG, "Tearing down bridge: $reason")
 
         try {
-            val mediaSession = activeMedia?.session
-            if (controlEndQueued) mediaSession?.closeAfterControlEnd() else mediaSession?.close()
+            closeMediaOffThread(activeMedia?.session, afterControlEnd = controlEndQueued, activeAudioSession)
             activeMedia = null
             dtmfQueuedUntil = 0L
-            activeAudioSession?.stop()
             activeAudioSession = null
 
             activeGsmCall?.let { call ->
@@ -1030,6 +1048,10 @@ class CallOrchestrator(
 
     companion object {
         private val dispatchRecoveryLock = Any()
+        /** Shared and never shut down: a stopping orchestrator still closes its last call's media. */
+        private val mediaCloser = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "bridge-media-close").apply { isDaemon = true }
+        }
         private var dispatchRecoveryComplete = false
         private const val TAG = "CallOrchestrator"
         /** The server invites the hosts for 25 seconds. */

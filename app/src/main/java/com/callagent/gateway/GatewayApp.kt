@@ -17,5 +17,7 @@ class GatewayApp : Application() {
             StrictMode.ThreadPolicy.Builder().permitAll().build()
         )
         Log.i("GatewayApp", "Homura v${BuildConfig.VERSION_NAME} started")
+        // A frozen main thread holds calls until someone closes Android's ANR dialog.
+        com.callagent.gateway.background.MainThreadWatchdog.start(this)
     }
 }

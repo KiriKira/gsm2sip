@@ -88,11 +88,7 @@ class SessionVault(private val prefsName: String, private val blobKey: String) :
             val body = packed.copyOfRange(12, packed.size)
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, iv))
-            val json = JSONObject(String(cipher.doFinal(body), Charsets.UTF_8))
-            CredentialStore.Session(json.getString("gateway_id"), json.getString("control_base_url"),
-                json.getString("access_token"), json.getString("access_expires_at"),
-                json.getString("refresh_token"), json.getString("refresh_expires_at"),
-                json.optString("pending_refresh_key").takeIf { it.isNotBlank() && it != "null" }).also {
+            decodeSession(JSONObject(String(cipher.doFinal(body), Charsets.UTF_8))).also {
                     cachedBlob = encoded
                     cachedSession = it
                 }
@@ -130,12 +126,7 @@ class SessionVault(private val prefsName: String, private val blobKey: String) :
         context.applicationContext.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
 
     private fun persist(context: Context, session: CredentialStore.Session) {
-        val plain = JSONObject().put("gateway_id", session.gatewayId)
-            .put("control_base_url", session.controlBaseUrl)
-            .put("access_token", session.accessToken).put("access_expires_at", session.accessExpiresAt)
-            .put("refresh_token", session.refreshToken).put("refresh_expires_at", session.refreshExpiresAt)
-        session.pendingRefreshKey?.let { plain.put("pending_refresh_key", it) }
-        val plaintext = plain.toString().toByteArray(Charsets.UTF_8)
+        val plaintext = encodeSession(session).toString().toByteArray(Charsets.UTF_8)
         val (iv, encrypted) = try { encrypt(plaintext, key()) } catch (_: Exception) {
             deleteKey()
             encrypt(plaintext, key())
@@ -217,3 +208,17 @@ object CredentialStore : SessionSource {
 
     fun clear(context: Context) = vault.clear(context)
 }
+
+/** The plaintext form of a session, as sealed by [SessionVault] and as carried by a full backup. */
+internal fun encodeSession(session: CredentialStore.Session): JSONObject = JSONObject()
+    .put("gateway_id", session.gatewayId)
+    .put("control_base_url", session.controlBaseUrl)
+    .put("access_token", session.accessToken).put("access_expires_at", session.accessExpiresAt)
+    .put("refresh_token", session.refreshToken).put("refresh_expires_at", session.refreshExpiresAt)
+    .apply { session.pendingRefreshKey?.let { put("pending_refresh_key", it) } }
+
+internal fun decodeSession(json: JSONObject): CredentialStore.Session = CredentialStore.Session(
+    json.getString("gateway_id"), json.getString("control_base_url"),
+    json.getString("access_token"), json.getString("access_expires_at"),
+    json.getString("refresh_token"), json.getString("refresh_expires_at"),
+    json.optString("pending_refresh_key").takeIf { it.isNotBlank() && it != "null" })

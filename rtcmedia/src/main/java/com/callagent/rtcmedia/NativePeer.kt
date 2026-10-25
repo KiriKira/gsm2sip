@@ -39,7 +39,8 @@ internal class NativePeer(
     private val source: AudioSource
     private val track: AudioTrack
     private val peer: PeerConnection
-    private var controls: DataChannel? = null
+    /** Not guarded by [lock]: see [attachControls]. */
+    private val controls = java.util.concurrent.atomic.AtomicReference<DataChannel?>()
     private val digitIds = linkedSetOf<String>()
     private var digitWindow = 0L
     private var digitCount = 0
@@ -181,8 +182,12 @@ internal class NativePeer(
     }
     fun mute(value:Boolean)=synchronized(lock){muted=value;if(!closed.get())track.setEnabled(audioEnabled && !value)}
     private fun attachControls(channel:DataChannel) {
-        if(channel.label()!="gsm-controls" || closed.get()){channel.close();channel.dispose();return}
-        synchronized(lock){if(controls!=null){channel.close();channel.dispose();return};controls=channel}
+        // Runs on WebRTC's signaling thread for a remote channel. It must never
+        // wait for [lock]: enableAudio() and close() hold it while calling the
+        // PeerConnection, whose proxy blocks on this same thread. That
+        // deadlock froze a gateway mid-call until Android killed it.
+        if(channel.label()!="gsm-controls" || closed.get() || !controls.compareAndSet(null,channel)){channel.close();channel.dispose();return}
+        if(closed.get()){if(controls.compareAndSet(channel,null)){channel.close();channel.dispose()};return}
         channel.registerObserver(object:DataChannel.Observer{
             override fun onBufferedAmountChange(previousAmount:Long)=Unit
             override fun onStateChange()=Unit
@@ -207,7 +212,7 @@ internal class NativePeer(
     fun sendDtmf(digits:String)=synchronized(lock){
         check(audioEnabled && isConnected && !closed.get()){"media_not_active"}
         require(digits.length in 1..16 && digits.all{it in "0123456789*#ABCD"})
-        val channel=checkNotNull(controls);check(channel.state()==DataChannel.State.OPEN)
+        val channel=checkNotNull(controls.get());check(channel.state()==DataChannel.State.OPEN)
         for(digit in digits){
             val data=JSONObject().put("type","dtmf").put("call_id",callId).put("id",UUID.randomUUID().toString()).put("digit",digit.toString()).toString().toByteArray()
             check(channel.send(DataChannel.Buffer(ByteBuffer.wrap(data),false))){"control_send_failed"}
@@ -234,7 +239,7 @@ internal class NativePeer(
     override fun close(){
         if(!closed.compareAndSet(false,true))return
         synchronized(lock){
-            runCatching{controls?.unregisterObserver();controls?.close();controls?.dispose()};controls=null
+            controls.getAndSet(null)?.let{runCatching{it.unregisterObserver();it.close();it.dispose()}}
             runCatching{peer.setAudioRecording(false);peer.setAudioPlayout(false);peer.close();peer.dispose()}
             runCatching{track.dispose()};runCatching{source.dispose()};runCatching{factory.dispose()};runCatching{module.release()}
         }

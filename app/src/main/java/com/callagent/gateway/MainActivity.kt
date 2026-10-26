@@ -1736,7 +1736,12 @@ class MainActivity : AppCompatActivity() {
             isEnabled = configured && !recoveryBusy.get()
             alpha = if (isEnabled) 1f else 0.5f
         })
-        smsSettings.addView(smsBackupTile(GatewayUi.Position.LAST, R.id.btnCfgSmsBackup))
+        smsSettings.addView(smsBackupTile(GatewayUi.Position.MIDDLE, R.id.btnCfgSmsBackup))
+        smsSettings.addView(GatewayUi.tile(this, GatewayUi.Position.LAST, "全量备份与恢复",
+            summary = "设置、配对、SIM 绑定和本机数据，加密导出到一个文件；可恢复到本机或新手机",
+            icon = R.drawable.ic_ui_archive, trailing = GatewayUi.chevron(this),
+            onClick = { startActivity(Intent(this, com.callagent.gateway.backup.GatewayFullBackupActivity::class.java)) }
+        ).apply { id = R.id.btnCfgFullBackup })
     }
 
     private fun renderBackgroundSettings(status: BackgroundStatus?) {

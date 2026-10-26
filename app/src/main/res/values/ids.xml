@@ -40,6 +40,7 @@
     <item name="btnEnableSmsRecovery" type="id" />
     <item name="btnScanSmsRecovery" type="id" />
     <item name="btnCfgSmsBackup" type="id" />
+    <item name="btnCfgFullBackup" type="id" />
     <item name="swBackgroundEnabled" type="id" />
     <item name="btnOpenNotificationSettings" type="id" />
     <item name="btnOpenBatterySettings" type="id" />

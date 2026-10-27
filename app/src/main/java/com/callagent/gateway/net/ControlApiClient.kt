@@ -121,7 +121,9 @@ class ControlApiClient(
         return (0 until array.length()).mapNotNull { array.optString(it).takeIf(String::isNotBlank) }.toSet()
     }
 
-    fun rtcControlAvailable(): Boolean = request("GET", "/v1/capabilities", authenticated = false).optBoolean("rtc_call_control", false)
+    /** The whole public capabilities document, for its feature flags. */
+    fun capabilityFlags(): JSONObject = request("GET", "/v1/capabilities", authenticated = false)
+    fun rtcControlAvailable(): Boolean = capabilityFlags().optBoolean("rtc_call_control", false)
 
     fun revoke() {
         synchronized(refreshLock) {

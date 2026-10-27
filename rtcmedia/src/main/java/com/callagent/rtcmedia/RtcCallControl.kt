@@ -14,12 +14,15 @@ class RtcCallControl(private val api: MediaApi) {
         return (0 until array.length()).map(array::getJSONObject)
     }
     fun get(id: String) = api.request("GET", "/rtc/control/calls/$id", null)
+    /** remainingRingMs, for an incoming call to a node advertising
+     * reception_v2 only, is what is left of the call's ring window. */
     fun create(id: String, gateway: String, sim: String, revision: Long, to: String,
-               incoming: Boolean = false, from: String? = null): JSONObject {
+               incoming: Boolean = false, from: String? = null, remainingRingMs: Long? = null): JSONObject {
         val body = JSONObject().put("version", 1).put("operation_id", UUID.randomUUID().toString())
             .put("call_id", id).put("gateway_id", gateway).put("sim_id", sim)
             .put("mapping_revision", revision).put("to", to)
         from?.let { body.put("from", it) }
+        remainingRingMs?.let { body.put("remaining_ring_ms", it) }
         return committed("/rtc/control/${if (incoming) "incoming" else "calls"}", body)
     }
     fun operation(id: String, kind: String, candidate: String? = null): JSONObject {

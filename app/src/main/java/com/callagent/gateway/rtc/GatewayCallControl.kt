@@ -1,6 +1,7 @@
 package com.callagent.gateway.rtc
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import com.callagent.gateway.data.CredentialStore
 import com.callagent.gateway.data.GatewayDatabase
@@ -23,6 +24,9 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
         @Volatile var ready = false
         @Volatile var checked = false
         @Volatile var supported = false
+        /** The node advertises reception_v2: it takes remaining_ring_ms and
+         * answers NO_INCOMING_SUBSCRIBERS. */
+        @Volatile var receptionV2 = false
         @Volatile var lastSeen = System.nanoTime()
         var capabilityAt = 0L
     }
@@ -62,7 +66,10 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
         try{
             val now=System.nanoTime()
             if(now-node.capabilityAt>25_000_000_000L){
-                node.supported=client.rtcControlAvailable();node.checked=true;node.capabilityAt=now
+                val capabilities=client.capabilityFlags()
+                node.supported=capabilities.optBoolean("rtc_call_control",false)
+                node.receptionV2=capabilities.optBoolean("reception_v2",false)
+                node.checked=true;node.capabilityAt=now
                 if(!node.supported){node.ready=false;return}
                 check(RtcAudioSession.isAvailable(context)){"RTC_NATIVE_UNAVAILABLE"}
                 node.control.capability(true)
@@ -86,8 +93,10 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
     }
     /** Offers the ringing cellular call to every ready node. A definite create
      * failure is left out; an ambiguous response still counts as a possible offer.
-     * Once offered, errors end this call; it is never offered a second time. */
-    fun offerIncoming(mapping:SimRegistry.SimMapping,id:String,number:String,valid:()->Boolean){
+     * Once offered, errors end this call; it is never offered a second time.
+     * Nodes that take it are told what is left of the ring window, which runs
+     * from ringStartedAt (elapsedRealtime); none is offered after it ends. */
+    fun offerIncoming(mapping:SimRegistry.SimMapping,id:String,number:String,ringStartedAt:Long,valid:()->Boolean){
         val eligible=nodes.values.filter{it.supported && it.ready}
         check(eligible.isNotEmpty()){"RTC_NO_READY_NODE"}
         check(GatewayDatabase.get(context).reserveRtcCellularSlot(id)){"RTC_CELLULAR_OCCUPIED"}
@@ -97,6 +106,8 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
         try {
             for(node in eligible){
                 check(valid()){"RTC_INCOMING_RETIRED"}
+                val remaining=remainingRingMs(ringStartedAt,SystemClock.elapsedRealtime())
+                if(remaining<=0)break
                 if(!fork.beginCreate(node.gatewayId))break
                 var requestAttempted=false
                 var snapshot:JSONObject?=null
@@ -107,7 +118,7 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
                     checkNotNull(revision){"RTC_NODE_SIM_NOT_BOUND"}
                     requestAttempted=true
                     snapshot=node.control.create(id,node.gatewayId,mapping.simId,revision,
-                        "",true,number.takeIf{it.isNotBlank()})
+                        "",true,number.takeIf{it.isNotBlank()},remaining.takeIf{node.receptionV2})
                 }catch(error:Throwable){failure=error}
 
                 val outcome=when{

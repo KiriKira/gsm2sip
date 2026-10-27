@@ -2,12 +2,20 @@ package com.callagent.gateway.rtc
 
 import com.callagent.rtcmedia.MediaApiException
 
-/** Distinguishes server rejections from POST outcomes that may have committed. */
+/** Distinguishes server rejections from POST outcomes that may have committed.
+ * NO_INCOMING_SUBSCRIBERS only says no host on that node takes calls now: the
+ * offer moves on to the other nodes. */
 internal fun mayHaveCommittedCreate(error: Throwable): Boolean = when (error) {
-    is MediaApiException -> error.code != "GATEWAY_UNAVAILABLE" &&
+    is MediaApiException -> error.code != "GATEWAY_UNAVAILABLE" && error.code != "NO_INCOMING_SUBSCRIBERS" &&
         (error.status >= 500 || (error.status == 409 && error.code == "CALL_ID_CONFLICT"))
     else -> true
 }
+
+/** An incoming call rings the hosts for this long from its first cellular RINGING. */
+internal const val INCOMING_RING_MS = 25_000L
+
+/** What is left of the ring window, on the monotonic clock (elapsedRealtime). */
+fun remainingRingMs(ringStartedAt: Long, now: Long): Long = INCOMING_RING_MS - (now - ringStartedAt)
 
 /** Coordinates the short window in which one incoming call is being offered
  * sequentially to several RTC nodes. No caller holds this monitor over I/O. */

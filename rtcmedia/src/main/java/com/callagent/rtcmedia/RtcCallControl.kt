@@ -7,8 +7,10 @@ import java.util.UUID
  * remain bound to the existing paired node/session. Never retries a cellular
  * effect with a new call_id or converts an error into a SIP fallback. */
 class RtcCallControl(private val api: MediaApi) {
-    fun capability(enabled: Boolean) = api.request("POST", "/rtc/control/capability",
-        JSONObject().put("version", 1).put("enabled", enabled))
+    /** globalDecline: a gateway that decides decline_all, sent only to a
+     * node advertising global_decline_v1. */
+    fun capability(enabled: Boolean, globalDecline: Boolean = false) = api.request("POST", "/rtc/control/capability",
+        JSONObject().put("version", 1).put("enabled", enabled).apply { if (globalDecline) put("global_decline", true) })
     fun calls(): List<JSONObject> {
         val array = api.request("GET", "/rtc/control/calls", null).getJSONArray("calls")
         return (0 until array.length()).map(array::getJSONObject)

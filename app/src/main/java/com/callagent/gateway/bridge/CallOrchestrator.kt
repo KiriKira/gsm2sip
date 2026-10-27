@@ -161,6 +161,7 @@ class CallOrchestrator(
         if (stopped) return
         val id = snapshot.getString("call_id")
         val leg = RtcControlLeg(node, snapshot)
+        var declineRequested = false
         synchronized(this) {
             if (snapshot.getString("direction") == "incoming") {
                 if (activeBusinessCallId != id || !rtcIncoming) return
@@ -172,6 +173,30 @@ class CallOrchestrator(
                     }
                     return
                 }
+                if (snapshot.optBoolean("decline_requested") && snapshot.optString("winner_client_id").isBlank() && declinedCallId != id) {
+                    declineRequested = true
+                }
+            }
+        }
+        // A host declined the call for every host. The durable ledger decides
+        // it against an answer; once it is committed the cellular call is
+        // rejected, and its real END reports "declined" to every node.
+        // If an answer won instead, the snapshot is handled as usual below.
+        if (declineRequested && runCatching { GatewayDatabase.get(context).claimCallDecline(id, node.gatewayId) }.getOrDefault(false)) {
+            telecomHandler.post {
+                synchronized(this) {
+                    if (activeBusinessCallId != id || !rtcIncoming || declinedCallId == id) return@synchronized
+                    declinedCallId = id
+                    Log.i("GsmRtc", "call_id=$id event=declined_for_every_host node=${node.gatewayId.take(8)}")
+                    tearDown("Declined by a host")
+                }
+            }
+            return
+        }
+        synchronized(this) {
+            if (snapshot.getString("direction") == "incoming") {
+                if (activeBusinessCallId != id || !rtcIncoming) return
+                if (incomingRtcLegs[node.gatewayId]?.snapshot !== snapshot) return
                 if (snapshot.optString("candidate_client_id").isBlank() || activeRtcLeg != null) return
                 activeRtcLeg = leg
                 val gen = generation
@@ -354,6 +379,8 @@ class CallOrchestrator(
     /** elapsedRealtime of the pending call's first RINGING: its ring window
      * runs from here, however long SIM mapping and offers take. */
     private var pendingInboundRingStartedAt = 0L
+    /** The incoming call a host declined for every host, once the ledger says so. */
+    @Volatile private var declinedCallId: String? = null
     private var pendingInboundResolution: Future<*>? = null
     private var inboundFlowTask: Future<*>? = null
     @Volatile private var stopped = false

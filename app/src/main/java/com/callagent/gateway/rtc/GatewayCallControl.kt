@@ -27,6 +27,9 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
         /** The node advertises reception_v2: it takes remaining_ring_ms and
          * answers NO_INCOMING_SUBSCRIBERS. */
         @Volatile var receptionV2 = false
+        /** The node advertises global_decline_v1: a host there can decline a
+         * call for every host, which this gateway decides and reports. */
+        @Volatile var globalDecline = false
         @Volatile var lastSeen = System.nanoTime()
         var capabilityAt = 0L
     }
@@ -69,17 +72,19 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
                 val capabilities=client.capabilityFlags()
                 node.supported=capabilities.optBoolean("rtc_call_control",false)
                 node.receptionV2=capabilities.optBoolean("reception_v2",false)
+                node.globalDecline=capabilities.optBoolean("global_decline_v1",false)
                 node.checked=true;node.capabilityAt=now
                 if(!node.supported){node.ready=false;return}
                 check(RtcAudioSession.isAvailable(context)){"RTC_NATIVE_UNAVAILABLE"}
-                node.control.capability(true)
+                node.control.capability(true,node.globalDecline)
                 node.api.request("POST","/devices/self/rtc-capability",JSONObject().put("version",1))
             }
             if(!node.supported)return
             GatewayDatabase.get(context).rtcTerminals(node.gatewayId).forEach{(id,kind)->
                 try {
                     val snapshot=node.control.get(id)
-                    if(snapshot.getString("state")!="ended")node.control.operation(id,kind)
+                    // A node that does not know a decline for every host is told the call ended.
+                    if(snapshot.getString("state")!="ended")node.control.operation(id,if(kind=="declined"&&!node.globalDecline)"ended" else kind)
                     GatewayDatabase.get(context).acknowledgeRtcTerminal(id,node.gatewayId)
                 }catch(error:MediaApiException){if(error.status==404)GatewayDatabase.get(context).acknowledgeRtcTerminal(id,node.gatewayId)else throw error}
             }

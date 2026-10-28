@@ -1177,8 +1177,8 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         } finally { db.endTransaction() }
     }
 
-    /** Allocate and persist one exact heartbeat payload. If the HTTP response
-     * was lost, the next loop retries the identical sequence and bytes. */
+    /** Allocate and persist one exact heartbeat payload. Retry identical bytes
+     * after a lost response, unless a newer SIM mapping superseded the body. */
     fun prepareHeartbeatPayload(gatewayId: String, build: (Long) -> String): Pair<Long, String> {
         val db = writableDatabase
         db.beginTransaction()
@@ -1189,8 +1189,16 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                 arrayOf(gatewayId)
             ).use { if (it.moveToFirst()) it.getLong(0) to it.getString(1) else null }
             if (pending != null) {
-                db.setTransactionSuccessful()
-                return pending
+                val current = build(pending.first)
+                if (heartbeatMappings(pending.second) == heartbeatMappings(current)) {
+                    db.setTransactionSuccessful()
+                    return pending
+                }
+                // A confirmed mapping change cannot be reported using the old
+                // sequence: the server will replay its cached old revision.
+                // Start a new request without reusing an idempotency key.
+                db.delete("heartbeat_pending", "owner_gateway_id=? AND sequence=?",
+                    arrayOf(gatewayId, pending.first.toString()))
             }
             db.execSQL("UPDATE meta SET value=value+1 WHERE key='heartbeat_sequence'")
             val sequence = db.rawQuery("SELECT value FROM meta WHERE key='heartbeat_sequence'", null)
@@ -1202,6 +1210,14 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             db.setTransactionSuccessful()
             return sequence to payload
         } finally { db.endTransaction() }
+    }
+
+    private fun heartbeatMappings(payload: String): Map<String, Long> {
+        val sims = JSONObject(payload).optJSONArray("sim_states") ?: return emptyMap()
+        return (0 until sims.length()).associate { index ->
+            val sim = sims.getJSONObject(index)
+            sim.getString("sim_id") to sim.getLong("mapping_revision")
+        }
     }
 
     fun completeHeartbeat(gatewayId: String, sequence: Long) {

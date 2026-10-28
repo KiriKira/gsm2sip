@@ -126,6 +126,18 @@ class GatewayDatabaseTest {
         assertEquals(listOf(declined to "declined"),db.rtcTerminals(gatewayB))
         db.acknowledgeRtcTerminal(declined,gatewayA);db.acknowledgeRtcTerminal(declined,gatewayB)
 
+        assertNull("an ended decline is finished",db.unfinishedDecline(40_000L))
+
+        val interrupted=id("rtc-decline-interrupted")
+        assertTrue(db.beginCallDispatch(interrupted,"sim",1,"incoming"))
+        assertTrue(db.claimCallDecline(interrupted,gatewayA))
+        db.recoverDispatchingCallsToUnknown()
+        assertEquals(interrupted,db.unfinishedDecline(40_000L))
+        assertNull("a decline past the ring window is not this call",db.unfinishedDecline(40_000L,System.currentTimeMillis()+41_000L))
+        db.completeRtcCellular(interrupted,"failed",listOf(gatewayA))
+        assertNull(db.unfinishedDecline(40_000L))
+        db.acknowledgeRtcTerminal(interrupted,gatewayA)
+
         val answered=id("rtc-answered")
         assertTrue(db.beginCallDispatch(answered,"sim",1,"incoming"))
         assertTrue(db.reserveRtcCellularSlot(answered))

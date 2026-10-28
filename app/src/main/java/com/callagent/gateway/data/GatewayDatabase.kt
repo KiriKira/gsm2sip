@@ -262,6 +262,18 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
     fun claimCallDecline(callId: String, node: String): Boolean =
         claimCallDecision(callId, node, DECLINED_BY_HOST, "declined")
 
+    /**
+     * An incoming call a host declined for every host whose cellular end was
+     * never seen: the process died between the decision and the reject. A
+     * call ringing now, within [windowMs] of that decision, is the same call
+     * offered again by Telecom after the restart.
+     */
+    fun unfinishedDecline(windowMs: Long, now: Long = System.currentTimeMillis()): String? = readableDatabase.rawQuery(
+        """SELECT l.call_id FROM call_ledger l JOIN call_winners w ON w.call_id=l.call_id
+           WHERE l.direction='incoming' AND l.state IN ('dispatching','unknown') AND w.decision='declined' AND w.created_at>=?
+           ORDER BY w.created_at DESC LIMIT 1""", arrayOf((now - windowMs).toString())
+    ).use { if (it.moveToFirst()) it.getString(0) else null }
+
     private fun claimCallDecision(callId: String, node: String, clientId: String, decision: String): Boolean {
         val db = writableDatabase
         db.beginTransaction()

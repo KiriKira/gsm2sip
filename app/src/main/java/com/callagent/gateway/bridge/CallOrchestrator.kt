@@ -529,6 +529,20 @@ class CallOrchestrator(
             return
         }
 
+        // A host declined this call for every host, and the process stopped
+        // before the reject reached the modem: Telecom now offers it again.
+        // Finish the decline instead of ringing the hosts once more; the
+        // unresolved ledger row then reports "declined" to every node.
+        if (bridgeState == BridgeState.IDLE && call.state == Call.STATE_RINGING) {
+            val declined = runCatching { GatewayDatabase.get(context).unfinishedDecline(DECLINE_RECOVERY_MS) }.getOrNull()
+            if (declined != null) {
+                Log.i("GsmRtc", "call_id=$declined event=decline_finished_after_restart")
+                releasedCalls.add(call)
+                rejectOrDisconnect(call)
+                return
+            }
+        }
+
         if (bridgeState != BridgeState.IDLE) {
             Log.w(TAG, "Busy — rejecting GSM call")
             rejectOrDisconnect(call)
@@ -1084,6 +1098,8 @@ class CallOrchestrator(
     }
 
     companion object {
+        /** A decline older than the ring window cannot belong to a call still ringing. */
+        private const val DECLINE_RECOVERY_MS = 40_000L
         private val dispatchRecoveryLock = Any()
         /** Shared and never shut down: a stopping orchestrator still closes its last call's media. */
         private val mediaCloser = Executors.newSingleThreadExecutor { r ->

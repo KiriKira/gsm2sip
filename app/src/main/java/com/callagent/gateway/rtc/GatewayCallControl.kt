@@ -121,6 +121,7 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
                     val revision=if(node.primary)mapping.mappingRevision else GatewayDatabase.get(context).meshNodeSims(node.gatewayId)
                         .firstOrNull{it.simId.equals(mapping.simId,true)&&it.state=="active"}?.mappingRevision
                     checkNotNull(revision){"RTC_NODE_SIM_NOT_BOUND"}
+                    IncomingOfferDiagnostics.started(id,node.gatewayId,remaining)
                     requestAttempted=true
                     snapshot=node.control.create(id,node.gatewayId,mapping.simId,revision,
                         "",true,number.takeIf{it.isNotBlank()},remaining.takeIf{node.receptionV2})
@@ -141,7 +142,7 @@ class GatewayCallControl(private val context: Context, private val orchestrator:
                         Log.w("GsmRtc","call_id=$id event=incoming_snapshot_failed node=${node.gatewayId.take(8)} error=${error.javaClass.simpleName}")
                     }
                 }else{
-                    Log.w("GsmRtc","call_id=$id event=incoming_offer_failed node=${node.gatewayId.take(8)} error=${failure?.javaClass?.simpleName?:"CreateRejected"}")
+                    IncomingOfferDiagnostics.failed(id,node.gatewayId,remaining,failure)
                 }
             }
             check(offered>0){"RTC_INCOMING_NOT_OFFERED"}

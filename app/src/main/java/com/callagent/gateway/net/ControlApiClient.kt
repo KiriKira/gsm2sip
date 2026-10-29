@@ -121,7 +121,9 @@ class ControlApiClient(
         return (0 until array.length()).mapNotNull { array.optString(it).takeIf(String::isNotBlank) }.toSet()
     }
 
-    fun rtcControlAvailable(): Boolean = request("GET", "/v1/capabilities", authenticated = false).optBoolean("rtc_call_control", false)
+    /** The whole public capabilities document, for its feature flags. */
+    fun capabilityFlags(): JSONObject = request("GET", "/v1/capabilities", authenticated = false)
+    fun rtcControlAvailable(): Boolean = capabilityFlags().optBoolean("rtc_call_control", false)
 
     fun revoke() {
         synchronized(refreshLock) {
@@ -169,8 +171,13 @@ class ControlApiClient(
     fun heartbeat(body: JSONObject): HeartbeatResult {
         val session = sessionOrThrow()
         val response = request("POST", "/v1/gateways/${session.gatewayId}/heartbeat", body)
+        return parseHeartbeatResult(response)
+    }
+
+    internal fun parseHeartbeatResult(response: JSONObject): HeartbeatResult {
         val revision = response.optLong("mapping_revision", -1L)
-        if (revision < 1) throw ControlApiException("INVALID_HEARTBEAT_RESPONSE", "服务器未返回有效 SIM revision")
+        // A paired gateway has revision zero until its first SIM proposal.
+        if (revision < 0) throw ControlApiException("INVALID_HEARTBEAT_RESPONSE", "服务器未返回有效 SIM revision")
         val invalidated = response.optJSONArray("invalidated_sim_ids") ?: JSONArray()
         val extensions = response.optJSONArray("extensions") ?: JSONArray()
         return HeartbeatResult(revision, (0 until invalidated.length()).map { invalidated.getString(it) },

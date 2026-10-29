@@ -15,6 +15,7 @@ import com.callagent.gateway.audio.CellularAudioSession
 import com.callagent.gateway.data.GatewayDatabase
 import com.callagent.gateway.gsm.GsmCallManager
 import com.callagent.gateway.rtc.GatewayCallControl
+import com.callagent.gateway.rtc.remainingRingMs
 import com.callagent.gateway.service.GatewayService
 import com.callagent.gateway.sim.SimRegistry
 import com.callagent.rtcmedia.PcmBridge
@@ -160,6 +161,7 @@ class CallOrchestrator(
         if (stopped) return
         val id = snapshot.getString("call_id")
         val leg = RtcControlLeg(node, snapshot)
+        var declineRequested = false
         synchronized(this) {
             if (snapshot.getString("direction") == "incoming") {
                 if (activeBusinessCallId != id || !rtcIncoming) return
@@ -171,6 +173,30 @@ class CallOrchestrator(
                     }
                     return
                 }
+                if (snapshot.optBoolean("decline_requested") && snapshot.optString("winner_client_id").isBlank() && declinedCallId != id) {
+                    declineRequested = true
+                }
+            }
+        }
+        // A host declined the call for every host. The durable ledger decides
+        // it against an answer; once it is committed the cellular call is
+        // rejected, and its real END reports "declined" to every node.
+        // If an answer won instead, the snapshot is handled as usual below.
+        if (declineRequested && runCatching { GatewayDatabase.get(context).claimCallDecline(id, node.gatewayId) }.getOrDefault(false)) {
+            telecomHandler.post {
+                synchronized(this) {
+                    if (activeBusinessCallId != id || !rtcIncoming || declinedCallId == id) return@synchronized
+                    declinedCallId = id
+                    Log.i("GsmRtc", "call_id=$id event=declined_for_every_host node=${node.gatewayId.take(8)}")
+                    tearDown("Declined by a host")
+                }
+            }
+            return
+        }
+        synchronized(this) {
+            if (snapshot.getString("direction") == "incoming") {
+                if (activeBusinessCallId != id || !rtcIncoming) return
+                if (incomingRtcLegs[node.gatewayId]?.snapshot !== snapshot) return
                 if (snapshot.optString("candidate_client_id").isBlank() || activeRtcLeg != null) return
                 activeRtcLeg = leg
                 val gen = generation
@@ -350,6 +376,11 @@ class CallOrchestrator(
     private var pendingInboundCall: Call? = null
     private var pendingInboundCallId: String? = null
     private var pendingInboundGeneration = -1L
+    /** elapsedRealtime of the pending call's first RINGING: its ring window
+     * runs from here, however long SIM mapping and offers take. */
+    private var pendingInboundRingStartedAt = 0L
+    /** The incoming call a host declined for every host, once the ledger says so. */
+    @Volatile private var declinedCallId: String? = null
     private var pendingInboundResolution: Future<*>? = null
     private var inboundFlowTask: Future<*>? = null
     @Volatile private var stopped = false
@@ -498,6 +529,20 @@ class CallOrchestrator(
             return
         }
 
+        // A host declined this call for every host, and the process stopped
+        // before the reject reached the modem: Telecom now offers it again.
+        // Finish the decline instead of ringing the hosts once more; the
+        // unresolved ledger row then reports "declined" to every node.
+        if (bridgeState == BridgeState.IDLE && call.state == Call.STATE_RINGING) {
+            val declined = runCatching { GatewayDatabase.get(context).unfinishedDecline(DECLINE_RECOVERY_MS) }.getOrNull()
+            if (declined != null) {
+                Log.i("GsmRtc", "call_id=$declined event=decline_finished_after_restart")
+                releasedCalls.add(call)
+                rejectOrDisconnect(call)
+                return
+            }
+        }
+
         if (bridgeState != BridgeState.IDLE) {
             Log.w(TAG, "Busy — rejecting GSM call")
             rejectOrDisconnect(call)
@@ -525,6 +570,7 @@ class CallOrchestrator(
         pendingInboundCall = call
         pendingInboundCallId = callId
         pendingInboundGeneration = callGeneration
+        pendingInboundRingStartedAt = SystemClock.elapsedRealtime()
         listener?.onStateChanged(
             bridgeState,
             "Incoming GSM call (${CallerId.describe(number, call.details?.handlePresentation)})"
@@ -591,10 +637,11 @@ class CallOrchestrator(
 
         activeGsmMapping = mapping
         activeBusinessCallId = callId
+        val ringStartedAt = pendingInboundRingStartedAt
         clearPendingInbound()
 
         Log.i(TAG, "GSM call is ringing; offering it to the hosts")
-        if (!submitInboundFlow(call, mapping, callId, number, callGeneration)) {
+        if (!submitInboundFlow(call, mapping, callId, number, callGeneration, ringStartedAt)) {
             tearDown("Could not offer the incoming call", leaveRinging = true)
         }
     }
@@ -622,6 +669,7 @@ class CallOrchestrator(
         pendingInboundCall = null
         pendingInboundCallId = null
         pendingInboundGeneration = -1L
+        pendingInboundRingStartedAt = 0L
     }
 
     private fun cancelPendingInboundWork() {
@@ -764,7 +812,8 @@ class CallOrchestrator(
         mapping: SimRegistry.SimMapping,
         callId: String,
         callerNumber: String,
-        callGeneration: Long
+        callGeneration: Long,
+        ringStartedAt: Long
     ) {
         try {
             SimRegistry.resolveForVoice(
@@ -788,8 +837,9 @@ class CallOrchestrator(
             // never offered a second time.
             val manager = checkNotNull(rtcControl) { "RTC_CONTROL_NOT_STARTED" }
             rtcIncoming = true
-            manager.offerIncoming(mapping, callId, callerNumber) { isInboundFlowIdentityCurrent(gsmCall, callId, mapping.simId, callGeneration) }
-            schedule(INCOMING_OFFER_TIMEOUT_MS) {
+            manager.offerIncoming(mapping, callId, callerNumber, ringStartedAt) { isInboundFlowIdentityCurrent(gsmCall, callId, mapping.simId, callGeneration) }
+            // The window runs from the first RINGING, as the nodes were told.
+            schedule(remainingRingMs(ringStartedAt, SystemClock.elapsedRealtime()).coerceAtLeast(0)) {
                 if (activeBusinessCallId == callId && bridgeState != BridgeState.BRIDGED) tearDown("Incoming call was not answered in time", leaveRinging = true)
             }
         } catch (_: Throwable) {
@@ -803,13 +853,14 @@ class CallOrchestrator(
         mapping: SimRegistry.SimMapping,
         callId: String,
         callerNumber: String,
-        callGeneration: Long
+        callGeneration: Long,
+        ringStartedAt: Long
     ): Boolean {
         if (stopped || inboundWorker.isShutdown ||
             !isInboundFlowIdentityCurrent(gsmCall, callId, mapping.simId, callGeneration)) return false
         return try {
             inboundFlowTask = inboundWorker.submit {
-                handleInboundFlow(gsmCall, mapping, callId, callerNumber, callGeneration)
+                handleInboundFlow(gsmCall, mapping, callId, callerNumber, callGeneration, ringStartedAt)
             }
             true
         } catch (e: Exception) {
@@ -1047,6 +1098,8 @@ class CallOrchestrator(
     }
 
     companion object {
+        /** A decline older than the ring window cannot belong to a call still ringing. */
+        private const val DECLINE_RECOVERY_MS = 40_000L
         private val dispatchRecoveryLock = Any()
         /** Shared and never shut down: a stopping orchestrator still closes its last call's media. */
         private val mediaCloser = Executors.newSingleThreadExecutor { r ->
@@ -1055,7 +1108,6 @@ class CallOrchestrator(
         private var dispatchRecoveryComplete = false
         private const val TAG = "CallOrchestrator"
         /** The server invites the hosts for 25 seconds. */
-        private const val INCOMING_OFFER_TIMEOUT_MS = 25_000L
         /** Longest a single keypress may hold a tone on the GSM call. */
         private const val MAX_DTMF_TONE_MS = 2_000L
         /** How long a dispatch may stay unreported by Telecom before it counts as never placed. */

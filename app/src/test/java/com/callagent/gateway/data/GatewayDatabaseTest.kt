@@ -112,6 +112,43 @@ class GatewayDatabaseTest {
     }
 
     @Test
+    fun hostDeclineAndAnswerExcludeEachOtherAndTheEndReportsDeclined() {
+        db.addMeshNode(gatewayB,"http://backup.invalid/v1","backup")
+        val declined=id("rtc-declined")
+        assertTrue(db.beginCallDispatch(declined,"sim",1,"incoming"))
+        assertTrue(db.reserveRtcCellularSlot(declined))
+        assertTrue(db.claimCallDecline(declined,gatewayB))
+        assertTrue("a repeated decline is the same decision",db.claimCallDecline(declined,gatewayB))
+        reopen()
+        assertFalse("no host can answer a declined call",db.claimCallWinner(declined,gatewayA,"host-a"))
+        db.completeRtcCellular(declined,"failed",listOf(gatewayA,gatewayB))
+        assertEquals(listOf(declined to "declined"),db.rtcTerminals(gatewayA))
+        assertEquals(listOf(declined to "declined"),db.rtcTerminals(gatewayB))
+        db.acknowledgeRtcTerminal(declined,gatewayA);db.acknowledgeRtcTerminal(declined,gatewayB)
+
+        assertNull("an ended decline is finished",db.unfinishedDecline(40_000L))
+
+        val interrupted=id("rtc-decline-interrupted")
+        assertTrue(db.beginCallDispatch(interrupted,"sim",1,"incoming"))
+        assertTrue(db.claimCallDecline(interrupted,gatewayA))
+        db.recoverDispatchingCallsToUnknown()
+        assertEquals(interrupted,db.unfinishedDecline(40_000L))
+        assertNull("a decline past the ring window is not this call",db.unfinishedDecline(40_000L,System.currentTimeMillis()+41_000L))
+        db.completeRtcCellular(interrupted,"failed",listOf(gatewayA))
+        assertNull(db.unfinishedDecline(40_000L))
+        db.acknowledgeRtcTerminal(interrupted,gatewayA)
+
+        val answered=id("rtc-answered")
+        assertTrue(db.beginCallDispatch(answered,"sim",1,"incoming"))
+        assertTrue(db.reserveRtcCellularSlot(answered))
+        assertTrue(db.claimCallWinner(answered,gatewayA,"host-a"))
+        assertFalse("a decline after the answer loses",db.claimCallDecline(answered,gatewayB))
+        assertTrue(db.claimCallWinner(answered,gatewayA,"host-a"))
+        db.completeRtcCellular(answered,"completed",listOf(gatewayA))
+        assertEquals(listOf(answered to "ended"),db.rtcTerminals(gatewayA))
+    }
+
+    @Test
     fun losingNodeTerminalIsDurableWithoutEndingThePhysicalCall() {
         val call=id("rtc-winner")
         assertTrue(db.beginCallDispatch(call,"sim",1,"incoming"))

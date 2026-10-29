@@ -8,6 +8,20 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 class IncomingForkCoordinatorTest {
+    @Test fun nodeWithoutSubscribersIsDefinitelyRejectedSoTheOfferMovesOn() {
+        assertFalse(mayHaveCommittedCreate(MediaApiException(503, "NO_INCOMING_SUBSCRIBERS")))
+        val fork = IncomingForkCoordinator(listOf("no-hosts-node", "host-node"))
+        assertTrue(fork.beginCreate("no-hosts-node"))
+        assertTrue(fork.completeCreate("no-hosts-node", IncomingForkCoordinator.CreateOutcome.REJECTED).isEmpty())
+        assertTrue("an empty node must not close the fork", fork.beginCreate("host-node"))
+    }
+
+    @Test fun ringWindowRunsFromTheFirstRingingAndNeverGrows() {
+        assertEquals(25_000L, remainingRingMs(ringStartedAt = 1_000L, now = 1_000L))
+        assertEquals(21_600L, remainingRingMs(ringStartedAt = 1_000L, now = 4_400L))
+        assertTrue(remainingRingMs(ringStartedAt = 1_000L, now = 26_000L) <= 0)
+    }
+
     @Test fun definiteRejectedNodeDoesNotGetTerminalAndHealthyLaterNodeCanSucceed() {
         val unavailable = MediaApiException(503, "GATEWAY_UNAVAILABLE")
         assertFalse(mayHaveCommittedCreate(unavailable))

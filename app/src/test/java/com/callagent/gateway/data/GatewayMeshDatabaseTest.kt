@@ -1,6 +1,7 @@
 package com.callagent.gateway.data
 
 import android.content.Context
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -44,6 +45,80 @@ class GatewayMeshDatabaseTest {
         db.close()
         context.deleteDatabase("gateway-data.db")
     }
+
+    @Test
+    fun confirmingFirstMeshSimSupersedesAnUnacknowledgedEmptyHeartbeat() {
+        val empty = db.prepareHeartbeatPayload(node) { sequence -> heartbeat(sequence, emptyList()) }
+        db.close()
+        db = GatewayDatabase.get(context)
+        assertEquals("pending heartbeats survive a database reopen", empty,
+            db.prepareHeartbeatPayload(node) { sequence -> heartbeat(sequence, emptyList()) })
+        // The server may already have cached revision zero for this sequence.
+        db.replaceMeshNodeSims(node, 1, listOf(simId))
+        val bound = db.prepareHeartbeatPayload(node) { sequence -> heartbeat(sequence, listOf(simId to 1L)) }
+        assertTrue(bound.first > empty.first)
+        assertEquals(simId, JSONObject(bound.second).getJSONArray("sim_states").getJSONObject(0).getString("sim_id"))
+        assertEquals(1, pendingHeartbeatCount(node))
+        // A late completion of the superseded request cannot delete its replacement.
+        db.completeHeartbeat(node, empty.first)
+        assertEquals(1, pendingHeartbeatCount(node))
+        db.completeHeartbeat(node, bound.first)
+        assertEquals(0, pendingHeartbeatCount(node))
+    }
+
+    @Test
+    fun newerPrimaryRevisionSupersedesPendingButTelemetryChangesKeepExactRetry() {
+        val original = db.prepareHeartbeatPayload(primary) { sequence -> heartbeat(sequence, listOf(simId to 5L)) }
+        val retry = db.prepareHeartbeatPayload(primary) { sequence ->
+            JSONObject(heartbeat(sequence, listOf(simId to 5L))).put("battery_percent", 99).toString()
+        }
+        assertEquals("network retries preserve the sequence and exact body", original, retry)
+        val updated = db.prepareHeartbeatPayload(primary) { sequence -> heartbeat(sequence, listOf(simId to 6L)) }
+        assertTrue(updated.first > original.first)
+        assertEquals(6L, JSONObject(updated.second).getJSONArray("sim_states").getJSONObject(0).getLong("mapping_revision"))
+        assertEquals(1, pendingHeartbeatCount(primary))
+        assertEquals(updated, db.prepareHeartbeatPayload(primary) { sequence -> heartbeat(sequence, listOf(simId to 6L)) })
+    }
+
+    @Test
+    fun simOrderKeepsExactRetryButRemovalReplacesOnlyThatGatewaysPending() {
+        val otherSim = UUID.randomUUID().toString()
+        val mappings = listOf(simId to 5L, otherSim to 5L)
+        val original = db.prepareHeartbeatPayload(primary) { sequence -> heartbeat(sequence, mappings) }
+        val nodePending = db.prepareHeartbeatPayload(node) { sequence -> heartbeat(sequence, emptyList()) }
+        assertEquals(original, db.prepareHeartbeatPayload(primary) { sequence -> heartbeat(sequence, mappings.reversed()) })
+
+        val removed = db.prepareHeartbeatPayload(primary) { sequence -> heartbeat(sequence, emptyList()) }
+        assertTrue(removed.first > original.first)
+        assertEquals(0, JSONObject(removed.second).getJSONArray("sim_states").length())
+        assertEquals(1, pendingHeartbeatCount(primary))
+        assertEquals(nodePending, db.prepareHeartbeatPayload(node) { sequence -> heartbeat(sequence, emptyList()) })
+    }
+
+    @Test
+    fun replacementBuildFailurePreservesThePendingRequestAndSequence() {
+        val original = db.prepareHeartbeatPayload(node) { sequence -> heartbeat(sequence, emptyList()) }
+        val failure = runCatching {
+            db.prepareHeartbeatPayload(node) { sequence ->
+                if (sequence != original.first) error("Could not build replacement")
+                heartbeat(sequence, listOf(simId to 1L))
+            }
+        }.exceptionOrNull()
+        assertTrue(failure is IllegalStateException)
+        assertEquals(1, pendingHeartbeatCount(node))
+        assertEquals(original, db.prepareHeartbeatPayload(node) { sequence -> heartbeat(sequence, emptyList()) })
+        val replacement = db.prepareHeartbeatPayload(node) { sequence -> heartbeat(sequence, listOf(simId to 1L)) }
+        assertEquals(original.first + 1, replacement.first)
+    }
+
+    private fun heartbeat(sequence: Long, mappings: List<Pair<String, Long>>): String = JSONObject()
+        .put("sequence", sequence).put("sim_states", JSONArray().apply {
+            mappings.forEach { (id, revision) -> put(JSONObject().put("sim_id", id).put("mapping_revision", revision)) }
+        }).toString()
+
+    private fun pendingHeartbeatCount(gatewayId: String): Int = db.readableDatabase.rawQuery(
+        "SELECT COUNT(*) FROM heartbeat_pending WHERE owner_gateway_id=?", arrayOf(gatewayId)
+    ).use { it.moveToFirst(); it.getInt(0) }
 
     @Test
     fun inboundSmsIsCopiedToEveryNodeWithTheSameMessageId() {

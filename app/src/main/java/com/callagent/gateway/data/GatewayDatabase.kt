@@ -232,6 +232,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             createSmsArchiveTables(db)
         }
         if (oldVersion < 8) createCallWinnerTable(db)
+        else if (oldVersion < 9) db.execSQL("ALTER TABLE call_winners ADD COLUMN decision TEXT NOT NULL DEFAULT 'accepted'")
         if (oldVersion < 7) {
             db.execSQL("ALTER TABLE commands ADD COLUMN content_hash TEXT")
             createMeshTables(db)
@@ -241,16 +242,39 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
     private fun createCallWinnerTable(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE rtc_cellular_slot (singleton INTEGER PRIMARY KEY CHECK(singleton=1),call_id TEXT NOT NULL UNIQUE REFERENCES call_ledger(call_id))")
         db.execSQL("CREATE TABLE rtc_control_terminals (call_id TEXT NOT NULL,node_gateway_id TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'ended',PRIMARY KEY(call_id,node_gateway_id))")
+        // decision (v9): 'accepted' answers the call for client_id, 'declined'
+        // rejects it for every host. Whichever commits first decides.
         db.execSQL("""CREATE TABLE call_winners (
             call_id TEXT PRIMARY KEY REFERENCES call_ledger(call_id),
             node_gateway_id TEXT NOT NULL, client_id TEXT NOT NULL,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL, decision TEXT NOT NULL DEFAULT 'accepted'
         )""")
     }
 
     /** Global to this physical installation. A losing node can never answer
-     * the same GSM call, even after the process restarts. */
-    fun claimCallWinner(callId: String, node: String, clientId: String): Boolean {
+     * the same GSM call, even after the process restarts, and an answer and a
+     * host's decline of the whole call exclude each other. */
+    fun claimCallWinner(callId: String, node: String, clientId: String): Boolean =
+        claimCallDecision(callId, node, clientId, "accepted")
+
+    /** Records that a host on [node] declined the call for every host, unless
+     * an answer was committed first. */
+    fun claimCallDecline(callId: String, node: String): Boolean =
+        claimCallDecision(callId, node, DECLINED_BY_HOST, "declined")
+
+    /**
+     * An incoming call a host declined for every host whose cellular end was
+     * never seen: the process died between the decision and the reject. A
+     * call ringing now, within [windowMs] of that decision, is the same call
+     * offered again by Telecom after the restart.
+     */
+    fun unfinishedDecline(windowMs: Long, now: Long = System.currentTimeMillis()): String? = readableDatabase.rawQuery(
+        """SELECT l.call_id FROM call_ledger l JOIN call_winners w ON w.call_id=l.call_id
+           WHERE l.direction='incoming' AND l.state IN ('dispatching','unknown') AND w.decision='declined' AND w.created_at>=?
+           ORDER BY w.created_at DESC LIMIT 1""", arrayOf((now - windowMs).toString())
+    ).use { if (it.moveToFirst()) it.getString(0) else null }
+
+    private fun claimCallDecision(callId: String, node: String, clientId: String, decision: String): Boolean {
         val db = writableDatabase
         db.beginTransaction()
         try {
@@ -258,8 +282,11 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             if (!live || !servingGateway(db, node)) return false
             val inserted = db.insertWithOnConflict("call_winners", null, ContentValues().apply {
                 put("call_id",callId); put("node_gateway_id",node); put("client_id",clientId); put("created_at",System.currentTimeMillis())
+                put("decision",decision)
             }, SQLiteDatabase.CONFLICT_IGNORE) != -1L
-            val same = inserted || db.rawQuery("SELECT 1 FROM call_winners WHERE call_id=? AND node_gateway_id=? AND client_id=?", arrayOf(callId,node,clientId)).use { it.moveToFirst() }
+            val same = inserted || db.rawQuery(
+                "SELECT 1 FROM call_winners WHERE call_id=? AND node_gateway_id=? AND client_id=? AND decision=?",
+                arrayOf(callId,node,clientId,decision)).use { it.moveToFirst() }
             db.setTransactionSuccessful()
             return same
         } finally { db.endTransaction() }
@@ -1150,8 +1177,8 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         } finally { db.endTransaction() }
     }
 
-    /** Allocate and persist one exact heartbeat payload. If the HTTP response
-     * was lost, the next loop retries the identical sequence and bytes. */
+    /** Allocate and persist one exact heartbeat payload. Retry identical bytes
+     * after a lost response, unless a newer SIM mapping superseded the body. */
     fun prepareHeartbeatPayload(gatewayId: String, build: (Long) -> String): Pair<Long, String> {
         val db = writableDatabase
         db.beginTransaction()
@@ -1162,8 +1189,16 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
                 arrayOf(gatewayId)
             ).use { if (it.moveToFirst()) it.getLong(0) to it.getString(1) else null }
             if (pending != null) {
-                db.setTransactionSuccessful()
-                return pending
+                val current = build(pending.first)
+                if (heartbeatMappings(pending.second) == heartbeatMappings(current)) {
+                    db.setTransactionSuccessful()
+                    return pending
+                }
+                // A confirmed mapping change cannot be reported using the old
+                // sequence: the server will replay its cached old revision.
+                // Start a new request without reusing an idempotency key.
+                db.delete("heartbeat_pending", "owner_gateway_id=? AND sequence=?",
+                    arrayOf(gatewayId, pending.first.toString()))
             }
             db.execSQL("UPDATE meta SET value=value+1 WHERE key='heartbeat_sequence'")
             val sequence = db.rawQuery("SELECT value FROM meta WHERE key='heartbeat_sequence'", null)
@@ -1175,6 +1210,14 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
             db.setTransactionSuccessful()
             return sequence to payload
         } finally { db.endTransaction() }
+    }
+
+    private fun heartbeatMappings(payload: String): Map<String, Long> {
+        val sims = JSONObject(payload).optJSONArray("sim_states") ?: return emptyMap()
+        return (0 until sims.length()).associate { index ->
+            val sim = sims.getJSONObject(index)
+            sim.getString("sim_id") to sim.getLong("mapping_revision")
+        }
     }
 
     fun completeHeartbeat(gatewayId: String, sequence: Long) {
@@ -1260,7 +1303,7 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         writableDatabase.delete("rtc_cellular_slot","call_id=?",arrayOf(callId))
     }
     fun queueRtcTerminal(callId: String,node: String,kind: String = "ended") {
-        require(kind in setOf("ended","answered_elsewhere"))
+        require(kind in setOf("ended","answered_elsewhere","declined"))
         writableDatabase.execSQL("INSERT OR IGNORE INTO rtc_control_terminals(call_id,node_gateway_id,kind) VALUES(?,?,?)",arrayOf(callId,node,kind))
     }
     fun rtcTerminals(node: String): List<Pair<String,String>> = readableDatabase.rawQuery("SELECT call_id,kind FROM rtc_control_terminals WHERE node_gateway_id=? LIMIT 32",arrayOf(node)).use{c->buildList{while(c.moveToNext())add(c.getString(0) to c.getString(1))}}
@@ -1271,7 +1314,9 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         try {
             db.execSQL("UPDATE call_ledger SET state=?,updated_at=? WHERE call_id=? AND state IN ('dispatching','unknown')",arrayOf(state,System.currentTimeMillis(),callId))
             db.delete("rtc_cellular_slot","call_id=?",arrayOf(callId))
-            nodes.forEach{node->db.execSQL("INSERT OR IGNORE INTO rtc_control_terminals(call_id,node_gateway_id,kind) VALUES(?,?,'ended')",arrayOf(callId,node))}
+            // A call a host declined for everyone ends as declined on every node.
+            val kind=if(db.rawQuery("SELECT 1 FROM call_winners WHERE call_id=? AND decision='declined'",arrayOf(callId)).use{it.moveToFirst()})"declined" else "ended"
+            nodes.forEach{node->db.execSQL("INSERT OR IGNORE INTO rtc_control_terminals(call_id,node_gateway_id,kind) VALUES(?,?,?)",arrayOf(callId,node,kind))}
             db.setTransactionSuccessful()
         } finally {db.endTransaction()}
     }
@@ -1878,7 +1923,9 @@ class GatewayDatabase private constructor(context: Context) : SQLiteOpenHelper(
         private const val SMS_PER_MINUTE_LIMIT = 5
         private const val SMS_PER_HOUR_LIMIT = 30
         private const val TAG = "GatewayDatabase"
-        private const val VERSION = 8
+        private const val VERSION = 9
+        /** client_id of a decline: it ends the call for every host. */
+        private const val DECLINED_BY_HOST = "declined_by_host"
         private const val ARCHIVE_COLUMNS = "id,source,owner_id,gateway_id,owner_gateway_id,message_id,sim_id,sim_label," +
             "direction,from_address,to_address,body,created_at,status,observed_at,slot_index,subscription_id,part_count"
         private val ARCHIVE_SNAPSHOT_QUERY = """

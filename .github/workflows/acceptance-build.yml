@@ -1,0 +1,110 @@
+name: turn-acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: why this build
+        required: false
+        default: acceptance
+      runner:
+        description: lab instrumentation class (AGP overwrites the manifest's first entry)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [normal, relay]
+    name: ${{ matrix.variant }}-apk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+      - name: Install Android SDK 35
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+
+      - name: Assemble debug app and androidTest
+        shell: bash
+        run: |
+          set -euo pipefail
+          RELAY=""
+          if [ "${{ matrix.variant }}" = "relay" ]; then RELAY="-PforceRtcRelay=true"; fi
+          ./gradlew -PrtcEmulator=true $RELAY -PrtcLabRunner="${{ inputs.runner }}" \
+            :app:assembleDebug :app:assembleDebugAndroidTest \
+            --no-daemon --max-workers=2
+
+      - name: Record identity and ABIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, zipfile
+          from pathlib import Path
+          out = {"variant": os.environ["VARIANT"], "source_commit": os.environ["GITHUB_SHA"],
+                 "run_url": os.environ["GITHUB_SERVER_URL"] + "/" + os.environ["GITHUB_REPOSITORY"] +
+                            "/actions/runs/" + os.environ["GITHUB_RUN_ID"],
+                 "apks": {}}
+          for p in list(Path("app/build/outputs/apk/debug").glob("*.apk")) + \
+                   list(Path("app/build/outputs/apk/androidTest/debug").glob("*.apk")):
+              abis = sorted({n.split("/")[1] for n in zipfile.ZipFile(p).namelist() if n.startswith("lib/")})
+              out["apks"][str(p)] = {"sha256": hashlib.sha256(p.read_bytes()).hexdigest(), "abis": abis}
+          Path("BUILD-INFO.json").write_text(json.dumps(out, indent=2) + "\n")
+          print(json.dumps(out, indent=2))
+          PY
+        env:
+          VARIANT: ${{ matrix.variant }}
+
+      - name: Fail if not x86_64
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          info = json.loads(Path("BUILD-INFO.json").read_text())
+          # only the app APK carries native libs; an androidTest APK has no lib/ by design
+          app = {k: v["abis"] for k, v in info["apks"].items() if "/androidTest/" not in k}
+          bad = {k: v for k, v in app.items() if "x86_64" not in v}
+          assert not bad, f"missing x86_64 in app APK: {bad}"
+          print("x86_64 present in app APK; androidTest APKs carry no native libs (expected)")
+          PY
+
+      - name: Assert lab runner is registered in the androidTest manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          AAPT2=$(find "$SDK/build-tools" -name aapt2 | sort | tail -1)
+          "$AAPT2" dump xmltree --file AndroidManifest.xml \
+            app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk > /tmp/m.xml
+          grep -q 'instrumentation' /tmp/m.xml || { echo "no instrumentation node"; exit 1; }
+          NAMES=$(grep -A3 'E: instrumentation' /tmp/m.xml | grep 'android:name' | sed 's/.*="\(.*\)"/\1/')
+          echo "registered: $NAMES"
+          echo "$NAMES" | grep -q '${{ inputs.runner }}' || { echo "runner ${{ inputs.runner }} NOT registered"; exit 1; }
+
+      - name: Stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/${{ matrix.variant }}-app.apk"
+          cp app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk "dist/${{ matrix.variant }}-test.apk"
+          cp BUILD-INFO.json dist/
+          ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.variant }}-apk
+          path: dist/
+          if-no-files-found: error

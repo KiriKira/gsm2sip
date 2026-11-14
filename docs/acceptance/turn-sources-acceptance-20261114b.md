@@ -134,13 +134,45 @@ APK 由临时验收 workflow 构建（仅新增 `.github/workflows/acceptance-bu
 
 "动作 → 通话建立"总耗时（外呼中位）：P1 2491 ms、P2 3055 ms、P3 2416 ms、P4 2321 ms；来电中位：P1 4891 ms、P2 5104 ms、P3 4821 ms。
 
-**结论**：`sources=` 能区分配置（P1/P2 = 0，P3/P4 = 1）；外部来源的代价集中在**首次**拉取（几百 ms 到 1.5 s），缓存后回落到毫秒级，与文档"来源刷新最多 1.5 s"一致。
+**结论**：`sources=` 能区分配置（P1 = 0，P3/P4 = 1）。**P2 实测也是 0，但那不是该配置的应有值**——按代码 P2 应为 1，实测 0 的原因是节点注册表为空（见 4.4），属配置未成立，不能作为"`sources` 能区分双节点配置"的证据。外部来源的代价集中在**首次**拉取（几百 ms 到 1.5 s），缓存后回落到毫秒级，与文档"来源刷新最多 1.5 s"一致。
 
-### 4.4 P2 的补充说明（拓扑选择）
+### 4.4 P2 的补充说明（拓扑选择）— 已更正两次，结论为"环境限制，未能成立"
 
-按审阅意见，两部手机都配对节点 A、B 后跑 P2。实测结果是 `nodes=1`、`sources=0` —— B 没有成为来源。另外尝试了"绑定无 TURN 的 B、A 经 mesh 挂上"这一拓扑，得到 `node_servers_configured=0 / selected_turn_urls=0 / reason=no_turn_servers_configured`，强制中继下通话无法接通（0 候选）。
+**第一次写法**（"mesh 第二节点没成为来源，与 C2 不一致，待产品确认"）推理错误；**第二次修订**归因为"配对流程没写注册表"，也不完整。最终核实如下。
 
-即：**在本轮的 mesh 配置下，另一节点没有成为可用的 TURN 来源。** 这与上一轮 C2 的结论不一致，本轮如实记录为待确认，不作为通过项；F3 的 mesh（nodeA + GriefSeed Worker）确有第二个来源生效（`selected_turn_urls=5`），说明 mesh 通路本身可用，差异在节点侧未提供 TURN 时如何处理。
+#### 代码预期
+
+`RelayRepository.kt:118` 只跳过 `id == currentNodeId` 的那一个；其余已注册 node provider 走 `:134–141` 拉凭据并加入 `ready`（`:171–174`）。故两端各配两个节点时，非当前节点**应当**贡献 1 个来源，P2 预期 `sources=1`。
+
+#### 实测
+
+P2 六通（3 外呼 + 3 来电）全部正常接通 `relay/relay`，但 `sources=0`。
+
+#### 根因（实测确认）
+
+在 mesh 配对成功后（gateway `c8eb78d7`、host READY），检查两端持久化状态：
+
+| 检查项 | 值 |
+|---|---|
+| host `shared_prefs/host-nodes.xml` | `<map />`（空） |
+| gateway `mesh_nodes` 表 | 0 行 |
+
+再用 lab 的 `mesh_add` 命令（`HostJointInstrumentation.kt:119`，走 `HostNodes.add`）显式添加 nodeB，被产品拒绝：
+
+```
+NodeSetupFailure: 这个服务器上是另一台旧手机，不能加入同一个节点列表
+```
+
+对应代码 `HostNodes.kt:119–127`：添加第二节点时会校验该服务器上报的 `installId` 必须与节点列表已记录的**同一台旧手机**一致，不一致即拒绝并回滚。
+
+**本实验室的 nodeA 与 nodeB 各自跑了独立的 gateway 实例（不同 installId），而产品的"mesh 双节点"前提是同一台 gateway 手机同时注册到两个服务器。** 因此 P2 的拓扑在本环境无法建立，`sources=0` 是配置不成立的表现，不是 `sources` 语义问题，也不是产品缺陷。
+
+#### 结论
+
+- P2 **未能按设计执行**，记为**环境限制**，不作为通过项，也不能用来评价 `sources` 的行为。
+- 若要真正验证"非当前节点作为来源"，需要一个 gateway 手机同时配对 A、B 的拓扑（`HostNodes` 的 installId 校验才能通过），本轮不具备。
+- 同时更正一个**观测误读**：此前引用的 `nodes=1` 出自 `event=incoming_offered nodes=N`（Homura `GatewayCallControl.kt:185`），含义是**本次成功下发 offer 的节点数**，不是客户端注册表里的节点数量。用它推断"App 只认识一个节点"是错的。
+- `reason=no_turn_servers_configured` 只出现在另一条实验 P2Bprobe（绑无内置 TURN 的 B 且无外部来源），不属于 P2 本组。
 
 ### 4.5 F 组（GriefSeed Worker）
 
@@ -176,7 +208,7 @@ APK 由临时验收 workflow 构建（仅新增 `.github/workflows/acceptance-bu
 | 用例 | 状态 | 具体原因 / 剩余工作 |
 |---|---|---|
 | E1（main APK + PR 版服务端） | **未完成（环境限制）** | main 分支的 `app/build.gradle.kts` 没有 `rtcEmulator` 开关，`-PrtcEmulator=true` 无效，产物只有 `arm64-v8a`（CI 断言报 `missing x86_64 in app APK`），无法装进 x86_64 AVD。**这不是产品缺陷**：main 从未支持模拟器 ABI。可行路径二选一：(a) 给 main 加同样的 `rtcEmulator` ABI 开关后重跑（需改产品代码，不建议为验收改 main）；(b) 用真机跑 E1。另注：main 的 androidTest manifest 未注册 lab runner（`testInstrumentationRunner` 默认值），所以即便有 x86_64 产物也需带 `-PrtcLabRunner` 重新构建。 |
-| P2 的"另一节点作为来源" | **未达成** | 见 4.4。mesh 生效但节点 TURN 未成为来源，需产品侧确认该拓扑的预期（是否需要当前节点无 TURN 时自动采用对端节点的 TURN）。 |
+| P2 的"另一节点作为来源" | **未完成（环境限制）** | 见 4.4。产品要求加入节点列表的第二服务器上必须是**同一台旧手机**（`HostNodes.kt:119–127` 的 `installId` 校验），而本实验室 nodeA/nodeB 各跑独立 gateway 实例，`HostNodes.add` 直接拒绝（"这个服务器上是另一台旧手机"）。`sources=0` 属配置未成立，不能用于评价该功能。需要"一台 gateway 同时配对 A、B"的拓扑才能验证。 |
 | C5 的截断打点 | **未观察到** | 见 4.6。是否应在裁剪时输出 `relay_sources_truncated` 由产品判断；本轮不改代码。 |
 
 ---

@@ -1,5 +1,7 @@
 # TURN 解耦 / 中继来源 设备验收报告（第三轮）
 
+> **⚠ 部分证据已作废。** 本文件 4.1 节的 `port_residues` / `all_released` 来自有缺陷的统计脚本（恒返回 0），已由 `turn-sources-acceptance-20261114c.md` 作废并重测。第 2 节 `FORCE_RTC_RELAY` 的结论不变，但验证方法应改为 jadx（原 aandroguard 脚本在本环境失效）。C5 的"通过"应降级为未验证。详见更正文件。
+
 日期：2026-11-14
 实验室：AWS EC2 测试机（`<lab-host>`），两台 AVD：`emulator-5554` = Gateway（Homura），`emulator-5556` = Host（Madoka）
 本轮依据上一轮审阅意见执行：部署测试 Worker、补齐不需要 Worker 的用例、P 组改用新日志、复查 R1、更正两处表述。

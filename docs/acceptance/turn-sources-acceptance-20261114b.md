@@ -104,6 +104,16 @@ APK 由临时验收 workflow 构建（仅新增 `.github/workflows/acceptance-bu
 
 主指标为 App 自带日志 `event=relay_sources_resolved elapsed_ms=N sources=K`（`RelayRepository.resolveForCall` 包住 `resolve()`，覆盖凭据获取 + STUN 测速）。仓库文档 `docs/relay-source-foundation.md` 明确写明 `native_ready`/`offer_sent` 的计时**不含**这一段，因此这是唯一能回答"多一个来源要多久"的数。
 
+**`sources=` 的口径必须先说清**：它统计的是 `resolve()` 返回的**非当前节点附加来源**数量。当前节点自己的 TURN **不在**这个列表里，它走另一条路：
+
+```
+admission.ice_servers → RtcAudioSession.nodeServers
+  → RelaySources.selectForCall(nodeServers, additionalRelaySources)
+  → relaySelection.servers → PeerConnection.IceServer → NativePeer
+```
+
+（`RtcAudioSession.kt` 内解析 admission 得 `nodeServers`，再经 `selectForCall` 合并两路来源。）所以 **P1 的 `sources=0` 是正常的**，不代表没有 TURN 可用——节点 TURN 照常生效。实测诊断行可佐证：`node_sources_configured=1 node_servers_configured=2 selected_turn_urls=2` 与 `sources=0` 在同一通电话里并存。
+
 次指标仍保留"动作 → 通话建立"的总耗时，**两者并列给出，不互相替代**：
 
 - 外呼锚点：Telecom 的 `EventRecord added as Call`

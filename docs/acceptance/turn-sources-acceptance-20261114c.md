@@ -4,6 +4,36 @@
 
 ---
 
+## 0. 对更正文件 v1 的一处撤回
+
+本文件 v1 第 3 节曾写“**代码里没有 `node_servers_configured` 这个字段**，该推断撤回”。**那条撤回本身是错的，现再撤回。**
+
+错误原因：核对时三个仓库都停在 `plan/acceptance-report`（放报告的）分支，而不是被测提交 `c67f380`/`ba8b087`，在报告分支上自然搜不到产品代码里的字段。
+
+在正确提交上该字段确实存在（`RelayGatheringDiagnostics.kt`）：
+
+```kotlin
+private val nodeSources = if (nodeServers.isEmpty()) 0 else 1
+private val nodeServerCount = nodeServers.size
+...
+" external_sources_selected=$externalSelected node_sources_configured=$nodeSources"
++ " node_servers_configured=$nodeServerCount node_enabled=$nodeEnabled selected_turn_urls=$selectedTurnUrls"
+```
+
+即 `node_sources_configured` 是“节点是否提供了 server”（0/1），`node_servers_configured` 是 `nodeServers.size`（server 条目数，不是 URL 数）。
+
+实测一条正常通话的诊断行（当前安装 `0deacf46`/`bf649c57`）：
+
+```
+event=relay_no_local_candidates reason=turn_candidates_unavailable force_relay=true local_candidates=0
+external_sources_configured=0 external_sources_enabled=0 external_sources_selected=0
+node_sources_configured=1 node_servers_configured=2 node_enabled=true selected_turn_urls=2
+```
+
+**字段工作正常，节点 TURN 也正常进入了配置。** 之前 P3probe 里出现 `node_servers_configured=0 ... selected_turn_urls=0`，是那一刻确实没有节点 TURN（绑到无内置 TURN 的 nodeB 且无外部来源），属真实状态，不是字段故障。
+
+---
+
 ## 1. 作废：R1 的 `port_residues` / `all_released` 是假的
 
 ### 现象
@@ -81,6 +111,7 @@ owner  turnserver -c /run/gsm2sip/turn.conf  (pid 29)
 | `acceptance-build.yml` manifest 断言靠正则子串 | **成立**（CI 日志里 `Raw:` 前缀可见），属测试工具质量问题，不影响产物。 |
 | `r1_quota2.py` 跨 host/gateway 时钟相减 | **不成立**：`rows` 在 `for role` 内重建，P 的三处 `dms()` 均用 host 锚点与 host 事件。 |
 | `FORCE_RTC_RELAY` 用 `buildconfig.py` 读取 | **该脚本在本环境失效**（androguard 路径返回 `None`）。已改用 jadx 复核。 |
+| 读产品代码时的分支 | **已犯过一次错**：在 `plan/acceptance-report` 分支上搜字段，得出"字段不存在"的错误结论（见第 0 节）。读被测实现必须 `git show <被测SHA>:<path>` 或先切到被测提交，不能在放文档的分支上搜。 |
 
 ---
 
